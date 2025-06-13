@@ -17,7 +17,9 @@ init_db()
 
 #Ruta de prueba
 
-@app.route('/') def home(): return 'Backend de Dispen-Easy funcionando correctamente'
+@app.route('/') 
+def home(): 
+    return 'Backend de Dispen-Easy funcionando correctamente'
 
 #Webhook de MercadoPago
 
