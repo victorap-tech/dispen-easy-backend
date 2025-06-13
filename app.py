@@ -1,63 +1,56 @@
-from flask import Flask, request, jsonify 
-import sqlite3 
+from flask import Flask, request, jsonify
+import sqlite3
 import os
 
-app = Flask(name)
+app = Flask(__name__)
 
-#Inicializar base de datos
-
-def init_db(): 
-    conn = sqlite3.connect('pagos.db') 
-    cursor = conn.cursor() 
-cursor.execute('''CREATE TABLE IF NOT EXISTS pagos ( id_pago TEXT PRIMARY KEY, status TEXT )''') 
-conn.commit() 
-conn.close()
+# Crear base de datos si no existe
+def init_db():
+    conn = sqlite3.connect('pagos.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS pagos (
+                        id_pago TEXT PRIMARY KEY,
+                        status TEXT
+                      )''')
+    conn.commit()
+    conn.close()
 
 init_db()
 
-#Ruta de prueba
+@app.route('/')
+def home():
+    return 'Servidor funcionando correctamente'
 
-@app.route('/') 
-def home(): 
-    return 'Backend de Dispen-Easy funcionando correctamente'
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json()
+    id_pago = str(data.get('data', {}).get('id', ''))
+    if not id_pago:
+        return jsonify({'message': 'ID no válido'}), 400
 
-#Webhook de MercadoPago
-
-@app.route('/webhook', methods=['POST']) 
-def webhook(): 
-    data = request.get_json() 
-    if not data: 
-        return jsonify({'status': 'error', 'message': 'No JSON received'}), 400
-
-payment_id = str(data.get('data', {}).get('id'))
-if payment_id:
     conn = sqlite3.connect('pagos.db')
     cursor = conn.cursor()
-    cursor.execute('INSERT OR REPLACE INTO pagos (id_pago, status) VALUES (?, ?)', (payment_id, 'aprobado'))
+    cursor.execute("INSERT OR REPLACE INTO pagos (id_pago, status) VALUES (?, ?)", (id_pago, 'aprobado'))
     conn.commit()
     conn.close()
-    return jsonify({'status': 'ok', 'message': 'Pago recibido'}), 200
-else:
-    return jsonify({'status': 'error', 'message': 'ID de pago no encontrado'}), 400
+    return jsonify({'message': 'Pago recibido'}), 200
 
-#Verificar pago desde ESP32
+@app.route('/check_payment', methods=['GET'])
+def check_payment():
+    id_pago = request.args.get('id_pago')
+    if not id_pago:
+        return jsonify({'status': 'error', 'message': 'Falta id_pago'}), 400
 
-@app.route('/check_payment', methods=['GET']) 
-def check_payment(): 
-    id_pago = request.args.get('id_pago') 
-  if not id_pago: 
-      return jsonify({'status': 'error', 'message': 'Falta id_pago'}), 400
+    conn = sqlite3.connect('pagos.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM pagos WHERE id_pago=?", (id_pago,))
+    row = cursor.fetchone()
+    conn.close()
 
-conn = sqlite3.connect('pagos.db')
-cursor = conn.cursor()
-cursor.execute('SELECT status FROM pagos WHERE id_pago = ?', (id_pago,))
-result = cursor.fetchone()
-conn.close()
+    if row:
+        return jsonify({'estado': row[0], 'status': 'ok'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Pago no encontrado'}), 404
 
-if result and result[0] == 'aprobado':
-    return jsonify({'estado': 'aprobado', 'status': 'ok'})
-else:
-    return jsonify({'message': 'pago no encontrado', 'status': 'error'})
-
-if name == 'main': 
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
