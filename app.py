@@ -4,7 +4,7 @@ import os
 
 app = Flask(name)
 
-Crear base de datos si no existe
+#Crear base de datos si no existe
 
 def init_db(): conn = sqlite3.connect('pagos.db') cursor = conn.cursor() cursor.execute('''CREATE TABLE IF NOT EXISTS pagos ( id_pago TEXT PRIMARY KEY, status TEXT, raw TEXT )''') conn.commit() conn.close()
 
