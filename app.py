@@ -5,6 +5,8 @@ from datetime import datetime
 app = Flask(__name__)
 DB_NAME = 'pagos.db'
 
+crear_tabla_si_no_existe()
+
 # 🧱 Función para crear tabla si no existe
 def crear_tabla_si_no_existe():
     conn = sqlite3.connect(DB_NAME)
