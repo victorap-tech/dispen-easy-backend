@@ -1,72 +1,68 @@
 from flask import Flask, request, jsonify
 import sqlite3
-from datetime import datetime
+import os
 
 app = Flask(__name__)
-DB_NAME = 'pagos.db'
 
-# 🧱 Función para crear tabla si no existe
-def crear_tabla_si_no_existe():
-    conn = sqlite3.connect(DB_NAME)
+# Inicializa la base de datos
+def init_db():
+    conn = sqlite3.connect('pagos.db')
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pagos (
             id_pago TEXT PRIMARY KEY,
-            estado TEXT,
-            fecha TEXT
+            estado TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-# ✅ Ejecutar al iniciar
-crear_tabla_si_no_existe()
-
-# 🔁 Webhook para recibir notificaciones de MercadoPago
+# Endpoint para recibir pagos (webhook de MercadoPago)
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
     if not data:
-        return jsonify({'message': 'Faltan datos', 'status': 'error'}), 400
+        return 'Invalid payload', 400
 
-    try:
-        id_pago = str(data['data']['id'])
-        estado = data.get('type', 'desconocido')
-        fecha = datetime.now().isoformat()
+    # Extrae el ID de pago y estado
+    id_pago = str(data.get('id_pago'))
+    estado = data.get('estado', 'pendiente')
 
-        conn = sqlite3.connect(DB_NAME)
+    if id_pago:
+        conn = sqlite3.connect('pagos.db')
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO pagos (id_pago, estado, fecha)
-            VALUES (?, ?, ?)
-        ''', (id_pago, estado, fecha))
+        cursor.execute('INSERT OR REPLACE INTO pagos (id_pago, estado) VALUES (?, ?)', (id_pago, estado))
         conn.commit()
         conn.close()
+        return 'Pago guardado', 200
+    else:
+        return 'ID de pago no encontrado', 400
 
-        return jsonify({'message': 'Recibido', 'status': 'ok'}), 200
-
-    except Exception as e:
-        return jsonify({'message': str(e), 'status': 'error'}), 500
-
-# 🔍 Endpoint para consultar pagos
+# Endpoint para consultar el estado de un pago
 @app.route('/check_payment', methods=['GET'])
 def check_payment():
     id_pago = request.args.get('id_pago')
     if not id_pago:
-        return jsonify({'status': 'error', 'message': 'Falta el parámetro id_pago'}), 400
+        return jsonify({'error': 'Falta el parámetro id_pago'}), 400
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect('pagos.db')
     cursor = conn.cursor()
     cursor.execute('SELECT estado FROM pagos WHERE id_pago = ?', (id_pago,))
     row = cursor.fetchone()
     conn.close()
 
-    if row and row[0] == 'payment':
-        return jsonify({'estado': 'aprobado', 'status': 'ok'}), 200
+    if row:
+        return jsonify({'estado': row[0]})
     else:
-        return jsonify({'estado': 'pendiente', 'status': 'error'}), 404
+        return jsonify({'estado': 'no_encontrado'})
 
+# Inicializa la base de datos al iniciar
+init_db()
+
+# Puerto dinámico para Railway
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
-
+     
+  
