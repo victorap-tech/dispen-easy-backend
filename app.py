@@ -73,7 +73,7 @@ def marcar_dispensado():
         return jsonify({"error": "ID de pago no proporcionado"}), 400
 
 # Lanzar la app en el puerto que Railway define
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))  # Para producción
+#if __name__ == '__main__':
+    #port = int(os.environ.get('PORT', 5000))  # Para producción
     #app.run(host='0.0.0.0', port=port)
    
