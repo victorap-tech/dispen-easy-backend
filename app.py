@@ -62,5 +62,5 @@ def marcar_dispensado():
         return jsonify({"mensaje": "Marcado como dispensado"}), 200
     return jsonify({"error": "id_pago requerido"}), 400
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+#if __name__ == '__main__':
+    #app.run(host='0.0.0.0', port=8000)
