@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import sqlite3
 
 app = Flask(__name__)
-DB_PATH = "pagos.db"
+DB_PATH = "/tmp/pagos.db"
 
 # Inicializar base de datos (si no existe)
 def init_db():
