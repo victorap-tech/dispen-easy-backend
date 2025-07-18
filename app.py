@@ -74,6 +74,9 @@ def marcar_dispensado():
     conn.close()
     return jsonify({'status': 'ok'}), 200
   
+from app import app
 
+if __name__ == "__main__":
+    app.run()
 
   
