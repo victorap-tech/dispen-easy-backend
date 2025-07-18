@@ -3,61 +3,46 @@ import sqlite3
 import os
 
 app = Flask(__name__)
-DB_PATH = 'pagos.db'
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS pagos (
-            id_pago TEXT PRIMARY KEY,
-            estado TEXT,
-            dispensado INTEGER
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Ruta a la base de datos
+DB_PATH = os.getenv('DB_PATH', 'pagos.db')
 
-init_db()
-
-@app.route('/')
-def home():
-    return 'Dispen-Easy backend OK'
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
-    id_pago = data.get('id')
-    estado = data.get('estado')
-    if not id_pago or not estado:
-        return jsonify({'error': 'Faltan datos'}), 400
+    if not data or 'id_pago' not in data:
+        return jsonify({'error': 'Falta id_pago'}), 400
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado)
-        VALUES (?, ?, 0)
-    ''', (id_pago, estado))
-    conn.commit()
-    conn.close()
-    return jsonify({'status': 'ok'}), 200
+    id_pago = data['id_pago']
 
-@app.route('/check_payment_pendiente')
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, 0)", (id_pago, 'aprobado'))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/check_payment_pendiente', methods=['GET'])
 def check_payment_pendiente():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id_pago FROM pagos
-        WHERE estado = 'approved' AND dispensado = 0
-        LIMIT 1
-    ''')
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_pago FROM pagos WHERE estado = 'aprobado' AND dispensado = 0 LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
 
-    if row:
-        return jsonify({'id_pago': row[0]})
-    else:
-        return jsonify({'id_pago': None})
+        if result:
+            return jsonify({'pago_pendiente': True, 'id_pago': result[0]}), 200
+        else:
+            return jsonify({'pago_pendiente': False}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/marcar_dispensado', methods=['POST'])
 def marcar_dispensado():
@@ -66,17 +51,18 @@ def marcar_dispensado():
     if not id_pago:
         return jsonify({'error': 'Falta id_pago'}), 400
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE pagos SET dispensado = 1 WHERE id_pago = ?
-    ''', (id_pago,))
-    conn.commit()
-    conn.close()
-    return jsonify({'status': 'ok'}), 200
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE pagos SET dispensado = 1 WHERE id_pago = ?", (id_pago,))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'ok'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-if __name__ == "__main__":
-    app.run()
 
+
+  
 
   
