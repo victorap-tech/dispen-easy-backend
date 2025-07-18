@@ -3,10 +3,8 @@ import sqlite3
 import os
 
 app = Flask(__name__)
-
 DB_PATH = '/tmp/pagos.db'
 
-# Crear base de datos si no existe
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -20,18 +18,17 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Ruta raíz para verificar que está funcionando
+init_db()
+
 @app.route('/')
 def home():
     return 'Dispen-Easy backend OK'
 
-# Webhook para registrar pago
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
     id_pago = data.get('id')
     estado = data.get('estado')
-
     if not id_pago or not estado:
         return jsonify({'error': 'Faltan datos'}), 400
 
@@ -43,10 +40,8 @@ def webhook():
     ''', (id_pago, estado))
     conn.commit()
     conn.close()
-
     return jsonify({'status': 'guardado'}), 200
 
-# Verificar si hay un pago pendiente por dispensar
 @app.route('/check_payment_pendiente', methods=['GET'])
 def check_payment_pendiente():
     conn = sqlite3.connect(DB_PATH)
@@ -58,18 +53,15 @@ def check_payment_pendiente():
     ''')
     row = cursor.fetchone()
     conn.close()
-
     if row:
         return jsonify({'id_pago': row[0]})
     else:
         return jsonify({'id_pago': None})
 
-# Marcar pago como dispensado
 @app.route('/marcar_dispensado', methods=['POST'])
 def marcar_dispensado():
     data = request.get_json()
     id_pago = data.get('id_pago')
-
     if not id_pago:
         return jsonify({'error': 'Falta id_pago'}), 400
 
@@ -80,14 +72,8 @@ def marcar_dispensado():
     ''', (id_pago,))
     conn.commit()
     conn.close()
-
     return jsonify({'status': 'ok'}), 200
-
-# Ejecutar servidor Flask
-#if __name__ == '__main__':
-    #init_db()
-    #app.run(host='0.0.0.0', port=8000)
-
+  
 
 
   
