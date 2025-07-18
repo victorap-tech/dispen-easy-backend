@@ -40,19 +40,20 @@ def webhook():
     ''', (id_pago, estado))
     conn.commit()
     conn.close()
-    return jsonify({'status': 'guardado'}), 200
+    return jsonify({'status': 'ok'}), 200
 
-@app.route('/check_payment_pendiente', methods=['GET'])
+@app.route('/check_payment_pendiente')
 def check_payment_pendiente():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id_pago FROM pagos
-        WHERE estado = 'aprobado' AND dispensado = 0
+        WHERE estado = 'approved' AND dispensado = 0
         LIMIT 1
     ''')
     row = cursor.fetchone()
     conn.close()
+
     if row:
         return jsonify({'id_pago': row[0]})
     else:
@@ -73,9 +74,9 @@ def marcar_dispensado():
     conn.commit()
     conn.close()
     return jsonify({'status': 'ok'}), 200
-  
 
 if __name__ == "__main__":
     app.run()
+
 
   
