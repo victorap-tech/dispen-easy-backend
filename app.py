@@ -60,6 +60,4 @@ def marcar_dispensado():
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-if __name__ == '__main__':
-    init_db()
-    app.run(host='0.0.0.0', port=5000)
+init_db()
