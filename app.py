@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import sqlite3
 
 app = Flask(__name__)
@@ -25,8 +25,10 @@ def webhook():
     if id_pago and estado:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))",
-                  (id_pago, estado, id_pago))
+        c.execute(
+            "INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))",
+            (id_pago, estado, id_pago)
+        )
         conn.commit()
         conn.close()
         return jsonify({'status': 'ok'}), 200
@@ -58,14 +60,37 @@ def marcar_dispensado():
     conn.close()
     return jsonify({'status': 'marcado'})
 
+@app.route('/ver_pagos', methods=['GET'])
+def ver_pagos():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM pagos")
+    rows = c.fetchall()
+    conn.close()
+    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2]} for row in rows]
+    return jsonify(pagos)
+
+@app.route('/borrar_pagos', methods=['POST'])
+def borrar_pagos():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM pagos")
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'borrados'})
+
+@app.route('/descargar_db', methods=['GET'])
+def descargar_db():
+    return send_file(DB_PATH, as_attachment=True)
+
 @app.route('/')
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-# Inicializar la base de datos al arrancar
+# Inicializa la base de datos si no existe
 init_db()
 
-# NO INCLUYAS app.run en Railway, Railway lo maneja solo
-# Si querés correr local:
+# Para Railway no pongas app.run()
+# Si lo ejecutás local, descomentá estas líneas:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000)
