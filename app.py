@@ -7,11 +7,13 @@ DB_PATH = "pagos.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS pagos (
-                    id_pago TEXT PRIMARY KEY,
-                    estado TEXT,
-                    dispensado INTEGER DEFAULT 0
-                )""")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pagos (
+            id_pago TEXT PRIMARY KEY,
+            estado TEXT,
+            dispensado INTEGER DEFAULT 0
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -23,7 +25,8 @@ def webhook():
     if id_pago and estado:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?),0))", (id_pago, estado, id_pago))
+        c.execute("INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))",
+                  (id_pago, estado, id_pago))
         conn.commit()
         conn.close()
         return jsonify({'status': 'ok'}), 200
@@ -59,9 +62,10 @@ def marcar_dispensado():
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-# Esto inicializa la base de datos SIEMPRE (no borra nada)
+# Inicializar la base de datos al arrancar
 init_db()
 
-# ¡NO incluyas la línea de app.run para Railway!
+# NO INCLUYAS app.run en Railway, Railway lo maneja solo
+# Si querés correr local:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000)
