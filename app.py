@@ -2,16 +2,17 @@ from flask import Flask, request, jsonify
 import sqlite3
 
 app = Flask(__name__)
+
 DB_PATH = "pagos.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS pagos (
-                    id_pago TEXT PRIMARY KEY,
-                    estado TEXT,
-                    dispensado INTEGER DEFAULT 0
-                )''')
+        id_pago TEXT PRIMARY KEY,
+        estado TEXT,
+        dispensado INTEGER DEFAULT 0
+    )''')
     conn.commit()
     conn.close()
 
@@ -23,8 +24,7 @@ def webhook():
     if id_pago and estado:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))",
-                  (id_pago, estado, id_pago))
+        c.execute("INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))", (id_pago, estado, id_pago))
         conn.commit()
         conn.close()
         return jsonify({'status': 'ok'}), 200
@@ -60,9 +60,9 @@ def marcar_dispensado():
 def index():
     return "Servidor Dispen-Easy funcionando."
 
+# Solo inicializa la base, NO ejecuta app.run() cuando lo levanta gunicorn
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000)
-else:
-    init_db()
 
