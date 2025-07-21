@@ -60,9 +60,9 @@ def marcar_dispensado():
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-# Solo inicializa la base, NO ejecuta app.run() cuando lo levanta gunicorn
+# Esto inicializa la base de datos siempre, tanto en desarrollo como en producción
 init_db()
 
+# Esta línea SOLO debe ejecutarse localmente, no en Railway/gunicorn
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
