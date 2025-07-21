@@ -7,11 +7,20 @@ DB_PATH = "pagos.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Tabla de pagos
     c.execute("""
         CREATE TABLE IF NOT EXISTS pagos (
             id_pago TEXT PRIMARY KEY,
             estado TEXT,
             dispensado INTEGER DEFAULT 0
+        )
+    """)
+    # Tabla de fallas
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS fallas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descripcion TEXT,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -83,14 +92,37 @@ def borrar_pagos():
 def descargar_db():
     return send_file(DB_PATH, as_attachment=True)
 
+# --- NUEVOS ENDPOINTS DE FALLAS ---
+
+@app.route('/registrar_falla', methods=['POST'])
+def registrar_falla():
+    data = request.get_json()
+    descripcion = data.get('descripcion', 'Sin descripción')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO fallas (descripcion) VALUES (?)", (descripcion,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'falla registrada'})
+
+@app.route('/ver_fallas', methods=['GET'])
+def ver_fallas():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, descripcion, fecha FROM fallas ORDER BY fecha DESC")
+    rows = c.fetchall()
+    conn.close()
+    fallas = [{'id': row[0], 'descripcion': row[1], 'fecha': row[2]} for row in rows]
+    return jsonify(fallas)
+
 @app.route('/')
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-# Inicializa la base de datos si no existe
+# Inicializar base de datos
 init_db()
 
-# Para Railway no pongas app.run()
-# Si lo ejecutás local, descomentá estas líneas:
+# Para Railway no incluyas app.run()
+# Si vas a correr local, descomentá esto:
 # if __name__ == "__main__":
 #     app.run(host="0.0.0.0", port=5000)
