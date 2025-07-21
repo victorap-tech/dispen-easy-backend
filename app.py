@@ -12,7 +12,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS pagos (
             id_pago TEXT PRIMARY KEY,
             estado TEXT,
-            dispensado INTEGER DEFAULT 0
+            dispensado INTEGER DEFAULT 0,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     # Tabla de fallas
@@ -21,6 +22,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             descripcion TEXT,
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Tabla de heartbeat
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -35,8 +44,8 @@ def webhook():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0))",
-            (id_pago, estado, id_pago)
+            "INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado, fecha) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0), COALESCE((SELECT fecha FROM pagos WHERE id_pago=?), CURRENT_TIMESTAMP))",
+            (id_pago, estado, id_pago, id_pago)
         )
         conn.commit()
         conn.close()
@@ -73,10 +82,10 @@ def marcar_dispensado():
 def ver_pagos():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM pagos")
+    c.execute("SELECT id_pago, estado, dispensado, fecha FROM pagos")
     rows = c.fetchall()
     conn.close()
-    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2]} for row in rows]
+    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]} for row in rows]
     return jsonify(pagos)
 
 @app.route('/borrar_pagos', methods=['POST'])
@@ -92,8 +101,19 @@ def borrar_pagos():
 def descargar_db():
     return send_file(DB_PATH, as_attachment=True)
 
-# --- NUEVOS ENDPOINTS DE FALLAS ---
+@app.route('/buscar_pago/<id_pago>', methods=['GET'])
+def buscar_pago(id_pago):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id_pago, estado, dispensado, fecha FROM pagos WHERE id_pago=?", (id_pago,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]})
+    else:
+        return jsonify({'error': 'Pago no encontrado'}), 404
 
+# --- FALLAS ---
 @app.route('/registrar_falla', methods=['POST'])
 def registrar_falla():
     data = request.get_json()
@@ -114,6 +134,48 @@ def ver_fallas():
     conn.close()
     fallas = [{'id': row[0], 'descripcion': row[1], 'fecha': row[2]} for row in rows]
     return jsonify(fallas)
+
+# --- HEARTBEAT ---
+@app.route('/heartbeat', methods=['POST'])
+def heartbeat():
+    data = request.get_json()
+    device_id = data.get('device_id', 'esp32')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO heartbeat (device_id, timestamp) VALUES (?, datetime('now'))", (device_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'heartbeat recibido'})
+
+@app.route('/ver_heartbeat/<device_id>', methods=['GET'])
+def ver_heartbeat(device_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT timestamp FROM heartbeat WHERE device_id=? ORDER BY timestamp DESC LIMIT 1", (device_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
+    else:
+        return jsonify({'error': 'No hay heartbeat registrado para este dispositivo'})
+
+# --- MONITOREO PAGOS PENDIENTES ANTIGUOS ---
+@app.route('/pagos_pendientes_viejos', methods=['GET'])
+def pagos_pendientes_viejos():
+    minutos = int(request.args.get('min', 5))  # por defecto, 5 minutos
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id_pago, estado, dispensado, fecha
+        FROM pagos
+        WHERE estado='aprobado'
+        AND dispensado=0
+        AND (strftime('%s','now') - strftime('%s',fecha))/60 > ?
+    """, (minutos,))
+    rows = c.fetchall()
+    conn.close()
+    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]} for row in rows]
+    return jsonify(pagos)
 
 @app.route('/')
 def index():
