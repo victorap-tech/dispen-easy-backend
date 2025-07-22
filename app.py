@@ -4,19 +4,21 @@ import sqlite3
 app = Flask(__name__)
 DB_PATH = "pagos.db"
 
+# ----------------- Inicialización de la base ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Tabla de pagos
+    # PAGOS
     c.execute("""
         CREATE TABLE IF NOT EXISTS pagos (
             id_pago TEXT PRIMARY KEY,
             estado TEXT,
             dispensado INTEGER DEFAULT 0,
+            producto TEXT,
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Tabla de fallas
+    # FALLAS
     c.execute("""
         CREATE TABLE IF NOT EXISTS fallas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,7 +26,7 @@ def init_db():
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Tabla de heartbeat
+    # HEARTBEAT
     c.execute("""
         CREATE TABLE IF NOT EXISTS heartbeat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,20 +34,30 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # PRODUCTOS
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS productos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            precio REAL NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
+# ----------------- WEBHOOK Y PAGOS --------------------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
     id_pago = data.get('id_pago')
     estado = data.get('estado')
+    producto = data.get('producto', data.get('external_reference', 'desconocido'))
     if id_pago and estado:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado, fecha) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0), COALESCE((SELECT fecha FROM pagos WHERE id_pago=?), CURRENT_TIMESTAMP))",
-            (id_pago, estado, id_pago, id_pago)
+            "INSERT OR REPLACE INTO pagos (id_pago, estado, dispensado, producto, fecha) VALUES (?, ?, COALESCE((SELECT dispensado FROM pagos WHERE id_pago=?), 0), ?, COALESCE((SELECT fecha FROM pagos WHERE id_pago=?), CURRENT_TIMESTAMP))",
+            (id_pago, estado, id_pago, producto, id_pago)
         )
         conn.commit()
         conn.close()
@@ -57,13 +69,13 @@ def webhook():
 def check_payment_pendiente():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id_pago FROM pagos WHERE estado='aprobado' AND dispensado=0 LIMIT 1")
+    c.execute("SELECT id_pago, producto FROM pagos WHERE estado='aprobado' AND dispensado=0 LIMIT 1")
     row = c.fetchone()
     conn.close()
     if row:
-        return jsonify({'id_pago': row[0]})
+        return jsonify({'id_pago': row[0], 'producto': row[1]})
     else:
-        return jsonify({'id_pago': None})
+        return jsonify({'id_pago': None, 'producto': None})
 
 @app.route('/marcar_dispensado', methods=['POST'])
 def marcar_dispensado():
@@ -82,11 +94,23 @@ def marcar_dispensado():
 def ver_pagos():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id_pago, estado, dispensado, fecha FROM pagos")
+    c.execute("SELECT id_pago, estado, dispensado, producto, fecha FROM pagos")
     rows = c.fetchall()
     conn.close()
-    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]} for row in rows]
+    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'producto': row[3], 'fecha': row[4]} for row in rows]
     return jsonify(pagos)
+
+@app.route('/buscar_pago/<id_pago>', methods=['GET'])
+def buscar_pago(id_pago):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id_pago, estado, dispensado, producto, fecha FROM pagos WHERE id_pago=?", (id_pago,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'producto': row[3], 'fecha': row[4]})
+    else:
+        return jsonify({'error': 'Pago no encontrado'}), 404
 
 @app.route('/borrar_pagos', methods=['POST'])
 def borrar_pagos():
@@ -101,19 +125,7 @@ def borrar_pagos():
 def descargar_db():
     return send_file(DB_PATH, as_attachment=True)
 
-@app.route('/buscar_pago/<id_pago>', methods=['GET'])
-def buscar_pago(id_pago):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id_pago, estado, dispensado, fecha FROM pagos WHERE id_pago=?", (id_pago,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return jsonify({'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]})
-    else:
-        return jsonify({'error': 'Pago no encontrado'}), 404
-
-# --- FALLAS ---
+# ----------------- FALLAS --------------------------
 @app.route('/registrar_falla', methods=['POST'])
 def registrar_falla():
     data = request.get_json()
@@ -135,7 +147,7 @@ def ver_fallas():
     fallas = [{'id': row[0], 'descripcion': row[1], 'fecha': row[2]} for row in rows]
     return jsonify(fallas)
 
-# --- HEARTBEAT ---
+# ----------------- HEARTBEAT --------------------------
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.get_json()
@@ -159,32 +171,55 @@ def ver_heartbeat(device_id):
     else:
         return jsonify({'error': 'No hay heartbeat registrado para este dispositivo'})
 
-# --- MONITOREO PAGOS PENDIENTES ANTIGUOS ---
-@app.route('/pagos_pendientes_viejos', methods=['GET'])
-def pagos_pendientes_viejos():
-    minutos = int(request.args.get('min', 5))  # por defecto, 5 minutos
+# ----------------- PRODUCTOS (CRUD) --------------------------
+@app.route('/productos', methods=['GET'])
+def get_productos():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        SELECT id_pago, estado, dispensado, fecha
-        FROM pagos
-        WHERE estado='aprobado'
-        AND dispensado=0
-        AND (strftime('%s','now') - strftime('%s',fecha))/60 > ?
-    """, (minutos,))
-    rows = c.fetchall()
+    c.execute("SELECT id, nombre, precio FROM productos")
+    productos = [{"id": row[0], "nombre": row[1], "precio": row[2]} for row in c.fetchall()]
     conn.close()
-    pagos = [{'id_pago': row[0], 'estado': row[1], 'dispensado': row[2], 'fecha': row[3]} for row in rows]
-    return jsonify(pagos)
+    return jsonify(productos)
 
+@app.route('/productos', methods=['POST'])
+def add_producto():
+    data = request.get_json()
+    nombre = data.get("nombre")
+    precio = data.get("precio")
+    if not nombre or precio is None:
+        return jsonify({"error": "Faltan datos"}), 400
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO productos (nombre, precio) VALUES (?, ?)", (nombre, precio))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+@app.route('/productos/<int:prod_id>', methods=['PUT'])
+def update_producto(prod_id):
+    data = request.get_json()
+    nombre = data.get("nombre")
+    precio = data.get("precio")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE productos SET nombre=?, precio=? WHERE id=?", (nombre, precio, prod_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+@app.route('/productos/<int:prod_id>', methods=['DELETE'])
+def delete_producto(prod_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM productos WHERE id=?", (prod_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+# ----------------- RAÍZ --------------------------
 @app.route('/')
 def index():
     return "Servidor Dispen-Easy funcionando."
 
-# Inicializar base de datos
+# Inicializar base si no existe
 init_db()
-
-# Para Railway no incluyas app.run()
-# Si vas a correr local, descomentá esto:
-# if __name__ == "__main__":
-#     app.run(host="0.0.0.0", port=5000)
