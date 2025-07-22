@@ -8,12 +8,20 @@ CORS(app)
 
 DB_PATH = "productos.db"
 
-# ------- INICIALIZAR TABLAS ---------
+# --------- CORS FIX GLOBAL PARA RAILWAY ----------
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# ---------- INICIALIZAR TABLAS ----------
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Tabla de productos
+    # Productos
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,94 +30,145 @@ def init_db():
             link_pago TEXT
         )
     ''')
-    # Tabla de pagos (para webhook)
+    # Pagos
     c.execute('''
         CREATE TABLE IF NOT EXISTS pagos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            producto_id INTEGER,
             estado TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            producto_id INTEGER,
+            fecha TEXT,
+            monto REAL,
+            mp_payment_id TEXT,
+            mp_topic TEXT
         )
     ''')
-    # Heartbeat (opcional)
+    # Heartbeat
     c.execute('''
         CREATE TABLE IF NOT EXISTS heartbeat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_id TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            timestamp TEXT
         )
     ''')
     conn.commit()
     conn.close()
     return "Tablas inicializadas (productos, pagos, heartbeat)"
 
-# ------- PRODUCTOS (CRUD) -----------
-@app.route('/productos', methods=['GET'])
-def get_productos():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, nombre, precio, link_pago FROM productos")
-    productos = [
-        {'id': row[0], 'nombre': row[1], 'precio': row[2], 'link_pago': row[3]}
-        for row in c.fetchall()
-    ]
-    conn.close()
-    return jsonify(productos)
+# ----------- PRODUCTOS (CRUD) -----------
+@app.route('/productos', methods=['GET', 'POST', 'OPTIONS'])
+def productos():
+    if request.method == 'OPTIONS':
+        return '', 200
 
-@app.route('/productos', methods=['POST'])
-def add_producto():
-    data = request.json
-    nombre = data.get('nombre')
-    precio = data.get('precio')
-    link_pago = data.get('link_pago', None)
-    if not nombre or not precio:
-        return "Faltan datos", 400
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)",
-              (nombre, precio, link_pago))
-    conn.commit()
-    conn.close()
-    return "Producto agregado", 201
+    if request.method == 'GET':
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, nombre, precio, link_pago FROM productos")
+        productos = [
+            {'id': row[0], 'nombre': row[1], 'precio': row[2], 'link_pago': row[3]}
+            for row in c.fetchall()
+        ]
+        conn.close()
+        return jsonify(productos)
 
-@app.route('/productos/<int:prod_id>', methods=['DELETE'])
-def delete_producto(prod_id):
+    if request.method == 'POST':
+        data = request.json
+        nombre = data.get('nombre')
+        precio = data.get('precio')
+        link_pago = data.get('link_pago', None)
+        if not nombre or not precio:
+            return "Faltan datos", 400
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)",
+            (nombre, precio, link_pago)
+        )
+        conn.commit()
+        conn.close()
+        return "Producto agregado", 201
+
+# ---------- BORRAR PRODUCTO ----------
+@app.route('/productos/<int:id>', methods=['DELETE'])
+def delete_producto(id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM productos WHERE id=?", (prod_id,))
+    c.execute("DELETE FROM productos WHERE id=?", (id,))
     conn.commit()
     conn.close()
     return "Producto borrado", 200
 
-# ------- WEBHOOK DE PAGOS -----------
+# ---------- WEBHOOK DE MERCADOPAGO ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    producto_id = data.get('producto_id')
-    estado = data.get('estado', 'pendiente')
+    producto_id = data.get('producto_id', None)
+    estado = data.get('estado', None)
+    monto = data.get('monto', None)
+    mp_payment_id = data.get('mp_payment_id', None)
+    mp_topic = data.get('mp_topic', None)
+    fecha = time.strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO pagos (producto_id, estado) VALUES (?, ?)", (producto_id, estado))
+    c.execute('''
+        INSERT INTO pagos (estado, producto_id, fecha, monto, mp_payment_id, mp_topic)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (estado, producto_id, fecha, monto, mp_payment_id, mp_topic))
     conn.commit()
     conn.close()
     return "Webhook recibido", 200
 
-# ------- HEARTBEAT (opcional) -------
+# ---------- CONSULTAR PAGOS ----------
+@app.route('/pagos', methods=['GET'])
+def get_pagos():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, estado, producto_id, fecha, monto, mp_payment_id, mp_topic FROM pagos")
+    pagos = [
+        {
+            'id': row[0],
+            'estado': row[1],
+            'producto_id': row[2],
+            'fecha': row[3],
+            'monto': row[4],
+            'mp_payment_id': row[5],
+            'mp_topic': row[6]
+        }
+        for row in c.fetchall()
+    ]
+    conn.close()
+    return jsonify(pagos)
+
+# ---------- HEARTBEAT ----------
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.json
-    device_id = data.get('device_id')
+    device_id = data.get('device_id', None)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO heartbeat (device_id) VALUES (?)", (device_id,))
+    c.execute("INSERT INTO heartbeat (device_id, timestamp) VALUES (?, ?)", (device_id, timestamp))
     conn.commit()
     conn.close()
-    return "Heartbeat ok", 200
+    return "Heartbeat registrado", 200
 
+@app.route('/ver_heartbeat/<device_id>', methods=['GET'])
+def ver_heartbeat(device_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT timestamp FROM heartbeat WHERE device_id=? ORDER BY timestamp DESC LIMIT 1", (device_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
+    else:
+        return jsonify({'error': 'No hay heartbeat registrado para este dispositivo'})
+
+# ----------- HOME -------------
 @app.route('/')
-def index():
+def home():
     return "Servidor Dispen-Easy funcionando."
 
-# --------- PARA RAILWAY -------------
+# ----------- PARA DESARROLLO LOCAL -------------
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=5000)
