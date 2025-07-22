@@ -8,11 +8,12 @@ CORS(app)
 
 DB_PATH = "productos.db"
 
-# ---- Inicialización de base de datos ----
+# ------- INICIALIZAR TABLAS ---------
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Tabla de productos
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,29 +22,28 @@ def init_db():
             link_pago TEXT
         )
     ''')
+    # Tabla de pagos (para webhook)
     c.execute('''
         CREATE TABLE IF NOT EXISTS pagos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             producto_id INTEGER,
-            monto REAL,
             estado TEXT,
-            mp_id TEXT,
-            raw_data TEXT,
-            timestamp INTEGER DEFAULT (strftime('%s','now'))
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Heartbeat (opcional)
     c.execute('''
         CREATE TABLE IF NOT EXISTS heartbeat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_id TEXT,
-            timestamp INTEGER DEFAULT (strftime('%s','now'))
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
     conn.close()
     return "Tablas inicializadas (productos, pagos, heartbeat)"
 
-# ---- CRUD Productos ----
+# ------- PRODUCTOS (CRUD) -----------
 @app.route('/productos', methods=['GET'])
 def get_productos():
     conn = sqlite3.connect(DB_PATH)
@@ -66,73 +66,35 @@ def add_producto():
         return "Faltan datos", 400
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)", (nombre, precio, link_pago))
+    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)",
+              (nombre, precio, link_pago))
     conn.commit()
     conn.close()
-    return "Producto agregado", 200
+    return "Producto agregado", 201
 
 @app.route('/productos/<int:prod_id>', methods=['DELETE'])
 def delete_producto(prod_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM productos WHERE id = ?", (prod_id,))
+    c.execute("DELETE FROM productos WHERE id=?", (prod_id,))
     conn.commit()
     conn.close()
-    return "Producto eliminado", 200
+    return "Producto borrado", 200
 
-# ---- PAGOS ----
-@app.route('/pagos', methods=['GET'])
-def get_pagos():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, producto_id, monto, estado, mp_id, timestamp FROM pagos ORDER BY timestamp DESC LIMIT 20")
-    pagos = [
-        {'id': row[0], 'producto_id': row[1], 'monto': row[2], 'estado': row[3], 'mp_id': row[4], 'timestamp': row[5]}
-        for row in c.fetchall()
-    ]
-    conn.close()
-    return jsonify(pagos)
-
-@app.route('/pagos', methods=['POST'])
-def add_pago():
-    data = request.json
-    producto_id = data.get('producto_id')
-    monto = data.get('monto')
-    estado = data.get('estado', 'pendiente')
-    mp_id = data.get('mp_id', '')
-    raw_data = str(data)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO pagos (producto_id, monto, estado, mp_id, raw_data) VALUES (?, ?, ?, ?, ?)",
-              (producto_id, monto, estado, mp_id, raw_data))
-    conn.commit()
-    conn.close()
-    return "Pago registrado", 200
-
-# ---- WEBHOOK MERCADOPAGO ----
+# ------- WEBHOOK DE PAGOS -----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    # Aquí podés customizar el análisis del webhook según la info que envía MercadoPago
-    mp_id = None
-    monto = None
-    estado = None
-    producto_id = None
-    if data:
-        # Ejemplo: extraer el ID y estado de un pago (modifica según tu payload real)
-        mp_id = data.get('data', {}).get('id')
-        estado = data.get('type') or data.get('action') or "desconocido"
-        monto = data.get('monto', 0)
-    raw_data = str(data)
+    producto_id = data.get('producto_id')
+    estado = data.get('estado', 'pendiente')
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO pagos (producto_id, monto, estado, mp_id, raw_data) VALUES (?, ?, ?, ?, ?)",
-              (producto_id, monto, estado, mp_id, raw_data))
+    c.execute("INSERT INTO pagos (producto_id, estado) VALUES (?, ?)", (producto_id, estado))
     conn.commit()
     conn.close()
-    return jsonify({"status": "ok"}), 200
+    return "Webhook recibido", 200
 
-# ---- HEARTBEAT (dispositivos conectados, opcional) ----
+# ------- HEARTBEAT (opcional) -------
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.json
@@ -142,24 +104,12 @@ def heartbeat():
     c.execute("INSERT INTO heartbeat (device_id) VALUES (?)", (device_id,))
     conn.commit()
     conn.close()
-    return "OK", 200
+    return "Heartbeat ok", 200
 
-@app.route('/heartbeat/<device_id>', methods=['GET'])
-def ver_heartbeat(device_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT timestamp FROM heartbeat WHERE device_id=? ORDER BY timestamp DESC LIMIT 1", (device_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
-    else:
-        return jsonify({'error': 'No hay heartbeat registrado'}), 404
-
-# ---- Ruta raíz para ver que está online ----
 @app.route('/')
 def index():
     return "Servidor Dispen-Easy funcionando."
 
+# --------- PARA RAILWAY -------------
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0")
+    app.run(host='0.0.0.0', port=8000)
