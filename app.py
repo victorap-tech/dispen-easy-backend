@@ -1,18 +1,18 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
+import time
 
 app = Flask(__name__)
 CORS(app)
 
 DB_PATH = "productos.db"
 
-# ---------------- INICIALIZAR TABLAS ----------------
+# ---- Inicialización de base de datos ----
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Tabla de productos
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,20 +21,29 @@ def init_db():
             link_pago TEXT
         )
     ''')
-    # Tabla de pagos registrados
     c.execute('''
         CREATE TABLE IF NOT EXISTS pagos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             producto_id INTEGER,
+            monto REAL,
             estado TEXT,
-            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            mp_id TEXT,
+            raw_data TEXT,
+            timestamp INTEGER DEFAULT (strftime('%s','now'))
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS heartbeat (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            timestamp INTEGER DEFAULT (strftime('%s','now'))
         )
     ''')
     conn.commit()
     conn.close()
-    return "Tablas inicializadas (productos, pagos)"
+    return "Tablas inicializadas (productos, pagos, heartbeat)"
 
-# ---------------- CRUD PRODUCTOS ----------------
+# ---- CRUD Productos ----
 @app.route('/productos', methods=['GET'])
 def get_productos():
     conn = sqlite3.connect(DB_PATH)
@@ -57,85 +66,100 @@ def add_producto():
         return "Faltan datos", 400
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)",
-        (nombre, precio, link_pago)
-    )
+    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)", (nombre, precio, link_pago))
     conn.commit()
     conn.close()
-    return "Producto agregado", 201
+    return "Producto agregado", 200
 
-@app.route('/productos/<int:producto_id>', methods=['DELETE'])
-def delete_producto(producto_id):
+@app.route('/productos/<int:prod_id>', methods=['DELETE'])
+def delete_producto(prod_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM productos WHERE id=?", (producto_id,))
+    c.execute("DELETE FROM productos WHERE id = ?", (prod_id,))
     conn.commit()
     conn.close()
     return "Producto eliminado", 200
 
-# ---------------- REDIRECCIÓN A MERCADOPAGO ----------------
-@app.route('/pagar/<int:producto_id>')
-def pagar(producto_id):
+# ---- PAGOS ----
+@app.route('/pagos', methods=['GET'])
+def get_pagos():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT link_pago FROM productos WHERE id = ?", (producto_id,))
-    row = c.fetchone()
+    c.execute("SELECT id, producto_id, monto, estado, mp_id, timestamp FROM pagos ORDER BY timestamp DESC LIMIT 20")
+    pagos = [
+        {'id': row[0], 'producto_id': row[1], 'monto': row[2], 'estado': row[3], 'mp_id': row[4], 'timestamp': row[5]}
+        for row in c.fetchall()
+    ]
     conn.close()
-    if row and row[0]:
-        return redirect(row[0])
-    else:
-        return "Link de pago no encontrado para este producto.", 404
+    return jsonify(pagos)
 
-# ---------------- WEBHOOK: REGISTRA PAGO ----------------
+@app.route('/pagos', methods=['POST'])
+def add_pago():
+    data = request.json
+    producto_id = data.get('producto_id')
+    monto = data.get('monto')
+    estado = data.get('estado', 'pendiente')
+    mp_id = data.get('mp_id', '')
+    raw_data = str(data)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO pagos (producto_id, monto, estado, mp_id, raw_data) VALUES (?, ?, ?, ?, ?)",
+              (producto_id, monto, estado, mp_id, raw_data))
+    conn.commit()
+    conn.close()
+    return "Pago registrado", 200
+
+# ---- WEBHOOK MERCADOPAGO ----
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    # Debe incluir: producto_id y estado ("aprobado" o lo que decidas)
-    producto_id = data.get('producto_id')
-    estado = data.get('estado', 'pendiente')
-    if not producto_id:
-        return "Falta producto_id", 400
+    # Aquí podés customizar el análisis del webhook según la info que envía MercadoPago
+    mp_id = None
+    monto = None
+    estado = None
+    producto_id = None
+    if data:
+        # Ejemplo: extraer el ID y estado de un pago (modifica según tu payload real)
+        mp_id = data.get('data', {}).get('id')
+        estado = data.get('type') or data.get('action') or "desconocido"
+        monto = data.get('monto', 0)
+    raw_data = str(data)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO pagos (producto_id, estado) VALUES (?, ?)",
-        (producto_id, estado)
-    )
+    c.execute("INSERT INTO pagos (producto_id, monto, estado, mp_id, raw_data) VALUES (?, ?, ?, ?, ?)",
+              (producto_id, monto, estado, mp_id, raw_data))
     conn.commit()
     conn.close()
-    return jsonify({'status': 'ok'})
+    return jsonify({"status": "ok"}), 200
 
-# ---------------- CONSULTA DE PAGOS PENDIENTES (ESP32) ----------------
-@app.route('/pagos_pendientes', methods=['GET'])
-def pagos_pendientes():
+# ---- HEARTBEAT (dispositivos conectados, opcional) ----
+@app.route('/heartbeat', methods=['POST'])
+def heartbeat():
+    data = request.json
+    device_id = data.get('device_id')
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, producto_id FROM pagos WHERE estado = 'aprobado' ORDER BY fecha LIMIT 1")
+    c.execute("INSERT INTO heartbeat (device_id) VALUES (?)", (device_id,))
+    conn.commit()
+    conn.close()
+    return "OK", 200
+
+@app.route('/heartbeat/<device_id>', methods=['GET'])
+def ver_heartbeat(device_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT timestamp FROM heartbeat WHERE device_id=? ORDER BY timestamp DESC LIMIT 1", (device_id,))
     row = c.fetchone()
     conn.close()
     if row:
-        return jsonify({'pago_id': row[0], 'producto_id': row[1]})
+        return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
     else:
-        return jsonify({'pago_id': None, 'producto_id': None})
+        return jsonify({'error': 'No hay heartbeat registrado'}), 404
 
-# ---------------- MARCAR COMO DISPENSADO (ESP32) ----------------
-@app.route('/marcar_dispensado', methods=['POST'])
-def marcar_dispensado():
-    data = request.json
-    pago_id = data.get('pago_id')
-    if not pago_id:
-        return "Falta pago_id", 400
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE pagos SET estado='dispensado' WHERE id=?", (pago_id,))
-    conn.commit()
-    conn.close()
-    return jsonify({'status': 'ok'})
-
+# ---- Ruta raíz para ver que está online ----
 @app.route('/')
-def home():
+def index():
     return "Servidor Dispen-Easy funcionando."
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(debug=True, host="0.0.0.0")
