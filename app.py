@@ -1,14 +1,13 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
-import time
 
 app = Flask(__name__)
 CORS(app)
 
 DB_PATH = "productos.db"
 
-# ---------- INICIALIZAR TABLAS ----------
+# ---------- INICIALIZAR TABLAS (correr /initdb 1 vez) ----------
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -17,7 +16,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
-            precio REAL NOT NULL
+            precio REAL NOT NULL,
+            link_pago TEXT
         )
     ''')
     c.execute('''
@@ -35,17 +35,24 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS fallas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descripcion TEXT,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
-    return "Tablas inicializadas (productos, pagos, heartbeat)"
+    return "Tablas inicializadas (productos, pagos, heartbeat, fallas)"
 
 # ---------- CRUD PRODUCTOS ----------
 @app.route('/productos', methods=['GET'])
 def get_productos():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, nombre, precio FROM productos")
-    productos = [{'id': row[0], 'nombre': row[1], 'precio': row[2]} for row in c.fetchall()]
+    c.execute("SELECT id, nombre, precio, link_pago FROM productos")
+    productos = [{'id': row[0], 'nombre': row[1], 'precio': row[2], 'link_pago': row[3]} for row in c.fetchall()]
     conn.close()
     return jsonify(productos)
 
@@ -54,11 +61,12 @@ def add_producto():
     data = request.get_json()
     nombre = data.get('nombre')
     precio = data.get('precio')
+    link_pago = data.get('link_pago')
     if not nombre or precio is None:
         return jsonify({'error': 'Nombre y precio son obligatorios'}), 400
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO productos (nombre, precio) VALUES (?, ?)", (nombre, precio))
+    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)", (nombre, precio, link_pago))
     conn.commit()
     conn.close()
     return jsonify({'status': 'ok'})
@@ -99,7 +107,7 @@ def check_payment_pendiente():
     if row:
         return jsonify({'id_pago': row[0], 'producto_id': row[1]})
     else:
-        return jsonify({'id_pago': None})
+        return jsonify({'id_pago': None, 'producto_id': None})
 
 # ---------- MARCAR PAGO COMO DISPENSADO ----------
 @app.route('/marcar_dispensado', methods=['POST'])
@@ -140,6 +148,28 @@ def ver_heartbeat(device_id):
         return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
     else:
         return jsonify({'error': 'No hay heartbeat registrado para este dispositivo'})
+
+# ---------- REGISTRO DE FALLAS ----------
+@app.route('/registrar_falla', methods=['POST'])
+def registrar_falla():
+    data = request.get_json()
+    descripcion = data.get('descripcion', 'Sin descripción')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO fallas (descripcion) VALUES (?)", (descripcion,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'falla registrada'})
+
+@app.route('/ver_fallas', methods=['GET'])
+def ver_fallas():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, descripcion, fecha FROM fallas ORDER BY fecha DESC")
+    rows = c.fetchall()
+    conn.close()
+    fallas = [{'id': row[0], 'descripcion': row[1], 'fecha': row[2]} for row in rows]
+    return jsonify(fallas)
 
 # ---------- ENDPOINT DE PRUEBA ----------
 @app.route('/')
