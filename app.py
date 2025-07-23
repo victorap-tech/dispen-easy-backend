@@ -9,7 +9,7 @@ CORS(app)
 
 DB_PATH = 'productos.db'
 
-ACCESS_TOKEN = "TU_ACCESS_TOKEN_AQUI"  # ← Cambia esto por tu Access Token real de MP
+ACCESS_TOKEN = "APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043"  # ← Cambia esto por tu Access Token real de MP
 
 # -------- INICIALIZAR TABLAS --------
 @app.route('/initdb')
