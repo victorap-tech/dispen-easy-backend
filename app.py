@@ -90,7 +90,24 @@ def webhook():
     conn.commit()
     conn.close()
     return "Pago registrado", 200
-
+               # Endpoint para ver todos los pagos registrados
+@app.route('/pagos', methods=['GET'])
+def ver_pagos():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, producto_id, estado, fecha, id_pago_mercadopago FROM pagos")
+    pagos = [
+        {
+            'id': row[0],
+            'producto_id': row[1],
+            'estado': row[2],
+            'fecha': row[3],
+            'id_pago_mercadopago': row[4]
+        }
+        for row in c.fetchall()
+    ]
+    conn.close()
+    return jsonify(pagos)
 # ---------------- CONSULTAR PAGOS PENDIENTES POR PRODUCTO ----------------
 @app.route('/pago_pendiente/<int:producto_id>', methods=['GET'])
 def pago_pendiente(producto_id):
