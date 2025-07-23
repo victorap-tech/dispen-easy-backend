@@ -2,13 +2,16 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
 import time
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
-DB_PATH = "productos.db"
+DB_PATH = 'productos.db'
 
-# ---------------- INICIALIZAR TABLAS ----------------
+ACCESS_TOKEN = "TU_ACCESS_TOKEN_AQUI"  # ← Cambia esto por tu token de MercadoPago
+
+# -------- INICIALIZAR TABLAS --------
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -37,7 +40,7 @@ def init_db():
     conn.close()
     return "Tablas inicializadas"
 
-# ---------------- PRODUCTOS ----------------
+# -------- ENDPOINT DE PRODUCTOS --------
 @app.route('/productos', methods=['GET', 'POST'])
 def productos():
     conn = sqlite3.connect(DB_PATH)
@@ -54,7 +57,7 @@ def productos():
     conn.close()
     return jsonify(productos)
 
-# ---------------- BORRAR PRODUCTO ----------------
+# -------- BORRAR PRODUCTO --------
 @app.route('/productos/<int:id>', methods=['DELETE'])
 def borrar_producto(id):
     conn = sqlite3.connect(DB_PATH)
@@ -64,33 +67,54 @@ def borrar_producto(id):
     conn.close()
     return "Producto eliminado", 200
 
-# ---------------- WEBHOOK DE MERCADOPAGO ----------------
+# -------- WEBHOOK DE MERCADOPAGO --------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    # Simulación: suponemos que recibimos {"id_pago_mercadopago": "...", "link_pago": "..."}
-    id_pago_mercadopago = data.get('id_pago_mercadopago')
-    link_pago = data.get('link_pago')
-    if not (id_pago_mercadopago and link_pago):
-        return "Datos insuficientes", 400
+    # MercadoPago: { "type": "payment", "data": { "id": 12345678 } }
+    mp_payment_id = data.get("data", {}).get("id")
+    if not mp_payment_id:
+        return "Sin ID de pago", 400
+
+    # Consultar detalles del pago en MercadoPago
+    url = f"https://api.mercadopago.com/v1/payments/{mp_payment_id}"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        return "No se pudo consultar el pago", 400
+
+    payment_info = r.json()
+    status = payment_info["status"]
+    if status != "approved":
+        return "Pago no aprobado", 200
+
+    # Obtener el link de pago y buscar producto en DB
+    link_pago = payment_info["point_of_interaction"]["transaction_data"]["qr_code"] if "point_of_interaction" in payment_info else None
+    if not link_pago:
+        link_pago = payment_info.get("description")  # Usa descripción como respaldo
+
+    # Buscar el producto según el link_pago
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Buscar el producto según el link de pago fijo
     c.execute("SELECT id FROM productos WHERE link_pago = ?", (link_pago,))
     row = c.fetchone()
     if not row:
         conn.close()
         return "Producto no encontrado", 404
     producto_id = row[0]
+
     # Registrar el pago como pendiente
     c.execute(
         "INSERT INTO pagos (producto_id, estado, fecha, id_pago_mercadopago) VALUES (?, ?, ?, ?)",
-        (producto_id, "pendiente", time.strftime("%Y-%m-%d %H:%M:%S"), id_pago_mercadopago)
+        (producto_id, "pendiente", time.strftime("%Y-%m-%d %H:%M:%S"), mp_payment_id)
     )
     conn.commit()
     conn.close()
     return "Pago registrado", 200
-               # Endpoint para ver todos los pagos registrados
+
+# -------- VER PAGOS --------
 @app.route('/pagos', methods=['GET'])
 def ver_pagos():
     conn = sqlite3.connect(DB_PATH)
@@ -108,7 +132,8 @@ def ver_pagos():
     ]
     conn.close()
     return jsonify(pagos)
-# ---------------- CONSULTAR PAGOS PENDIENTES POR PRODUCTO ----------------
+
+# -------- CONSULTAR PAGOS PENDIENTES POR PRODUCTO --------
 @app.route('/pago_pendiente/<int:producto_id>', methods=['GET'])
 def pago_pendiente(producto_id):
     conn = sqlite3.connect(DB_PATH)
@@ -121,7 +146,7 @@ def pago_pendiente(producto_id):
     else:
         return jsonify({"pendiente": False})
 
-# ---------------- MARCAR PAGO COMO DISPENSADO ----------------
+# -------- MARCAR PAGO COMO DISPENSADO --------
 @app.route('/marcar_dispensado/<int:pago_id>', methods=['POST'])
 def marcar_dispensado(pago_id):
     conn = sqlite3.connect(DB_PATH)
@@ -131,12 +156,10 @@ def marcar_dispensado(pago_id):
     conn.close()
     return "Ok", 200
 
-# ---------------- HOME ----------------
+# -------- HOME --------
 @app.route('/')
 def home():
     return "Servidor Dispen-Easy funcionando (QR fijo por producto)."
 
-# ---------------- MAIN ----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-   
