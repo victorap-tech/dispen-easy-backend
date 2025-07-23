@@ -8,20 +8,12 @@ CORS(app)
 
 DB_PATH = "productos.db"
 
-# --------- CORS FIX GLOBAL PARA RAILWAY ----------
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-# ---------- INICIALIZAR TABLAS ----------
+# ---------------- INICIALIZAR TABLAS ----------------
 @app.route('/initdb')
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Productos
+    # Tabla productos
     c.execute('''
         CREATE TABLE IF NOT EXISTS productos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,145 +22,104 @@ def init_db():
             link_pago TEXT
         )
     ''')
-    # Pagos
+    # Tabla pagos
     c.execute('''
         CREATE TABLE IF NOT EXISTS pagos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            estado TEXT,
             producto_id INTEGER,
+            estado TEXT,
             fecha TEXT,
-            monto REAL,
-            mp_payment_id TEXT,
-            mp_topic TEXT
-        )
-    ''')
-    # Heartbeat
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS heartbeat (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT,
-            timestamp TEXT
+            id_pago_mercadopago TEXT,
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
         )
     ''')
     conn.commit()
     conn.close()
-    return "Tablas inicializadas (productos, pagos, heartbeat)"
+    return "Tablas inicializadas"
 
-# ----------- PRODUCTOS (CRUD) -----------
-@app.route('/productos', methods=['GET', 'POST', 'OPTIONS'])
+# ---------------- PRODUCTOS ----------------
+@app.route('/productos', methods=['GET', 'POST'])
 def productos():
-    if request.method == 'OPTIONS':
-        return '', 200
-
-    if request.method == 'GET':
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id, nombre, precio, link_pago FROM productos")
-        productos = [
-            {'id': row[0], 'nombre': row[1], 'precio': row[2], 'link_pago': row[3]}
-            for row in c.fetchall()
-        ]
-        conn.close()
-        return jsonify(productos)
-
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     if request.method == 'POST':
         data = request.json
         nombre = data.get('nombre')
         precio = data.get('precio')
-        link_pago = data.get('link_pago', None)
-        if not nombre or not precio:
-            return "Faltan datos", 400
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)",
-            (nombre, precio, link_pago)
-        )
+        link_pago = data.get('link_pago')
+        c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)", (nombre, precio, link_pago))
         conn.commit()
-        conn.close()
-        return "Producto agregado", 201
+    c.execute("SELECT id, nombre, precio, link_pago FROM productos")
+    productos = [{'id': row[0], 'nombre': row[1], 'precio': row[2], 'link_pago': row[3]} for row in c.fetchall()]
+    conn.close()
+    return jsonify(productos)
 
-# ---------- BORRAR PRODUCTO ----------
+# ---------------- BORRAR PRODUCTO ----------------
 @app.route('/productos/<int:id>', methods=['DELETE'])
-def delete_producto(id):
+def borrar_producto(id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM productos WHERE id=?", (id,))
     conn.commit()
     conn.close()
-    return "Producto borrado", 200
+    return "Producto eliminado", 200
 
-# ---------- WEBHOOK DE MERCADOPAGO ----------
+# ---------------- WEBHOOK DE MERCADOPAGO ----------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    producto_id = data.get('producto_id', None)
-    estado = data.get('estado', None)
-    monto = data.get('monto', None)
-    mp_payment_id = data.get('mp_payment_id', None)
-    mp_topic = data.get('mp_topic', None)
-    fecha = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Simulación: suponemos que recibimos {"id_pago_mercadopago": "...", "link_pago": "..."}
+    id_pago_mercadopago = data.get('id_pago_mercadopago')
+    link_pago = data.get('link_pago')
+    if not (id_pago_mercadopago and link_pago):
+        return "Datos insuficientes", 400
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
-        INSERT INTO pagos (estado, producto_id, fecha, monto, mp_payment_id, mp_topic)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (estado, producto_id, fecha, monto, mp_payment_id, mp_topic))
+    # Buscar el producto según el link de pago fijo
+    c.execute("SELECT id FROM productos WHERE link_pago = ?", (link_pago,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return "Producto no encontrado", 404
+    producto_id = row[0]
+    # Registrar el pago como pendiente
+    c.execute(
+        "INSERT INTO pagos (producto_id, estado, fecha, id_pago_mercadopago) VALUES (?, ?, ?, ?)",
+        (producto_id, "pendiente", time.strftime("%Y-%m-%d %H:%M:%S"), id_pago_mercadopago)
+    )
     conn.commit()
     conn.close()
-    return "Webhook recibido", 200
+    return "Pago registrado", 200
 
-# ---------- CONSULTAR PAGOS ----------
-@app.route('/pagos', methods=['GET'])
-def get_pagos():
+# ---------------- CONSULTAR PAGOS PENDIENTES POR PRODUCTO ----------------
+@app.route('/pago_pendiente/<int:producto_id>', methods=['GET'])
+def pago_pendiente(producto_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, estado, producto_id, fecha, monto, mp_payment_id, mp_topic FROM pagos")
-    pagos = [
-        {
-            'id': row[0],
-            'estado': row[1],
-            'producto_id': row[2],
-            'fecha': row[3],
-            'monto': row[4],
-            'mp_payment_id': row[5],
-            'mp_topic': row[6]
-        }
-        for row in c.fetchall()
-    ]
-    conn.close()
-    return jsonify(pagos)
-
-# ---------- HEARTBEAT ----------
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    data = request.json
-    device_id = data.get('device_id', None)
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO heartbeat (device_id, timestamp) VALUES (?, ?)", (device_id, timestamp))
-    conn.commit()
-    conn.close()
-    return "Heartbeat registrado", 200
-
-@app.route('/ver_heartbeat/<device_id>', methods=['GET'])
-def ver_heartbeat(device_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT timestamp FROM heartbeat WHERE device_id=? ORDER BY timestamp DESC LIMIT 1", (device_id,))
+    c.execute("SELECT id FROM pagos WHERE producto_id = ? AND estado = 'pendiente' ORDER BY fecha LIMIT 1", (producto_id,))
     row = c.fetchone()
     conn.close()
     if row:
-        return jsonify({'device_id': device_id, 'ultimo_heartbeat': row[0]})
+        return jsonify({"pago_id": row[0], "pendiente": True})
     else:
-        return jsonify({'error': 'No hay heartbeat registrado para este dispositivo'})
+        return jsonify({"pendiente": False})
 
-# ----------- HOME -------------
+# ---------------- MARCAR PAGO COMO DISPENSADO ----------------
+@app.route('/marcar_dispensado/<int:pago_id>', methods=['POST'])
+def marcar_dispensado(pago_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE pagos SET estado = 'dispensado' WHERE id = ?", (pago_id,))
+    conn.commit()
+    conn.close()
+    return "Ok", 200
+
+# ---------------- HOME ----------------
 @app.route('/')
 def home():
-    return "Servidor Dispen-Easy funcionando."
+    return "Servidor Dispen-Easy funcionando (QR fijo por producto)."
 
-# ----------- PARA DESARROLLO LOCAL -------------
+# ---------------- MAIN ----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+   
