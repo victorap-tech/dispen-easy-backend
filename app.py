@@ -4,7 +4,7 @@ import requests
 
 app = Flask(__name__)
 DB_PATH = 'productos.db'
-ACCESS_TOKEN = 'APP_USR-xxx'  # Poné tu token de producción o prueba de MercadoPago
+ACCESS_TOKEN =  'APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043' # Poné tu token de producción o prueba de MercadoPago
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
