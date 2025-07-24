@@ -88,10 +88,15 @@ def borrar_producto(id):
 # -------- WEBHOOK DE MERCADOPAGO --------
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    print("WEBHOOK RECIBIDO:")
+    print(request.data)   # Muestra el raw data recibido
+    print(request.json)   # Muestra el json parseado si es posible
+    print(request.headers) # Muestra los headers
     data = request.json
     mp_payment_id = data.get("data", {}).get("id")
     if not mp_payment_id:
         return "Sin ID de pago", 400
+
     # Consultar detalles del pago en MercadoPago
     url = f"https://api.mercadopago.com/v1/payments/{mp_payment_id}"
     headers = {
