@@ -1,109 +1,65 @@
 from flask import Flask, request, jsonify
 import sqlite3
-import requests
+from datetime import datetime
 
 app = Flask(__name__)
+DATABASE = 'pagos.db'
 
-DB_PATH = 'productos.db'
-ACCESS_TOKEN = "APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043"  # Coloca tu Access Token aquí
-
+# Inicializa la base de datos
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS productos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL,
-            precio REAL NOT NULL,
-            link_pago TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS pagos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            producto_id INTEGER,
-            estado TEXT,
-            mp_payment_id TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pagos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_pago TEXT,
+                estado TEXT,
+                timestamp TEXT,
+                dispensado INTEGER DEFAULT 0
+            )
+        ''')
+        conn.commit()
 
-@app.route('/initdb')
-def initdb():
-    init_db()
-    return "DB Inicializada"
-
-@app.route('/agregar_producto', methods=['POST'])
-def agregar_producto():
-    data = request.json
-    nombre = data['nombre']
-    precio = data['precio']
-
-    # Generar link de pago MercadoPago
-    url = "https://api.mercadopago.com/checkout/preferences"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "items": [
-            {
-                "title": nombre,
-                "quantity": 1,
-                "currency_id": "ARS",
-                "unit_price": float(precio)
-            }
-        ]
-    }
-    response = requests.post(url, headers=headers, json=payload)
-    link_pago = response.json()["init_point"]
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO productos (nombre, precio, link_pago) VALUES (?, ?, ?)", (nombre, precio, link_pago))
-    conn.commit()
-    conn.close()
-    return jsonify({"mensaje": "Producto agregado", "link_pago": link_pago})
-
-@app.route('/productos', methods=['GET'])
-def productos():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, nombre, precio, link_pago FROM productos")
-    productos = [{"id": row[0], "nombre": row[1], "precio": row[2], "link_pago": row[3]} for row in c.fetchall()]
-    conn.close()
-    return jsonify(productos)
-
+# Ruta del webhook
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    print("WEBHOOK RECIBIDO:")
-    print(request.data)
     data = request.json
-    mp_payment_id = data.get("data", {}).get("id")
-    if not mp_payment_id:
-        return "Sin ID de pago", 400
+    if data and "data" in data and "id" in data["data"]:
+        id_pago = str(data["data"]["id"])
+        estado = "aprobado"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(DATABASE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO pagos (id_pago, estado, timestamp) VALUES (?, ?, ?)", (id_pago, estado, timestamp))
+            conn.commit()
+        return jsonify({"status": "success"}), 200
+    return jsonify({"status": "invalid payload"}), 400
 
-    # Consultar estado real del pago en MP
-    url = f"https://api.mercadopago.com/v1/payments/{mp_payment_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        return "No se pudo consultar el pago", 400
-    payment_info = r.json()
-    status = payment_info["status"]
+# Consulta de pago pendiente (para ESP32)
+@app.route('/check_payment_pendiente', methods=['GET'])
+def check_payment_pendiente():
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_pago FROM pagos WHERE estado = 'aprobado' AND dispensado = 0 ORDER BY timestamp LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            return jsonify({"pendiente": True, "id_pago": row[0]})
+        else:
+            return jsonify({"pendiente": False})
 
-    # Registrar pago en DB
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Puedes asociar a producto_id si guardás el external_reference en la preferencia
-    c.execute("INSERT INTO pagos (producto_id, estado, mp_payment_id) VALUES (?, ?, ?)",
-              (None, status, mp_payment_id))
-    conn.commit()
-    conn.close()
-
-    return "Pago registrado", 200
+# Marcar como dispensado
+@app.route('/marcar_dispensado', methods=['POST'])
+def marcar_dispensado():
+    data = request.json
+    id_pago = data.get("id_pago")
+    if id_pago:
+        with sqlite3.connect(DATABASE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE pagos SET dispensado = 1 WHERE id_pago = ?", (id_pago,))
+            conn.commit()
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "missing id_pago"}), 400
 
 if __name__ == '__main__':
     init_db()
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
