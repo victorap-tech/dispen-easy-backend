@@ -1,10 +1,13 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
+import os
 
 app = Flask(__name__)
+CORS(app)  # Habilita CORS para permitir conexiones desde otro dominio
 
-# Token de producción de MercadoPago (reemplazar con el tuyo)
-ACCESS_TOKEN = 'APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043'
+# Token de producción de MercadoPago (se toma de variable de entorno)
+ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
 
 @app.route('/')
 def home():
@@ -32,7 +35,7 @@ def crear_link():
                 "currency_id": "ARS"
             }
         ],
-        "notification_url": "https://TU_DOMINIO/webhook",
+        "notification_url": "https://TUDOMINIO.com/webhook",  # ← Cambiar si usás webhook
         "back_urls": {
             "success": "https://www.success.com",
             "failure": "https://www.failure.com",
