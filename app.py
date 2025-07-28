@@ -28,13 +28,13 @@ if not MP_ACCESS_TOKEN:
     # raise ValueError("MP_ACCESS_TOKEN no configurado en las variables de entorno.") # Descomentar para producción
 
 # URL del frontend para CORS (obtenida de variables de entorno o localhost para desarrollo)
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:8000") # Asegúrate que coincida con el puerto de tu frontend
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://dispen-easy-web-production.up.railway.app/") # Asegúrate que coincida con el puerto de tu frontend
 
 # --- Configuración MQTT ---
-MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "broker.hivemq.com") # Ej: xxxxx.s1.eu.hivemq.cloud
-MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883)) # Ej: 8883 para SSL/TLS, 1883 para TCP
-MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "")
+MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "c9b4a2b821ec4e87b10ed8e0ace8e4ee.s1.eu.hivemq.cloud") # Ej: xxxxx.s1.eu.hivemq.cloud
+MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 8883)) # Ej: 8883 para SSL/TLS, 1883 para TCP
+MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "Victor")
+MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "Dispeneasy25")
 
 # Cliente MQTT
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1) # Especifica la versión de la API
