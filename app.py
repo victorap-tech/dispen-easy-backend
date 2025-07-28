@@ -23,7 +23,7 @@ db = SQLAlchemy(app) # Inicializa la extensión SQLAlchemy
 # En Railway, en tu servicio de backend, añade una variable:
 # FRONTEND_URL = https://tu-frontend-nombre-random.railway.app
 # Para desarrollo local, puedes usar "http://localhost:XXXX" donde XXXX es el puerto de tu frontend.
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:8000")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://dispen-easy-web-production.up.railway.app/")
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}})
 
 # --- CONFIGURACIÓN DE MERCADO PAGO ---
@@ -36,10 +36,10 @@ if not MP_ACCESS_TOKEN:
 
 # --- CONFIGURACIÓN MQTT ---
 # Configura estas variables de entorno en Railway para tu broker MQTT (ej. HiveMQ Cloud)
-MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "broker.hivemq.com") # Ej: xxxxx.s1.eu.hivemq.cloud
-MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883)) # Ej: 8883 para SSL/TLS
-MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "")
+MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "c9b4a2b821ec4e87b10ed8e0ace8e4ee.s1.eu.hivemq.cloud") # Ej: xxxxx.s1.eu.hivemq.cloud
+MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 8883)) # Ej: 8883 para SSL/TLS
+MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "Victor")
+MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "Dispen-easy25")
 
 MQTT_TOPIC_COMANDO = "dispensador/comando" # Para enviar comandos al ESP
 MQTT_TOPIC_STATUS_ESP = "dispensador/status" # Para recibir estados del ESP
