@@ -301,3 +301,5 @@ if __name__ == '__main__':
     # Asegura que las tablas se creen e inicien los productos de ejemplo en desarrollo
     initialize_database()
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000), debug=True)
+with app.app_context():
+    initialize_database()
