@@ -9,7 +9,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuración base de datos
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///pagos.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
