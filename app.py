@@ -193,6 +193,10 @@ def webhook():
     return jsonify({"status": "ok"})
 
 # Main
+@app.before_first_request
+def crear_tablas():
+    db.create_all()
+
 if __name__ == "__main__":
     initialize_database()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
