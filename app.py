@@ -3,6 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 import os
 import paho.mqtt.client as mqtt
+import mercadopago
 
 app = Flask(__name__)
 CORS(app)
@@ -129,6 +130,38 @@ def marcar_dispensado():
 def initialize_database():
     with app.app_context():
         db.create_all()
+        
+
+# Configurar MercadoPago con tu token de acceso (de producción o test)
+sdk = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN", "TU_ACCESS_TOKEN_AQUI"))
+
+@app.route('/api/generar_qr/<int:id_producto>', methods=['POST'])
+def generar_qr(id_producto):
+    producto = Producto.query.get(id_producto)
+    if not producto:
+        return jsonify({"status": "producto no encontrado"}), 404
+
+    preference_data = {
+        "items": [
+            {
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio),
+            }
+        ],
+        "back_urls": {
+            "success": "https://www.google.com",
+            "failure": "https://www.google.com",
+            "pending": "https://www.google.com"
+        },
+        "auto_return": "approved",
+        "external_reference": str(producto.id)
+    }
+
+    preference_response = sdk.preference().create(preference_data)
+    init_point = preference_response["response"]["init_point"]
+
+    return jsonify({"url": init_point})
 
 if __name__ == '__main__':
     initialize_database()
