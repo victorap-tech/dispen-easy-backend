@@ -24,7 +24,7 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://dispen-easy-web-productio
 MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "c9b4a2b821ec4e87b10ed8e0ace8e4ee.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 8883))
 MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "Victor")
-MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "Dispen2025")
+MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "Dispeneasy2025")
 
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
