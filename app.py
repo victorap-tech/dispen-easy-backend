@@ -18,13 +18,13 @@ db = SQLAlchemy(app)
 
 # Mercado Pago
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://dispen-easy-web-production.up.railway.app/")
 
 # MQTT
-MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "broker.hivemq.com")
-MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883))
-MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "")
+MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "c9b4a2b821ec4e87b10ed8e0ace8e4ee.s1.eu.hivemq.cloud")
+MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 8883))
+MQTT_USERNAME = os.environ.get("MQTT_BROKER_USERNAME", "Victor")
+MQTT_PASSWORD = os.environ.get("MQTT_BROKER_PASSWORD", "Dispen2025")
 
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
