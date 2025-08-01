@@ -162,12 +162,13 @@ def generar_qr(id_producto):
     init_point = preference_response["response"]["init_point"]
 
     return jsonify({"url": init_point})
+    
     from database import engine
-from models import Base
+    from models import Base
 
 # Crear la tabla en la base de datos si no existe
 Base.metadata.create_all(bind=engine)
 
 if __name__ == '__main__':
-    initialize_database()
+    
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
