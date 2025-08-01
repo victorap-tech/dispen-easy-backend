@@ -163,8 +163,8 @@ def generar_qr(id_producto):
 
     return jsonify({"url": init_point})
     
-    from database import engine
-    from models import Base
+from database import engine
+from models import Base
 
 # Crear la tabla en la base de datos si no existe
 Base.metadata.create_all(bind=engine)
