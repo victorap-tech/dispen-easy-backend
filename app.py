@@ -52,7 +52,7 @@ def listar_productos():
             'id': p.id,
             'nombre': p.nombre,
             'precio': p.precio,
-            'cantidad_ml': p.cantidad_ml
+            'cantidad': p.cantidad
         } for p in productos
     ])
 
@@ -111,7 +111,7 @@ def check_payment_pendiente():
             "pago_id": pago.payment_id,
             "producto_id": producto.id,
             "nombre": producto.nombre,
-            "cantidad_ml": producto.cantidad_ml
+            "cantidad": producto.cantidad
         })
     return jsonify({"status": "sin pagos pendientes"})
 
