@@ -10,6 +10,9 @@ from decimal import Decimal
 
 # --- Configuración de la Aplicación Flask ---
 app = Flask(__name__, static_folder='static', template_folder='templates')
+@app.route("/")
+def index():
+    return "✅ Backend Dispen-Easy funcionando"
 CORS(app) # Habilita CORS para que el ESP32 o apps externas puedan consumirlo
 
 # --- Configuración de la Base de Datos ---
