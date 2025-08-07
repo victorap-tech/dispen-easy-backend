@@ -60,11 +60,49 @@ def eliminar_producto(id):
     return jsonify({"mensaje": "Producto eliminado"})
 
 # --- Generar QR (simulado para ejemplo) ---
+
 @app.route("/api/generar_qr/<int:id>", methods=["POST", "OPTIONS"])
 def generar_qr(id):
     producto = Producto.query.get_or_404(id)
-    url_ficticia = f"https://www.mercadopago.com/qr?id_producto={id}"
-    return jsonify({"url": url_ficticia})
+
+    access_token = os.getenv("MP_ACCESS_TOKEN")
+    if not access_token:
+        return jsonify({"error": "Falta el token de MercadoPago"}), 500
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "items": [
+            {
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio),
+                "currency_id": "ARS"
+            }
+        ],
+        "back_urls": {
+            "success": "https://dispen-easy-web-production.up.railway.app",
+            "failure": "https://dispen-easy-web-production.up.railway.app",
+            "pending": "https://dispen-easy-web-production.up.railway.app"
+        },
+        "auto_return": "approved",
+        "external_reference": str(producto.id)
+    }
+
+    try:
+        res = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers=headers,
+            json=payload
+        )
+        res.raise_for_status()
+        data = res.json()
+        return jsonify({"url": data["init_point"]})
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- Inicializar base de datos si no existe ---
 with app.app_context():
