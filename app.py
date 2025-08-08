@@ -1,170 +1,111 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-import os
-import paho.mqtt.client as mqtt
+import qrcode
+import io
+import base64
 import requests
 
 app = Flask(__name__)
 CORS(app)
 
-# Base de datos: usa DATABASE_URL si está definido, si no usa SQLite local
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///pagos.db')
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+# Configuración de la base de datos
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///productos.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Modelos
+# Modelo de producto
 class Producto(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(100), nullable=False)
-    precio = db.Column(db.Float, nullable=False)
+    nombre = db.Column(db.String(80), nullable=False)
+    precio = db.Column(db.Integer, nullable=False)
     cantidad_litros = db.Column(db.Float, nullable=False)
 
-class Pago(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    payment_id = db.Column(db.String(100), unique=True)
-    producto_id = db.Column(db.Integer, db.ForeignKey('producto.id'))
-    dispensado = db.Column(db.Boolean, default=False)
+# Crear la base de datos si no existe
+with app.app_context():
+    db.create_all()
 
-# MQTT
-mqtt_client = mqtt.Client()
-mqtt_broker = os.getenv("MQTT_BROKER", "c9b4a2b821ec4e64b81628b63d4f452c.s1.eu.hivemq.cloud")
-mqtt_port = int(os.getenv("MQTT_PORT", 8883))
-mqtt_user = os.getenv("MQTT_USER", "Victor")
-mqtt_pass = os.getenv("MQTT_PASS", "Dispeneasy2025")
-
-if mqtt_user and mqtt_pass:
-    mqtt_client.username_pw_set(mqtt_user, mqtt_pass)
-    mqtt_client.tls_set()  # Habilita TLS si es HiveMQ Cloud
-    mqtt_client.connect(mqtt_broker, mqtt_port, 60)
-
-# Rutas
+# Ruta de bienvenida
 @app.route('/')
-def index():
+def inicio():
     return 'Backend Dispen-Easy funcionando'
 
+# Obtener todos los productos
 @app.route('/api/productos', methods=['GET'])
-def listar_productos():
+def obtener_productos():
     productos = Producto.query.all()
-    return jsonify([
-        {
+    resultado = []
+    for p in productos:
+        resultado.append({
             'id': p.id,
             'nombre': p.nombre,
             'precio': p.precio,
-            'cantidad': p.cantidad_litros
-        } for p in productos
-    ])
+            'cantidad_litros': p.cantidad_litros
+        })
+    return jsonify(resultado)
 
+# Agregar producto
 @app.route('/api/productos', methods=['POST'])
 def agregar_producto():
     data = request.get_json()
     nuevo = Producto(
         nombre=data['nombre'],
         precio=data['precio'],
-        cantidad_litros=data['cantidad']
+        cantidad_litros=data['cantidad_litros']
     )
     db.session.add(nuevo)
     db.session.commit()
-    return jsonify({"status": "ok"})
+    return jsonify({'mensaje': 'Producto agregado'}), 200
 
+# Eliminar producto
 @app.route('/api/productos/<int:id>', methods=['DELETE'])
 def eliminar_producto(id):
     producto = Producto.query.get(id)
-    if producto:
-        db.session.delete(producto)
-        db.session.commit()
-        return jsonify({"status": "eliminado"})
-    return jsonify({"error": "Producto no encontrado"}), 404
+    if not producto:
+        return jsonify({'error': 'Producto no encontrado'}), 404
+    db.session.delete(producto)
+    db.session.commit()
+    return jsonify({'mensaje': 'Producto eliminado'}), 200
 
-@app.route("/api/generar_qr/<int:id>", methods=["POST"])
+# Generar QR a partir del producto
+@app.route('/api/generar_qr/<int:id>', methods=['POST'])
 def generar_qr(id):
-    try:
-        producto = Producto.query.get(id)
-        if not producto:
-            return jsonify({"error": "Producto no encontrado"}), 404
+    producto = Producto.query.get(id)
+    if not producto:
+        return jsonify({'error': 'Producto no encontrado'}), 404
 
-        access_token = os.getenv("ACCESS_TOKEN")
-        if not access_token:
-            return jsonify({"error": "ACCESS_TOKEN no definido en variables de entorno"}), 500
+    # Crear preferencia en MercadoPago
+    url = 'https://api.mercadopago.com/checkout/preferences'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer TU_ACCESS_TOKEN'  # ⚠️ Reemplazá con tu token real
+    }
+    payload = {
+        "items": [
+            {
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio)
+            }
+        ],
+        "notification_url": "https://webhook.site/prueba"  # opcional
+    }
 
-        url = "https://api.mercadopago.com/checkout/preferences"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}"
-        }
-        body = {
-            "items": [
-                {
-                    "title": producto.nombre,
-                    "quantity": 1,
-                    "currency_id": "ARS",
-                    "unit_price": producto.precio
-                }
-            ],
-            "back_urls": {
-                "success": "https://www.mercadopago.com.ar",
-                "failure": "https://www.mercadopago.com.ar"
-            },
-            "auto_return": "approved"
-        }
+    response = requests.post(url, headers=headers, json=payload)
 
-        response = requests.post(url, headers=headers, json=body)
-        if response.status_code != 201:
-            print("Error MercadoPago:", response.text)
-            return jsonify({"error": "No se pudo generar la preferencia de pago"}), 500
+    if response.status_code != 201:
+        return jsonify({'error': 'No se pudo generar link de pago'}), 500
 
-        init_point = response.json().get("init_point")
-        return jsonify({"qr": init_point})
+    link = response.json()['init_point']
 
-    except Exception as e:
-        print("Error en generar_qr:", str(e))
-        return jsonify({"error": "Error interno del servidor"}), 500
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
-    payment_id = data.get("id")
-    producto_id = data.get("producto_id")
+    # Generar QR
+    qr = qrcode.make(link)
+    buffer = io.BytesIO()
+    qr.save(buffer, format='PNG')
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-    if payment_id and producto_id:
-        nuevo = Pago(payment_id=str(payment_id), producto_id=producto_id)
-        db.session.add(nuevo)
-        db.session.commit()
-        return jsonify({"status": "guardado"})
-
-    return jsonify({"status": "error"}), 400
-
-@app.route('/check_payment_pendiente')
-def check_payment_pendiente():
-    pago = Pago.query.filter_by(dispensado=False).first()
-    if pago:
-        producto = Producto.query.get(pago.producto_id)
-        if producto:
-            return jsonify({
-                "pago_id": pago.payment_id,
-                "producto_id": producto.id,
-                "nombre": producto.nombre,
-                "cantidad_litros": producto.cantidad_litros
-            })
-    return jsonify({"status": "sin pagos pendientes"})
-
-@app.route('/marcar_dispensado', methods=['POST'])
-def marcar_dispensado():
-    data = request.get_json()
-    id_pago = data.get("id_pago")
-    pago = Pago.query.filter_by(payment_id=id_pago).first()
-    if pago:
-        pago.dispensado = True
-        db.session.commit()
-        return jsonify({"status": "marcado"})
-    return jsonify({"status": "pago no encontrado"}), 404
-
-# Inicialización de la base de datos
-def initialize_database():
-    with app.app_context():
-        db.create_all()
+    return jsonify({'qr_base64': qr_base64})
 
 # Punto de entrada
-if __name__ == "__main__":
-    initialize_database()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
