@@ -31,7 +31,7 @@ def generar_qr(id):
     url = 'https://api.mercadopago.com/checkout/preferences'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043'  # Reemplazá por tu token real
+        'Authorization': f'Bearer {os.getenv("APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043")}'
     }
     payload = {
         "items": [
