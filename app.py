@@ -78,7 +78,7 @@ def generar_qr(id):
     url = 'https://api.mercadopago.com/checkout/preferences'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer TU_ACCESS_TOKEN'  # ⚠️ Reemplazá con tu token real
+        'Authorization': 'Bearer APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043'  # ⚠️ Reemplazá con tu token real
     }
     payload = {
         "items": [
@@ -88,7 +88,7 @@ def generar_qr(id):
                 "unit_price": float(producto.precio)
             }
         ],
-        "notification_url": "https://webhook.site/prueba"  # opcional
+        "notification_url": "https://web-production-e7d2.up.railway.app/webhook"  # opcional
     }
 
     response = requests.post(url, headers=headers, json=payload)
