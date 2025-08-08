@@ -71,7 +71,7 @@ class Producto(db.Model):
 @app.route('/api/productos', methods=['POST'])
 def agregar_producto():
     data = request.json
-    nuevo_producto = Producto(nombre=data['nombre'], precio=data['precio'])
+    nuevo_producto = Producto(nombre=data['nombre'], precio=data['precio'], cantidad=data['cantidad'])
     db.session.add(nuevo_producto)
     db.session.commit()
     return jsonify({'mensaje': 'Producto agregado correctamente'})
