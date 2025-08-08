@@ -60,21 +60,39 @@ def generar_qr(id):
 
     return jsonify({'qr_base64': qr_base64})
 
-# MODELO DE PRODUCTO
+# MODELO PRODUCTO
 class Producto(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     nombre = db.Column(db.String(100), nullable=False)
     precio = db.Column(db.Float, nullable=False)
-    cantidad = db.Column(db.Integer, nullable=False)
+    cantidad = db.Column(db.Integer, nullable=False)  # <-- AGREGADO
 
 # ENDPOINT PARA AGREGAR PRODUCTO
 @app.route('/api/productos', methods=['POST'])
 def agregar_producto():
     data = request.json
-    nuevo_producto = Producto(nombre=data['nombre'], precio=data['precio'], cantidad=data['cantidad'])
+    nuevo_producto = Producto(
+        nombre=data['nombre'],
+        precio=data['precio'],
+        cantidad=data['cantidad']
+    )
     db.session.add(nuevo_producto)
     db.session.commit()
     return jsonify({'mensaje': 'Producto agregado correctamente'})
+
+# ENDPOINT PARA OBTENER PRODUCTOS
+@app.route('/api/productos', methods=['GET'])
+def obtener_productos():
+    productos = Producto.query.all()
+    resultado = []
+    for p in productos:
+        resultado.append({
+            'id': p.id,
+            'nombre': p.nombre,
+            'precio': p.precio,
+            'cantidad': p.cantidad
+        })
+    return jsonify(resultado)
 
 # ENDPOINT PARA ELIMINAR PRODUCTO
 @app.route('/api/productos/<int:id>', methods=['DELETE'])
