@@ -105,7 +105,14 @@ def generar_qr(id):
     qr_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
     return jsonify({'qr_base64': qr_base64})
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json
+    print("⚠️ Webhook recibido:", data)  # Para debug en Railway logs
 
+    # Podés guardar en base de datos, marcar como pendiente o solo mostrar
+    # Por ahora solo devolvemos OK
+    return '', 200
 # Punto de entrada
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
