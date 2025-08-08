@@ -114,5 +114,5 @@ def webhook():
     # Por ahora solo devolvemos OK
     return '', 200
 # Punto de entrada
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+#if __name__ == '__main__':
+    #app.run(host='0.0.0.0', port=5000)
