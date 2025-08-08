@@ -52,7 +52,7 @@ def listar_productos():
             'id': p.id,
             'nombre': p.nombre,
             'precio': p.precio,
-            'cantidad_litros': p.cantidad_litros
+            'cantidad': p.cantidad_litros
         } for p in productos
     ])
 
