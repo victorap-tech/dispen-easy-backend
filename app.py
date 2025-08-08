@@ -84,15 +84,15 @@ def agregar_producto():
 @app.route('/api/productos', methods=['GET'])
 def obtener_productos():
     productos = Producto.query.all()
-    resultado = []
-    for p in productos:
-        resultado.append({
-            'id': p.id,
-            'nombre': p.nombre,
-            'precio': p.precio,
-            'cantidad': p.cantidad
+    lista_productos = []
+    for producto in productos:
+        lista_productos.append({
+            'id': producto.id,
+            'nombre': producto.nombre,
+            'precio': producto.precio,
+            'cantidad': producto.cantidad
         })
-    return jsonify(resultado)
+    return jsonify(lista_productos)
 
 # ENDPOINT PARA ELIMINAR PRODUCTO
 @app.route('/api/productos/<int:id>', methods=['DELETE'])
