@@ -4,6 +4,7 @@ import requests
 import qrcode
 import io
 import base64
+import os
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///pagos.db'
