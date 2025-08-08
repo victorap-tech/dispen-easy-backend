@@ -62,7 +62,7 @@ def agregar_producto():
     nuevo = Producto(
         nombre=data['nombre'],
         precio=data['precio'],
-        cantidad_litros=data['cantidad_litros']
+        cantidad_litros=data['cantidad']
     )
     db.session.add(nuevo)
     db.session.commit()
