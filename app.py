@@ -77,38 +77,49 @@ def eliminar_producto(id):
         return jsonify({"status": "eliminado"})
     return jsonify({"error": "Producto no encontrado"}), 404
 
-@app.route('/api/generar_qr/<int:id>', methods=['GET'])
+@app.route("/api/generar_qr/<int:id>", methods=["POST"])
 def generar_qr(id):
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "Producto no encontrado"}), 404
+    try:
+        producto = Producto.query.get(id)
+        if not producto:
+            return jsonify({"error": "Producto no encontrado"}), 404
 
-    access_token = os.getenv("MP_ACCESS_TOKEN")
-    if not access_token:
-        return jsonify({"error": "Falta MP_ACCESS_TOKEN"}), 500
+        access_token = os.getenv("ACCESS_TOKEN")
+        if not access_token:
+            return jsonify({"error": "ACCESS_TOKEN no definido en variables de entorno"}), 500
 
-    url = "https://api.mercadopago.com/checkout/preferences"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "items": [{
-            "title": producto.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": producto.precio
-        }],
-        "notification_url": os.getenv("WEBHOOK_URL", "https://example.com/webhook"),
-        "external_reference": str(producto.id)
-    }
+        url = "https://api.mercadopago.com/checkout/preferences"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        }
+        body = {
+            "items": [
+                {
+                    "title": producto.nombre,
+                    "quantity": 1,
+                    "currency_id": "ARS",
+                    "unit_price": producto.precio
+                }
+            ],
+            "back_urls": {
+                "success": "https://www.mercadopago.com.ar",
+                "failure": "https://www.mercadopago.com.ar"
+            },
+            "auto_return": "approved"
+        }
 
-    resp = requests.post(url, json=body, headers=headers)
-    if resp.status_code == 201:
-        return jsonify({"qr_url": resp.json()["init_point"]})
-    else:
-        return jsonify({"error": "Error al generar QR", "detalles": resp.text}), 500
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 201:
+            print("Error MercadoPago:", response.text)
+            return jsonify({"error": "No se pudo generar la preferencia de pago"}), 500
 
+        init_point = response.json().get("init_point")
+        return jsonify({"qr": init_point})
+
+    except Exception as e:
+        print("Error en generar_qr:", str(e))
+        return jsonify({"error": "Error interno del servidor"}), 500
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json()
