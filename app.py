@@ -3,26 +3,18 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 import requests, qrcode, io, base64, os
 
-# ------------------------
-# App + CORS
-# ------------------------
 app = Flask(__name__)
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},      # cambialo por el dominio del front si querés
+    resources={r"/api/*": {"origins": [
+        "https://dispen-easy-web-production.up.railway.app",
+        "http://localhost:3000"
+    ]}},
     methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type"]
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-@app.after_request
-def add_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return resp
-
-# ------------------------
 # DB
 # ------------------------
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
