@@ -1,20 +1,36 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-import requests
-import qrcode
-import io
-import base64
-import os
+import requests, qrcode, io, base64, os
 
+# ------------------------
+# App + CORS
+# ------------------------
 app = Flask(__name__)
 
-CORS(app)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},      # cambialo por el dominio del front si querés
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"]
+)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+# ------------------------
+# DB
+# ------------------------
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 db = SQLAlchemy(app)
 
-# MODELO DE BASE DE DATOS
+# ------------------------
+# Modelos
+# ------------------------
 class Pago(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     id_pago = db.Column(db.String(120), unique=True, nullable=False)
@@ -22,21 +38,79 @@ class Pago(db.Model):
     producto = db.Column(db.String(120), nullable=True)
     dispensado = db.Column(db.Boolean, default=False)
 
-# CREAR TABLAS
+class Producto(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(100), nullable=False)
+    precio = db.Column(db.Float, nullable=False)
+    cantidad = db.Column(db.Integer, nullable=False)  # stock / cantidad
+
+# Crear tablas si no existen
 with app.app_context():
     db.create_all()
+    print("Tablas creadas")
 
-# ENDPOINT PARA CREAR PRODUCTO Y GENERAR QR
-@app.route('/api/generar_qr/<int:id>', methods=['GET'])
+# ------------------------
+# Preflight (OPTIONS) para CORS
+# ------------------------
+@app.route("/api/productos", methods=["OPTIONS"])
+def productos_options():
+    return "", 204
+
+@app.route("/api/productos/<int:id>", methods=["OPTIONS"])
+def productos_id_options(id):
+    return "", 204
+
+# ------------------------
+# CRUD Productos
+# ------------------------
+@app.route("/api/productos", methods=["GET"])
+def listar_productos():
+    productos = Producto.query.all()
+    data = [{"id": p.id, "nombre": p.nombre, "precio": p.precio, "cantidad": p.cantidad} for p in productos]
+    return jsonify(data)
+
+@app.route("/api/productos", methods=["POST"])
+def agregar_producto():
+    data = request.json or {}
+    try:
+        nuevo = Producto(
+            nombre=data["nombre"],
+            precio=float(data["precio"]),
+            cantidad=int(data["cantidad"])
+        )
+        db.session.add(nuevo)
+        db.session.commit()
+        return jsonify({"mensaje": "Producto agregado correctamente"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"No se pudo agregar el producto: {e}"}), 400
+
+@app.route("/api/productos/<int:id>", methods=["DELETE"])
+def eliminar_producto(id):
+    p = Producto.query.get(id)
+    if not p:
+        return jsonify({"error": "Producto no encontrado"}), 404
+    db.session.delete(p)
+    db.session.commit()
+    return jsonify({"mensaje": "Producto eliminado"})
+
+# ------------------------
+# Generar QR de pago (Mercado Pago)
+# ------------------------
+@app.route("/api/generar_qr/<int:id>", methods=["GET"])
 def generar_qr(id):
     producto = Producto.query.get(id)
     if not producto:
-        return jsonify({'error': 'Producto no encontrado'}), 404
+        return jsonify({"error": "Producto no encontrado"}), 404
 
-    url = 'https://api.mercadopago.com/checkout/preferences'
+    token = os.getenv("MP_ACCESS_TOKEN")
+    if not token:
+        return jsonify({"error": "Falta MP_ACCESS_TOKEN en variables de entorno"}), 500
+
+    url = "https://api.mercadopago.com/checkout/preferences"
     headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {os.getenv("APP_USR-7903926381447246-061121-b38fe6b7c7d58e0b3927c08d041e9bd9-246749043")}'
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
     }
     payload = {
         "items": [
@@ -46,115 +120,67 @@ def generar_qr(id):
                 "unit_price": float(producto.precio)
             }
         ],
-        "notification_url": "https://web-production-e7d2.up.railway.app/webhook"  # Reemplazá por tu dominio Railway
+        # Cambiá el dominio si es necesario
+        "notification_url": "https://web-production-e7d2.up.railway.app/webhook"
     }
 
-    response = requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 201:
+        return jsonify({"error": "No se pudo generar link de pago"}), 500
 
-    if response.status_code != 201:
-        return jsonify({'error': 'No se pudo generar link de pago'}), 500
+    link = resp.json().get("init_point")
 
-    link = response.json()['init_point']
-
-    # Generar QR
+    # Generar PNG en base64
     qr = qrcode.make(link)
     buffer = io.BytesIO()
-    qr.save(buffer, format='PNG')
-    qr_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    qr.save(buffer, format="PNG")
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    return jsonify({'qr_base64': qr_base64})
+    return jsonify({"qr_base64": qr_base64})
 
-# MODELO PRODUCTO
-class Producto(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(100), nullable=False)
-    precio = db.Column(db.Float, nullable=False)
-    cantidad = db.Column(db.Integer, nullable=False)  # <-- AGREGADO
-
-# ENDPOINT PARA AGREGAR PRODUCTO
-@app.route('/api/productos', methods=['POST'])
-def agregar_producto():
-    data = request.json
-    nuevo_producto = Producto(
-        nombre=data['nombre'],
-        precio=data['precio'],
-        cantidad=data['cantidad']
-    )
-    db.session.add(nuevo_producto)
-    db.session.commit()
-    return jsonify({'mensaje': 'Producto agregado correctamente'})
-
-# ENDPOINT PARA OBTENER PRODUCTOS
-@app.route('/api/productos', methods=['GET'])
-def obtener_productos():
-    productos = Producto.query.all()
-    lista_productos = []
-    for producto in productos:
-        lista_productos.append({
-            'id': producto.id,
-            'nombre': producto.nombre,
-            'precio': producto.precio,
-            'cantidad': producto.cantidad
-        })
-    return jsonify(lista_productos)
-
-# ENDPOINT PARA ELIMINAR PRODUCTO
-@app.route('/api/productos/<int:id>', methods=['DELETE'])
-def eliminar_producto(id):
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({'error': 'Producto no encontrado'}), 404
-    db.session.delete(producto)
-    db.session.commit()
-    return jsonify({'mensaje': 'Producto eliminado'})
-
-# ENDPOINT PARA LISTAR PRODUCTOS
-@app.route('/api/productos', methods=['GET'])
-def listar_productos():
-    productos = Producto.query.all()
-    resultado = [{'id': p.id, 'nombre': p.nombre, 'precio': p.precio} for p in productos]
-    return jsonify(resultado)
-
-# WEBHOOK DE MERCADOPAGO
-@app.route('/webhook', methods=['POST'])
+# ------------------------
+# Webhook Mercado Pago
+# ------------------------
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.json or {}
     print("⚡ Webhook recibido:", data)
 
-    id_pago = data.get('data', {}).get('id')
+    id_pago = data.get("data", {}).get("id")
     if id_pago:
-        nuevo_pago = Pago(id_pago=id_pago, estado='pendiente', dispensado=False)
-        db.session.add(nuevo_pago)
+        nuevo = Pago(id_pago=id_pago, estado="pendiente", dispensado=False)
+        db.session.add(nuevo)
         db.session.commit()
 
-    return '', 200
+    return "", 200
 
-# CONSULTA DE PAGOS PENDIENTES
-@app.route('/check_payment_pendiente', methods=['GET'])
+# ------------------------
+# Consultar pago pendiente
+# ------------------------
+@app.route("/check_payment_pendiente", methods=["GET"])
 def check_pendiente():
-    pago = Pago.query.filter_by(estado='pendiente', dispensado=False).first()
+    pago = Pago.query.filter_by(estado="pendiente", dispensado=False).first()
     if pago:
-        return jsonify({'id_pago': pago.id_pago})
-    else:
-        return jsonify({'mensaje': 'No hay pagos pendientes'}), 204
+        return jsonify({"id_pago": pago.id_pago})
+    return jsonify({"mensaje": "No hay pagos pendientes"}), 204
 
-# MARCAR COMO DISPENSADO
-@app.route('/marcar_dispensado', methods=['POST'])
+# ------------------------
+# Marcar como dispensado
+# ------------------------
+@app.route("/marcar_dispensado", methods=["POST"])
 def marcar_dispensado():
-    data = request.json
-    id_pago = data.get('id_pago')
+    data = request.json or {}
+    id_pago = data.get("id_pago")
     pago = Pago.query.filter_by(id_pago=id_pago).first()
     if pago:
-        pago.estado = 'aprobado'
+        pago.estado = "aprobado"
         pago.dispensado = True
         db.session.commit()
-        return jsonify({'mensaje': 'Pago marcado como dispensado'})
-    else:
-        return jsonify({'error': 'Pago no encontrado'}), 404
+        return jsonify({"mensaje": "Pago marcado como dispensado"})
+    return jsonify({"error": "Pago no encontrado"}), 404
 
-with app.app_context():
-    db.create_all()
-    print("Tablas creadas")
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+# ------------------------
+# Entrada local (Gunicorn maneja producción)
+# ------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
