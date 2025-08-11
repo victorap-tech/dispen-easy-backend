@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-CORS(app)
 import requests
 import qrcode
 import io
@@ -9,6 +8,9 @@ import base64
 import os
 
 app = Flask(__name__)
+
+CORS(app)
+
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
 db = SQLAlchemy(app)
 
