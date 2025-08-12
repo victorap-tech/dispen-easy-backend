@@ -131,68 +131,97 @@ def eliminar_producto(id):
     db.session.commit()
     return jsonify({"mensaje": "Producto eliminado"})
 
-# ------------------------
+# --------------------------------------------
 # Generar QR de pago (Mercado Pago)
-# ------------------------
+# --------------------------------------------
 @app.route("/api/generar_qr/<int:id>", methods=["GET"])
 def generar_qr(id):
+    # 1) Buscar producto
     producto = Producto.query.get(id)
     if not producto:
         return jsonify({"error": "Producto no encontrado"}), 404
 
+    # 2) Token MP desde variables de entorno
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
         return jsonify({"error": "Falta MP_ACCESS_TOKEN en variables de entorno"}), 500
 
+    # 3) Crear preferencia en Mercado Pago
     url = "https://api.mercadopago.com/checkout/preferences"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
 
-     payload = {
-        "items": [{
-            "title": producto.nombre,
-            "quantity": 1,
-            "unit_price": float(producto.precio)
-        }],
-        "description": producto.nombre,  # <-- para que todos los flujos vean el nombre
+    # Ajusta estos dominios si cambiaron
+    FRONTEND_URL = "https://dispen-easy-web-production.up.railway.app/"
+    BACKEND_URL  = "https://web-production-e7d2.up.railway.app"
+
+    payload = {
+        "items": [
+            {
+                "title": producto.nombre,                 # Nombre visible
+                "quantity": 1,
+                "unit_price": float(producto.precio),     # Importe
+            }
+        ],
+        # Suma redundancia del nombre para que aparezca en todos los flujos
+        "description": producto.nombre,
         "additional_info": {
             "items": [{"title": producto.nombre}]
         },
+        # Metadata útil para rastrear en tu BD
         "metadata": {
             "producto_id": producto.id,
-            "producto_nombre": producto.nombre
+            "producto_nombre": producto.nombre,
         },
+        # Para reconciliar desde el webhook
         "external_reference": f"prod:{producto.id}",
-        "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
+        # Tu webhook (backend)
+        "notification_url": f"{BACKEND_URL}/webhook",
+        # A dónde vuelve el payer si abre en navegador
         "back_urls": {
-            "success": "https://dispen-easy-web-production.up.railway.app/",
-            "pending": "https://dispen-easy-web-production.up.railway.app/",
-            "failure": "https://dispen-easy-web-production.up.railway.app/"
+            "success": FRONTEND_URL,
+            "pending": FRONTEND_URL,
+            "failure": FRONTEND_URL,
         },
-        "auto_return": "approved"
+        "auto_return": "approved",
     }
-    
 
-    resp = requests.post(url, headers=headers, json=payload)
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    except Exception as e:
+        return jsonify({"error": "No se pudo contactar a MP", "detalle": str(e)}), 502
+
     if resp.status_code != 201:
-        # Loguea para ver exactamente qué dice MP
+        # Log por si necesitás ver detallado en Railway
         try:
             detalle = resp.json()
         except Exception:
             detalle = resp.text
         print("MP error:", resp.status_code, detalle)
-        return jsonify({"error": "No se pudo generar link de pago", "detalle": detalle}), 502
+        return jsonify({"error": "No se pudo crear preferencia", "detalle": detalle}), 502
 
-    link = resp.json().get("init_point")
-    import qrcode, io, base64
+    # 4) Obtener link de pago
+    data = resp.json()
+    link = data.get("init_point") or data.get("sandbox_init_point")
+    if not link:
+        return jsonify({"error": "Preferencia creada sin link"}), 502
+
+    # 5) Generar QR PNG en base64 a partir del link
     img = qrcode.make(link)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return jsonify({"qr_base64": qr_base64, "link": link})
-   
+
+    # 6) Devolver QR + link (por si querés abrirlo en nueva pestaña)
+    return jsonify({
+        "qr_base64": qr_base64,
+        "link": link,
+        "preferencia_id": data.get("id"),
+        "titulo": producto.nombre,
+        "precio": float(producto.precio),
+    })
 
 # ---- WEBHOOK Mercado Pago ----
 @app.route("/webhook", methods=["POST"])
