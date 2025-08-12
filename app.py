@@ -149,7 +149,8 @@ def generar_qr(id):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
-   payload = {
+
+     payload = {
     "items": [{
         "title": producto.nombre,
         "quantity": 1,
