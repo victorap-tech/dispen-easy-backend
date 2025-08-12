@@ -36,6 +36,7 @@ class Producto(db.Model):
     precio = db.Column(db.Float, nullable=False)
     cantidad = db.Column(db.Integer, nullable=False)  # stock / cantidad
 
+
 # Crear tablas si no existen
 with app.app_context():
     db.create_all()
@@ -136,22 +137,46 @@ def generar_qr(id):
     return jsonify({"qr_base64": qr_base64, "link": link})
    
 
-# ------------------------
-# Webhook Mercado Pago
-# ------------------------
+# ==== WEBHOOK DE MERCADO PAGO ====
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     print("⚡ Webhook recibido:", data)
 
-    id_pago = data.get("data", {}).get("id")
-    if id_pago:
-        nuevo = Pago(id_pago=id_pago, estado="pendiente", dispensado=False)
+    # MP suele enviar {"type":"payment","data":{"id":"<payment_id>"}} u otros eventos
+    id_pago = str(data.get("data", {}).get("id") or "")
+    if not id_pago:
+        # Nada útil: devolvemos 200 igual para que MP no reintente eternamente
+        return jsonify({"ok": True, "info": "sin id de pago"}), 200
+
+    # Idempotente: si ya existe, no lo volvemos a crear
+    pago = Pago.query.filter_by(id_pago=id_pago).first()
+    if not pago:
+        nuevo = Pago(id_pago=id_pago, estado="pendiente", dispensado=False, producto="")
         db.session.add(nuevo)
         db.session.commit()
+        print(f"✅ Pago creado: {id_pago}")
+    else:
+        print(f"↪️  Pago ya existente: {id_pago} (estado={pago.estado})")
 
-    return "", 200
+    # Responder SIEMPRE 200 rápido
+    return jsonify({"ok": True}), 200
 
+
+# ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
+@app.route("/api/pagos", methods=["GET"])
+def listar_pagos():
+    pagos = Pago.query.order_by(Pago.id.desc()).all()
+    out = []
+    for p in pagos:
+        out.append({
+            "id": p.id,
+            "id_pago": p.id_pago,
+            "estado": p.estado,
+            "producto": p.producto,
+            "dispensado": p.dispensado
+        })
+    return jsonify(out)
 # ------------------------
 # Consultar pago pendiente
 # ------------------------
