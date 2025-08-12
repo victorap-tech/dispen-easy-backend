@@ -109,11 +109,11 @@ def generar_qr(id):
         "items": [
             {"title": producto.nombre, "quantity": 1, "unit_price": float(producto.precio)}
         ],
-        "notification_url": "https://TU_BACKEND.webhook",  # ajustá tu dominio
+        "notification_url": "https://web-production-e7d2.up.railway.app/webhook",  # ajustá tu dominio
         "back_urls": {
-            "success": "https://TU_FRONTEND",
-            "pending": "https://TU_FRONTEND",
-            "failure": "https://TU_FRONTEND"
+            "success": "https://dispen-easy-web-production.up.railway.app/",
+            "pending": "https://dispen-easy-web-production.up.railway.app/",
+            "failure": "https://dispen-easy-web-production.up.railway.app/"
         },
         "auto_return": "approved"
     }
