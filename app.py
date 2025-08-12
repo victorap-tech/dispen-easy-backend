@@ -164,13 +164,14 @@ def generar_qr(id):
         "producto_nombre": producto.nombre
     },
     "external_reference": f"prod:{producto.id}",
-        "notification_url": "https://web-production-e7d2.up.railway.app/webhook",  # ajustá tu dominio
-        "back_urls": {
-            "success": "https://dispen-easy-web-production.up.railway.app/",
-            "pending": "https://dispen-easy-web-production.up.railway.app/",
-            "failure": "https://dispen-easy-web-production.up.railway.app/"
-        },
-        "auto_return": "approved"
+    "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
+    "back_urls": {
+        "success": "https://dispen-easy-web-production.up.railway.app/",
+        "pending": "https://dispen-easy-web-production.up.railway.app/",
+        "failure": "https://dispen-easy-web-production.up.railway.app/"
+    },
+    "auto_return": "approved"
+}
     }
 
     resp = requests.post(url, headers=headers, json=payload)
