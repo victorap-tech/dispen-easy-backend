@@ -20,6 +20,33 @@ CORS(
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
 db = SQLAlchemy(app)
 
+#----Helper para consultar Mercadopago----
+def mp_get_payment(payment_id: str, token: str):
+    """
+    Devuelve un dict con campos clave del pago en MP.
+    """
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200:
+        # devolvemos info mínima para log
+        try:
+            return None, r.status_code, r.json()
+        except Exception:
+            return None, r.status_code, r.text
+
+    data = r.json()
+    info = {
+        "id_pago": str(data.get("id")),
+        "estado": data.get("status"),                 # approved / pending / rejected / in_process
+        "producto": (data.get("description")          # si seteaste description
+                     or (data.get("additional_info") or {}).get("items", [{}])[0].get("title")
+                     or ""),
+        "monto": data.get("transaction_amount"),
+        "moneda": data.get("currency_id"),
+        "payer_email": (data.get("payer") or {}).get("email"),
+    }
+    return info, 200, None
 # ------------------------
 # Modelos
 # ------------------------
