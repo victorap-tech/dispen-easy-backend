@@ -235,86 +235,94 @@ def generar_qr(id):
         "precio": float(producto.precio),
     })
 
-# ---------- Webhook Mercado Pago ----------
+# ==== WEBHOOK Mercado Pago ====
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # log crudo
-    raw = request.get_data(as_text=True) or ""
-    print("Webhook raw body =", raw)
+    # Logs útiles para depurar
+    try:
+        raw_body = request.get_data(as_text=True)
+        print("[webhook] raw body =", raw_body)
+        print("[webhook] headers =", dict(request.headers))
+    except Exception:
+        pass
+
+    data = request.get_json(silent=True) or {}
+    action   = data.get("action")            # ej: payment.created / payment.updated
+    topic    = data.get("topic") or data.get("type")  # a veces viene como topic, a veces type
+    resource = data.get("resource")          # ej: https://api.mercadolibre.com/merchant_orders/{id}
+    print(f"[webhook] parsed action={action} topic={topic} resource={resource}")
 
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
-        return jsonify({"error": "MP_ACCESS_TOKEN faltante"}), 500
+        print("[webhook] ERROR: falta MP_ACCESS_TOKEN")
+        return "missing token", 500
 
-    data = request.get_json(silent=True) or {}
+    id_pago  = None
+    estado   = None
+    producto = None
 
-    # Caso A: llega 'resource' con una merchant_order
-    resource = data.get("resource")
-    if isinstance(resource, str) and "/merchant_orders/" in resource:
-        mo_id = resource.rsplit("/", 1)[-1]
-        mo, sc,_ = mp_get_merchant_order(mo_id, token)
-        print("[webhook] MerchantOrder resp:", sc, mo)
-
-        # Tomamos el primer pago si existe
-        payments = (mo or {}).get("payments") or []
-        if payments:
-            payment_id = str(payments[0].get("id"))
-            pay, sc,_ = mp_get_payment(payment_id, token)
-            print("[webhook] Payment resp:", sc, pay)
-            if sc == 200 and isinstance(pay, dict):
-                estado = str(pay.get("status", "pending"))
-                # Nombre de producto: priorizamos description, luego metadata, luego items
-                prod = (
-                    pay.get("description")
-                    or (pay.get("additional_info") or {}).get("items", [{}])[0].get("title")
-                    or (pay.get("metadata") or {}).get("producto_nombre")
-                    or "producto"
-                )
-                _upsert_pago(payment_id, estado, prod)
-                return "", 200
-
-        # Si no hay pagos en la MO, igual respondemos 200 para evitar reintentos infinitos
-        return "", 200
-
-    # Caso B: evento directo de pago (payment.created / payment.updated)
-    action = data.get("action", "")
-    if action.startswith("payment."):
-        payment_id = str((data.get("data") or {}).get("id") or data.get("id") or "")
-        if payment_id:
-            sc, pay = mp_get_payment(payment_id, token)
-            print("[webhook] Payment resp:", sc, pay)
-            if sc == 200 and isinstance(pay, dict):
-                estado = str(pay.get("status", "pending"))
-                prod = (
-                    pay.get("description")
-                    or (pay.get("additional_info") or {}).get("items", [{}])[0].get("title")
-                    or (pay.get("metadata") or {}).get("producto_nombre")
-                    or "producto"
-                )
-                _upsert_pago(payment_id, estado, prod)
-        return "", 200
-
-    # Si no matchea ninguno, OK igual
-    print("[webhook] evento no reconocido:", data)
-    return "", 200
-
-
-def _upsert_pago(id_pago: str, estado: str, producto: str):
-    """Crea o actualiza el registro en la tabla pagos."""
     try:
-        pago = Pago.query.filter_by(id_pago=id_pago).first()
-        if pago:
-            pago.estado = estado
-            if producto:
-                pago.producto = producto
-        else:
-            pago = Pago(id_pago=id_pago, estado=estado, producto=producto, dispensado=False)
-            db.session.add(pago)
-        db.session.commit()
-        print(f"[webhook] Pago guardado/actualizado id={id_pago} estado={estado} prod={producto}")
+        # 1) Caso: merchant_order (flujo “topic”: merchant_order)
+        if resource and "merchant_orders" in str(resource):
+            mo_id = str(resource).rstrip("/").split("/")[-1]
+            info_mo, sc_mo, raw_mo = mp_get_merchant_order(mo_id, token)
+            print(f"[webhook] MerchantOrder resp {sc_mo}", raw_mo)
+
+            if info_mo:
+                # tomamos el primer pago de la MO (ajusta si quieres consolidar varios)
+                pagos = info_mo.get("payments") or []
+                if pagos:
+                    id_pago = str(pagos[0].get("id_pago"))
+                    estado  = pagos[0].get("estado")
+
+                items = info_mo.get("items") or []
+                if items:
+                    producto = items[0].get("title")
+
+        # 2) Caso: payment (flujo “action”: payment.created / payment.updated)
+        if not id_pago:
+            payment_id = (data.get("data") or {}).get("id") or data.get("id")
+            if payment_id:
+                info_pay, sc_pay, raw_pay = mp_get_payment(str(payment_id), token)
+                print(f"[webhook] Payment resp {sc_pay}", raw_pay)
+
+                if info_pay:
+                    id_pago  = str(info_pay.get("id_pago"))
+                    estado   = info_pay.get("estado")
+                    # puede venir en description o en additional_info.items[0].title
+                    producto = info_pay.get("producto") or producto
+
+        if not id_pago:
+            # No vino nada que podamos procesar
+            print(f"[webhook] evento no reconocido: {data}")
+            return jsonify({"ok": True, "ignored": True}), 200
+
+        # 3) Guardar/actualizar en DB
+        try:
+            pago = Pago.query.filter_by(id_pago=id_pago).first()
+            if pago:
+                if estado:
+                    pago.estado = estado
+                if producto:
+                    pago.producto = producto
+            else:
+                pago = Pago(id_pago=id_pago,
+                            estado=estado or "pendiente",
+                            producto=producto or "")
+                db.session.add(pago)
+
+            db.session.commit()
+            print(f"[webhook] Pago guardado/actualizado id={id_pago} estado={estado} prod={producto}")
+        except Exception as e:
+            db.session.rollback()
+            print("[webhook] ERROR guardando pago:", e)
+            return "db error", 500
+
+        return jsonify({"ok": True}), 200
+
     except Exception as e:
-        db.session.rollback()
-        print("[webhook] ERROR guardando pago:", e)
+        print("[webhook] ERROR general:", e)
+        return "error", 500
 
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
 @app.route("/api/pagos", methods=["GET"])
