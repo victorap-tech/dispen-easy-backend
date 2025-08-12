@@ -345,26 +345,6 @@ def check_pendiente():
         "producto": pago.producto or ""
     }), 200
 
-# ---------- Marcar un pago como dispensado ----------
-@app.route("/marcar_dispensado", methods=["POST"])
-def marcar_dispensado():
-    body = request.get_json(silent=True) or {}
-    id_pago = str(body.get("id_pago") or "")
-    if not id_pago:
-        return jsonify({"error": "Falta id_pago"}), 400
-
-    pago = Pago.query.filter_by(id_pago=id_pago).first()
-    if not pago:
-        return jsonify({"error": "Pago no encontrado"}), 404
-
-    try:
-        pago.dispensado = True
-        # Podés opcionalmente dejar el estado como 'approved'; no es necesario cambiarlo.
-        db.session.commit()
-        return jsonify({"mensaje": "Pago marcado como dispensado"}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
 
 # ── Consultar si hay un pago APROBADO y NO dispensado ──────────────────────────
 @app.route('/api/check_payment_pendiente', methods=['GET'])
