@@ -172,7 +172,7 @@ def generar_qr(id):
     },
     "auto_return": "approved"
 }
-    }
+    
 
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 201:
