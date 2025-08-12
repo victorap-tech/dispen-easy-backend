@@ -151,28 +151,28 @@ def generar_qr(id):
     }
 
      payload = {
-    "items": [{
-        "title": producto.nombre,
-        "quantity": 1,
-        "unit_price": float(producto.precio)
-    }],
-    "description": producto.nombre,  # <-- para que todos los flujos vean el nombre
-    "additional_info": {
-        "items": [{"title": producto.nombre}]
-    },
-    "metadata": {
-        "producto_id": producto.id,
-        "producto_nombre": producto.nombre
-    },
-    "external_reference": f"prod:{producto.id}",
-    "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
-    "back_urls": {
-        "success": "https://dispen-easy-web-production.up.railway.app/",
-        "pending": "https://dispen-easy-web-production.up.railway.app/",
-        "failure": "https://dispen-easy-web-production.up.railway.app/"
-    },
-    "auto_return": "approved"
-}
+        "items": [{
+            "title": producto.nombre,
+            "quantity": 1,
+            "unit_price": float(producto.precio)
+        }],
+        "description": producto.nombre,  # <-- para que todos los flujos vean el nombre
+        "additional_info": {
+            "items": [{"title": producto.nombre}]
+        },
+        "metadata": {
+            "producto_id": producto.id,
+            "producto_nombre": producto.nombre
+        },
+        "external_reference": f"prod:{producto.id}",
+        "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
+        "back_urls": {
+            "success": "https://dispen-easy-web-production.up.railway.app/",
+            "pending": "https://dispen-easy-web-production.up.railway.app/",
+            "failure": "https://dispen-easy-web-production.up.railway.app/"
+        },
+        "auto_return": "approved"
+    }
     
 
     resp = requests.post(url, headers=headers, json=payload)
