@@ -167,63 +167,39 @@ def generar_qr(id):
 # =========================
 # Webhook de Mercado Pago
 # =========================
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json() or {}
+    data = request.get_json()
     print("Webhook recibido:", data)
 
-    mp_token = os.getenv("MP_ACCESS_TOKEN")
+    if data and 'type' in data and data['type'] == 'payment':
+        payment_id = str(data['data']['id'])
 
-    topic = data.get("topic")
-    if not topic:
-        return "Sin topic", 400
+        # Consultar datos del pago en MercadoPago
+        mp_token = os.getenv("MP_ACCESS_TOKEN")
+        info, status, raw = mp_get_payment(payment_id, mp_token)
 
-    # Caso 1: Notificación de pago
-    if topic == "payment":
-        payment_id = data.get("id") or data.get("data", {}).get("id")
-        if not payment_id:
-            return "Sin payment_id", 400
+        if status == 200 and info:
+            nuevo_pago = Pago(
+                id_pago=info["id_pago"],
+                estado=info["estado"],
+                producto=info["producto"],
+                monto=info["monto"],
+                moneda=info["moneda"],
+                payer_email=info["payer_email"],
+                dispensado=False
+            )
+            db.session.add(nuevo_pago)
+            db.session.commit()
 
-        pago_info, status, error = mp_get_payment(payment_id, mp_token)
-        if status != 200:
-            print("MP GET payment error:", error)
-            return "Error obteniendo pago", 500
+            return jsonify({"status": "ok"}), 200
+        else:
+            print("MP GET payment error:", raw)
+            return jsonify({"error": "payment not found"}), 404
 
-        nuevo_pago = Pago(
-            id_pago=pago_info["id_pago"],
-            estado=pago_info["estado"],
-            producto=pago_info["producto"]
-        )
-        db.session.add(nuevo_pago)
-        db.session.commit()
+    return jsonify({"status": "ignored"}), 200
 
-        return "Pago registrado", 200
 
-    # Caso 2: Notificación de merchant_order
-    elif topic == "merchant_order":
-        order_id = data.get("id") or data.get("resource", "").split("/")[-1]
-        if not order_id:
-            return "Sin order_id", 400
-
-        orden_info, status, error = mp_get_merchant_order(order_id, mp_token)
-        if status != 200:
-            print("MP GET merchant_order error:", error)
-            return "Error obteniendo orden", 500
-
-        for p in orden_info.get("pagos", []):
-            pago_info, _, _ = mp_get_payment(p.get("id"), mp_token)
-            if pago_info:
-                nuevo_pago = Pago(
-                    id_pago=pago_info["id_pago"],
-                    estado=pago_info["estado"],
-                    producto=pago_info["producto"]
-                )
-                db.session.add(nuevo_pago)
-
-        db.session.commit()
-        return "Orden registrada", 200
-
-    return "Evento no procesado", 200
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
 @app.route("/api/pagos", methods=["GET"])
 def listar_pagos():
