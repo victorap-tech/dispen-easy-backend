@@ -106,22 +106,34 @@ def generar_qr(id):
     }
     payload = {
         "items": [
-            {
-                "title": producto.nombre,
-                "quantity": 1,
-                "unit_price": float(producto.precio)
-            }
+            {"title": producto.nombre, "quantity": 1, "unit_price": float(producto.precio)}
         ],
-        # Cambiá el dominio si es necesario
-        "notification_url": "https://web-production-e7d2.up.railway.app/webhook"
+        "notification_url": "https://TU_BACKEND.webhook",  # ajustá tu dominio
+        "back_urls": {
+            "success": "https://TU_FRONTEND",
+            "pending": "https://TU_FRONTEND",
+            "failure": "https://TU_FRONTEND"
+        },
+        "auto_return": "approved"
     }
 
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 201:
-        return jsonify({"error": "No se pudo generar link de pago"}), 500
+        # Loguea para ver exactamente qué dice MP
+        try:
+            detalle = resp.json()
+        except Exception:
+            detalle = resp.text
+        print("MP error:", resp.status_code, detalle)
+        return jsonify({"error": "No se pudo generar link de pago", "detalle": detalle}), 502
 
     link = resp.json().get("init_point")
-
+    import qrcode, io, base64
+    img = qrcode.make(link)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return jsonify({"qr_base64": qr_base64, "link": link})
     # Generar PNG en base64
     qr = qrcode.make(link)
     buffer = io.BytesIO()
