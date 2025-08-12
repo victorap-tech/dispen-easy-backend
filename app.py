@@ -164,31 +164,80 @@ def generar_qr(id):
     return jsonify({"qr_base64": qr_base64, "link": link})
    
 
-# ==== WEBHOOK DE MERCADO PAGO ====
+# =========================
+# Webhook de Mercado Pago
+# =========================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
-    print("⚡ Webhook recibido:", data)
+    try:
+        token = os.getenv("MP_ACCESS_TOKEN")
+        if not token:
+            # Si falta el token, devolvemos 500 para que quede logueado y lo veas
+            return jsonify({"error": "Falta MP_ACCESS_TOKEN en variables de entorno"}), 500
 
-    # MP suele enviar {"type":"payment","data":{"id":"<payment_id>"}} u otros eventos
-    id_pago = str(data.get("data", {}).get("id") or "")
-    if not id_pago:
-        # Nada útil: devolvemos 200 igual para que MP no reintente eternamente
-        return jsonify({"ok": True, "info": "sin id de pago"}), 200
+        body = request.get_json(silent=True) or {}
+        print("⚡ Webhook recibido:", body)
 
-    # Idempotente: si ya existe, no lo volvemos a crear
-    pago = Pago.query.filter_by(id_pago=id_pago).first()
-    if not pago:
-        nuevo = Pago(id_pago=id_pago, estado="pendiente", dispensado=False, producto="")
-        db.session.add(nuevo)
+        # --- 1) Detectar el payment_id de distintas formas ---
+        payment_id = None
+
+        # a) Formato nuevo {"action": "...", "data": {"id": "123"}}
+        payment_id = (body.get("data") or {}).get("id")
+
+        # b) Formato "resource" con URL (merchant_orders/... o payments/...)
+        if not payment_id and "resource" in body:
+            try:
+                resource = body["resource"]
+                # Tomamos el último segmento de la URL (el ID)
+                payment_id = resource.rstrip("/").split("/")[-1]
+            except Exception:
+                pass
+
+        # c) A veces llega por querystring ?id=123
+        if not payment_id:
+            payment_id = request.args.get("id")
+
+        if not payment_id:
+            # No sabemos qué pago es; devolvemos 202 para que MP no reintente infinito
+            print("Webhook sin payment_id identificable")
+            return "", 202
+
+        # --- 2) Consultar el pago real en MP con el helper ---
+        info, status, raw = mp_get_payment(payment_id, token)
+        if status != 200 or info is None:
+            print("MP GET payment error:", status, raw)
+            # 202 = acepto el webhook, pero no proceso (evita reintentos agresivos)
+            return "", 202
+
+        # info trae: id_pago, estado, producto, monto, moneda, payer_email (según tu helper)
+        print("MP payment info:", info)
+
+        # --- 3) Guardar / actualizar en la DB ---
+        pago = Pago.query.filter_by(id_pago=info["id_pago"]).first()
+        if not pago:
+            pago = Pago(
+                id_pago=info["id_pago"],
+                estado=info.get("estado", "pendiente"),
+                producto=info.get("producto") or "",
+                dispensado=False,
+            )
+            db.session.add(pago)
+        else:
+            # Actualizamos por si cambió el estado (pending -> approved, etc.)
+            pago.estado = info.get("estado", pago.estado)
+            if info.get("producto"):
+                pago.producto = info["producto"]
+
         db.session.commit()
-        print(f"✅ Pago creado: {id_pago}")
-    else:
-        print(f"↪️  Pago ya existente: {id_pago} (estado={pago.estado})")
 
-    # Responder SIEMPRE 200 rápido
-    return jsonify({"ok": True}), 200
+        # Respondemos OK a MP
+        return "", 200
 
+    except Exception as e:
+        # Log para depurar sin romper el webhook
+        print("Webhook exception:", repr(e))
+        # 202 para que MP no entre en loop de reintentos si hay un bug temporal
+        return "", 202
 
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
 @app.route("/api/pagos", methods=["GET"])
