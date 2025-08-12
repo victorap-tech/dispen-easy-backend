@@ -149,10 +149,21 @@ def generar_qr(id):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    payload = {
-        "items": [
-            {"title": producto.nombre, "quantity": 1, "unit_price": float(producto.precio)}
-        ],
+   payload = {
+    "items": [{
+        "title": producto.nombre,
+        "quantity": 1,
+        "unit_price": float(producto.precio)
+    }],
+    "description": producto.nombre,  # <-- para que todos los flujos vean el nombre
+    "additional_info": {
+        "items": [{"title": producto.nombre}]
+    },
+    "metadata": {
+        "producto_id": producto.id,
+        "producto_nombre": producto.nombre
+    },
+    "external_reference": f"prod:{producto.id}",
         "notification_url": "https://web-production-e7d2.up.railway.app/webhook",  # ajustá tu dominio
         "back_urls": {
             "success": "https://dispen-easy-web-production.up.railway.app/",
