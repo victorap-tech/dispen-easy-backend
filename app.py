@@ -49,19 +49,31 @@ def mp_get_payment(payment_id: str, token: str):
         r = requests.get(url, headers=headers, timeout=12)
     except Exception as e:
         return None, 599, str(e)
+
     try:
         raw_json = r.json()
     except Exception:
         raw_json = r.text
+
     if r.status_code != 200:
         return None, r.status_code, raw_json
+
     data = r.json()
+
+    # Buscar el nombre del producto en distintos lugares
+    producto_nombre = (
+        data.get("description")
+        or (data.get("additional_info", {}).get("items", [{}])[0].get("title"))
+        or (data.get("metadata", {}).get("producto_nombre"))
+        or "Producto sin nombre"
+    )
+
     info = {
         "id_pago": str(data.get("id")),
-        "estado": data.get("status"),  # approved/pending/rejected/in_process
-        "producto": (data.get("description")
-                     or (data.get("additional_info", {}) or {}).get("items", [{}])[0].get("title"))
+        "estado": data.get("status"),  # approved / pending / rejected / in_process
+        "producto": producto_nombre
     }
+
     return info, 200, raw_json
 
 # ------------------------
@@ -223,85 +235,86 @@ def generar_qr(id):
         "precio": float(producto.precio),
     })
 
-# ---- WEBHOOK Mercado Pago ----
+# ---------- Webhook Mercado Pago ----------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    body = request.get_json(silent=True) or {}
-    headers = dict(request.headers)
-    print("▶︎ Webhook headers =", headers)
-    print("▶︎ Webhook raw body =", body)
+    # log crudo
+    raw = request.get_data(as_text=True) or ""
+    print("Webhook raw body =", raw)
 
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
-        print("[webhook] Falta MP_ACCESS_TOKEN")
-        return "", 200  # respondemos 200 para que MP no reintente infinito
+        return jsonify({"error": "MP_ACCESS_TOKEN faltante"}), 500
 
-    # MP puede mandar varios formatos:
-    topic = body.get("topic") or body.get("type") or body.get("action")  # p.ej: "merchant_order" o "payment.created"
-    resource = body.get("resource")  # p.ej: "https://api.mercadolibre.com/merchant_orders/33120295977"
-    data_id = (body.get("data") or {}).get("id")  # cuando es payment suele venir acá
+    data = request.get_json(silent=True) or {}
 
-    # --- Caso 1: Merchant Order ---
-    if resource and "merchant_orders" in resource:
-        mo_id = resource.rstrip("/").split("/")[-1]
-        info_mo, st, raw = mp_get_merchant_order(mo_id, token)
-        if not info_mo:
-            print("[webhook] Error merchant_order", st, raw)
-            return "", 200
+    # Caso A: llega 'resource' con una merchant_order
+    resource = data.get("resource")
+    if isinstance(resource, str) and "/merchant_orders/" in resource:
+        mo_id = resource.rsplit("/", 1)[-1]
+        sc, mo = mp_get_merchant_order(mo_id, token)
+        print("[webhook] MerchantOrder resp:", sc, mo)
 
-        # Extraemos pagos dentro de la orden
-        payments = info_mo.get("payments", []) or []
-        approved = any(p.get("status") == "approved" for p in payments)
-        payment_id = str(payments[0].get("id")) if payments else f"MO:{mo_id}"
+        # Tomamos el primer pago si existe
+        payments = (mo or {}).get("payments") or []
+        if payments:
+            payment_id = str(payments[0].get("id"))
+            sc, pay = mp_get_payment(payment_id, token)
+            print("[webhook] Payment resp:", sc, pay)
+            if sc == 200 and isinstance(pay, dict):
+                estado = str(pay.get("status", "pending"))
+                # Nombre de producto: priorizamos description, luego metadata, luego items
+                prod = (
+                    pay.get("description")
+                    or (pay.get("additional_info") or {}).get("items", [{}])[0].get("title")
+                    or (pay.get("metadata") or {}).get("producto_nombre")
+                    or "producto"
+                )
+                _upsert_pago(payment_id, estado, prod)
+                return "", 200
 
-        # Título del item (si vino)
-        titulo = ""
-        items = info_mo.get("items") or []
-        if items:
-            titulo = items[0].get("title") or ""
-
-        # Upsert en tu tabla Pago
-        pago = Pago.query.filter_by(id_pago=payment_id).first()
-        if not pago:
-            pago = Pago(id_pago=payment_id, estado="pendiente", producto=titulo, dispensado=False)
-            db.session.add(pago)
-
-        pago.estado = "aprobado" if approved else "pendiente"
-        if titulo:
-            pago.producto = titulo
-
-        db.session.commit()
-        print(f"[webhook] MerchantOrder procesada. payment_id={payment_id} estado={pago.estado}")
+        # Si no hay pagos en la MO, igual respondemos 200 para evitar reintentos infinitos
         return "", 200
 
-    # --- Caso 2: Payment (fallback por si MP envía 'payment.*') ---
-    if data_id:
-        info_pay, st, raw = mp_get_payment(str(data_id), token)
-        if not info_pay:
-            print("[webhook] Error payment", st, raw)
-            return "", 200
-
-        pago = Pago.query.filter_by(id_pago=info_pay["id_pago"]).first()
-        if not pago:
-            pago = Pago(
-                id_pago=info_pay["id_pago"],
-                estado=info_pay.get("estado") or "pendiente",
-                producto=info_pay.get("producto") or "",
-                dispensado=False
-            )
-            db.session.add(pago)
-        else:
-            pago.estado = info_pay.get("estado") or pago.estado
-            if info_pay.get("producto"):
-                pago.producto = info_pay["producto"]
-
-        db.session.commit()
-        print(f"[webhook] Payment procesado. id={pago.id_pago} estado={pago.estado}")
+    # Caso B: evento directo de pago (payment.created / payment.updated)
+    action = data.get("action", "")
+    if action.startswith("payment."):
+        payment_id = str((data.get("data") or {}).get("id") or data.get("id") or "")
+        if payment_id:
+            sc, pay = mp_get_payment(payment_id, token)
+            print("[webhook] Payment resp:", sc, pay)
+            if sc == 200 and isinstance(pay, dict):
+                estado = str(pay.get("status", "pending"))
+                prod = (
+                    pay.get("description")
+                    or (pay.get("additional_info") or {}).get("items", [{}])[0].get("title")
+                    or (pay.get("metadata") or {}).get("producto_nombre")
+                    or "producto"
+                )
+                _upsert_pago(payment_id, estado, prod)
         return "", 200
 
-    # Si no sabemos qué es, igual devolvemos 200
-    print("[webhook] Evento no reconocido, se ignora.")
+    # Si no matchea ninguno, OK igual
+    print("[webhook] evento no reconocido:", data)
     return "", 200
+
+
+def _upsert_pago(id_pago: str, estado: str, producto: str):
+    """Crea o actualiza el registro en la tabla pagos."""
+    try:
+        pago = Pago.query.filter_by(id_pago=id_pago).first()
+        if pago:
+            pago.estado = estado
+            if producto:
+                pago.producto = producto
+        else:
+            pago = Pago(id_pago=id_pago, estado=estado, producto=producto, dispensado=False)
+            db.session.add(pago)
+        db.session.commit()
+        print(f"[webhook] Pago guardado/actualizado id={id_pago} estado={estado} prod={producto}")
+    except Exception as e:
+        db.session.rollback()
+        print("[webhook] ERROR guardando pago:", e)
 
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
 @app.route("/api/pagos", methods=["GET"])
@@ -317,30 +330,41 @@ def listar_pagos():
             "dispensado": p.dispensado
         })
     return jsonify(out)
-# ------------------------
-# Consultar pago pendiente
-# ------------------------
+# ---------- Consulta de pago pendiente para dispensar ----------
 @app.route("/check_payment_pendiente", methods=["GET"])
 def check_pendiente():
-    pago = Pago.query.filter_by(estado="pendiente", dispensado=False).first()
-    if pago:
-        return jsonify({"id_pago": pago.id_pago})
-    return jsonify({"mensaje": "No hay pagos pendientes"}), 204
+    # Busca el primer pago aprobado y no dispensado
+    pago = Pago.query.filter_by(estado="approved", dispensado=False).first()
+    if not pago:
+        return jsonify({"mensaje": "No hay pagos pendientes"}), 204
 
-# ------------------------
-# Marcar como dispensado
-# ------------------------
+    # Si guardaste 'producto_id' en metadata/external_reference y también lo persistís, podés devolverlo aquí.
+    # Por ahora devolvemos lo que tenemos: id_pago y nombre del producto.
+    return jsonify({
+        "id_pago": pago.id_pago,
+        "producto": pago.producto or ""
+    }), 200
+
+# ---------- Marcar un pago como dispensado ----------
 @app.route("/marcar_dispensado", methods=["POST"])
 def marcar_dispensado():
-    data = request.json or {}
-    id_pago = data.get("id_pago")
+    body = request.get_json(silent=True) or {}
+    id_pago = str(body.get("id_pago") or "")
+    if not id_pago:
+        return jsonify({"error": "Falta id_pago"}), 400
+
     pago = Pago.query.filter_by(id_pago=id_pago).first()
-    if pago:
-        pago.estado = "aprobado"
+    if not pago:
+        return jsonify({"error": "Pago no encontrado"}), 404
+
+    try:
         pago.dispensado = True
+        # Podés opcionalmente dejar el estado como 'approved'; no es necesario cambiarlo.
         db.session.commit()
-        return jsonify({"mensaje": "Pago marcado como dispensado"})
-    return jsonify({"error": "Pago no encontrado"}), 404
+        return jsonify({"mensaje": "Pago marcado como dispensado"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def home():
