@@ -252,7 +252,7 @@ def webhook():
     resource = data.get("resource")
     if isinstance(resource, str) and "/merchant_orders/" in resource:
         mo_id = resource.rsplit("/", 1)[-1]
-        sc, mo = mp_get_merchant_order(mo_id, token)
+        mo, sc,_ = mp_get_merchant_order(mo_id, token)
         print("[webhook] MerchantOrder resp:", sc, mo)
 
         # Tomamos el primer pago si existe
