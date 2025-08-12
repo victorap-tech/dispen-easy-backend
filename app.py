@@ -278,6 +278,9 @@ def marcar_dispensado():
         return jsonify({"mensaje": "Pago marcado como dispensado"})
     return jsonify({"error": "Pago no encontrado"}), 404
 
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Backend funcionando"
 # ------------------------
 # Entrada local (Gunicorn maneja producción)
 # ------------------------
