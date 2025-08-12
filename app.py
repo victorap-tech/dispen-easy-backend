@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 import requests, qrcode, io, base64, os
+import traceback
 
 app = Flask(__name__)
 
@@ -167,38 +168,52 @@ def generar_qr(id):
 # =========================
 # Webhook de Mercado Pago
 # =========================
-@app.route('/webhook', methods=['POST'])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    print("Webhook recibido:", data)
+    try:
+        # Log básico para inspección
+        print("== Webhook headers ==", dict(request.headers))
+        raw_body = request.get_data(as_text=True)
+        print("== Webhook raw body ==", raw_body)
 
-    if data and 'type' in data and data['type'] == 'payment':
-        payment_id = str(data['data']['id'])
+        # MP puede enviar JSON o x-www-form-urlencoded
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        print("== Webhook parsed data ==", data)
 
-        # Consultar datos del pago en MercadoPago
-        mp_token = os.getenv("MP_ACCESS_TOKEN")
-        info, status, raw = mp_get_payment(payment_id, mp_token)
+        topic = data.get("topic") or data.get("type")  # a veces viene "payment", otras "merchant_order"
+        ref_id = data.get("id") or (data.get("data") or {}).get("id")
 
-        if status == 200 and info:
-            nuevo_pago = Pago(
-                id_pago=info["id_pago"],
-                estado=info["estado"],
-                producto=info["producto"],
-                monto=info["monto"],
-                moneda=info["moneda"],
-                payer_email=info["payer_email"],
-                dispensado=False
-            )
-            db.session.add(nuevo_pago)
-            db.session.commit()
+        # Guardado mínimo en DB si vino un id
+        if ref_id:
+            try:
+                nuevo = Pago(
+                    id_pago=str(ref_id),
+                    estado="pendiente",
+                    producto=data.get("producto", ""),   # si en algún flujo lo mandás
+                    dispensado=False
+                )
+                db.session.add(nuevo)
+                db.session.commit()
+                print(f"[webhook] Pago guardado/pendiente id={ref_id}")
+            except Exception as db_err:
+                # Si ya existe por unique, ignoramos
+                db.session.rollback()
+                print("[webhook] DB error (probable duplicado):", db_err)
 
-            return jsonify({"status": "ok"}), 200
-        else:
-            print("MP GET payment error:", raw)
-            return jsonify({"error": "payment not found"}), 404
+        # TIP: si querés consultar a MP acá, usá tu helper mp_get_payment(ref_id, token)
+        # token = os.getenv("MP_ACCESS_TOKEN")
+        # if topic == "payment" and ref_id and token:
+        #     info_code, info = mp_get_payment(ref_id, token)
+        #     print("MP GET payment:", info_code, info)
 
-    return jsonify({"status": "ignored"}), 200
+        # Responder 200 SIEMPRE para que MP no reintente indefinidamente
+        return "", 200
 
+    except Exception as e:
+        print("Webhook exception:", e)
+        traceback.print_exc()
+        # igual devolvemos 200 para que MP no repita
+        return "", 200
 
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
 @app.route("/api/pagos", methods=["GET"])
