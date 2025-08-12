@@ -259,7 +259,7 @@ def webhook():
         payments = (mo or {}).get("payments") or []
         if payments:
             payment_id = str(payments[0].get("id"))
-            sc, pay = mp_get_payment(payment_id, token)
+            pay, sc,_ = mp_get_payment(payment_id, token)
             print("[webhook] Payment resp:", sc, pay)
             if sc == 200 and isinstance(pay, dict):
                 estado = str(pay.get("status", "pending"))
