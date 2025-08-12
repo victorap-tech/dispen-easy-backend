@@ -366,6 +366,42 @@ def marcar_dispensado():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+# ── Consultar si hay un pago APROBADO y NO dispensado ──────────────────────────
+@app.route('/api/check_payment_pendiente', methods=['GET'])
+def check_payment_pendiente():
+    p = (Pago.query
+            .filter_by(estado='approved', dispensado=False)
+            .order_by(Pago.id.desc())
+            .first())
+    if not p:
+        # 204 = no hay contenido; el front puede interpretarlo como "no hay nada aún"
+        return jsonify({'mensaje': 'No hay pagos pendientes'}), 204
+
+    return jsonify({
+        'id': p.id,
+        'id_pago': p.id_pago,
+        'producto': p.producto,
+        'estado': p.estado
+    }), 200
+
+
+# ── Marcar como DISPENSADO (lo llama el front cuando ya liberó el producto) ────
+@app.route('/api/marcar_dispensado', methods=['POST'])
+def marcar_dispensado():
+    data = request.get_json(silent=True) or {}
+    id_pago = data.get('id_pago')
+
+    if not id_pago:
+        return jsonify({'error': 'id_pago requerido'}), 400
+
+    p = Pago.query.filter_by(id_pago=id_pago, estado='approved', dispensado=False).first()
+    if not p:
+        return jsonify({'error': 'Pago no encontrado o ya dispensado'}), 404
+
+    p.dispensado = True
+    db.session.commit()
+    return jsonify({'mensaje': 'Pago marcado como dispensado'}), 200
+
 @app.route("/", methods=["GET"])
 def home():
     return "✅ Backend funcionando"
