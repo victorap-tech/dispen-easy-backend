@@ -196,49 +196,39 @@ def eliminar_producto(id):
 # -----------------------------------------
 @app.route("/api/generar_qr/<int:id>", methods=["GET"])
 def generar_qr(id):
-    # 1) Buscar producto en la DB
-    producto = Producto.query.get_or_404(id)
+    producto = Producto.query.get(id)
+    if not producto:
+        return jsonify({"error": "Producto no encontrado"}), 404
 
-    # 2) Token MP
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
         return jsonify({"error": "Falta MP_ACCESS_TOKEN"}), 500
 
-    # 3) Preferencia
-    url = "https://api.mercadopago.com/checkout/preferences"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-
-    # Título visible que verá el cliente (puede ser solo el nombre)
-    titulo_visible = producto.nombre
+    titulo_visible = producto.nombre  # podés sumar marca si querés
 
     payload = {
         "items": [{
-            "title": titulo_visible,                 # ← nombre del producto
+            "title": titulo_visible,
             "quantity": 1,
-            "unit_price": float(producto.precio)
+            "unit_price": float(producto.precio),
         }],
-        "description": producto.nombre,             # ← refuerzo
-        "additional_info": {
-            "items": [{"title": producto.nombre}]   # ← refuerzo para webhook
-        },
-        "metadata": {                               # ← clave para que el webhook tenga el nombre
-            "producto_id": producto.id,
-            "producto_nombre": producto.nombre
+        "description": producto.nombre,
+        "additional_info": {"items": [{"title": producto.nombre}]},
+        "metadata": {
+            "product_id": producto.id,
+            "slot_id": producto.slot_id,      # <--- clave para el ESP
         },
         "external_reference": f"prod:{producto.id}",
-
-        # AJUSTA ESTAS URLs A TUS DOMINIOS
         "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
         "back_urls": {
             "success": "https://dispen-easy-web-production.up.railway.app/",
             "pending": "https://dispen-easy-web-production.up.railway.app/",
-            "failure": "https://dispen-easy-web-production.up.railway.app/"
+            "failure": "https://dispen-easy-web-production.up.railway.app/",
         },
-        "auto_return": "approved"
+        "auto_return": "approved",
     }
+
+    # … POST a MP como ya lo tenés …
 
     # 4) Crear preferencia
     resp = requests.post(url, headers=headers, json=payload, timeout=12)
