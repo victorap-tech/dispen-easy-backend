@@ -112,6 +112,25 @@ def mp_get_payment(payment_id: str, token: str):
 
     return info, 200, raw_json
 
+#-------Helper slotid-----
+from sqlalchemy import text
+
+def ensure_slot_id_column():
+    try:
+        res = db.session.execute(text("PRAGMA table_info(producto)"))
+        cols = [row[1] for row in res]
+        if "slot_id" not in cols:
+            db.session.execute(
+                text("ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 0")
+            )
+            db.session.commit()
+            print("[DB] Columna slot_id agregada")
+        else:
+            print("[DB] Columna slot_id ya existe")
+    except Exception as e:
+        print("[DB] Error creando columna slot_id:", e)
+        db.session.rollback()
+
 # ------------------------
 # Modelos
 # ------------------------
