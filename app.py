@@ -340,16 +340,23 @@ def webhook():
         db.session.rollback()
         print("[webhook] ERROR guardando pago:", e, flush=True)
 
-    # ---- Publicar a MQTT si aprobado ----
+   # ---- Publicar a MQTT si aprobado ----
+if (estado or "").lower() == "approved":
     try:
-        if (estado or "").lower() == "approved":
-            # Payload claro hacia el dispositivo
-            mqtt_publish({
-                "comando": "activar",
-                "producto": producto,            # ← nombre real
-                "pago_id": str(payment_id)
-            })  # usa MQTT_TOPIC por defecto (desde tu helper)
-            print("[webhook] MQTT publicado OK", flush=True)
+        # Extraer metadata del pago
+        meta = pay.get("metadata", {}) if isinstance(pay, dict) else {}
+        producto_id = meta.get("producto_id")  # ID numérico del producto
+        producto_nombre = meta.get("producto_nombre")  # Nombre real del producto
+
+        # Publicar por MQTT
+        mqtt_publish({
+            "comando": "activar",
+            "producto": producto_nombre,  # Ej: "Jabón líquido"
+            "producto_id": producto_id,   # Ej: 22
+            "pago_id": str(payment_id)
+        })
+        print(f"[webhook] MQTT publicado OK -> {producto_id} - {producto_nombre}", flush=True)
+
     except Exception as e:
         print("[webhook] Error publicando MQTT:", e, flush=True)
 
