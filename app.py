@@ -161,6 +161,7 @@ class Producto(db.Model):
 # Crear tablas si no existen
 with app.app_context():
     db.create_all()
+    ensure_slot_id_column()
     print("Tablas creadas")
 
 # ------------------------
