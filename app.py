@@ -255,35 +255,122 @@ def generar_qr(id):
 # -----------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-    print("[webhook] Datos recibidos:", data, flush=True)
+    raw = request.get_json(silent=True) or {}
+    print("[webhook] raw:", raw, flush=True)
 
+    token = os.getenv("MP_ACCESS_TOKEN")
+    if not token:
+        return jsonify({"error": "missing MP_ACCESS_TOKEN"}), 500
+
+    # --------- Resolver payment_id de los 2 formatos posibles ---------
+    payment_id = None
+    if isinstance(raw.get("data"), dict) and raw["data"].get("id"):
+        payment_id = str(raw["data"]["id"])
+    elif raw.get("resource") and raw.get("topic"):
+        topic = raw["topic"]
+        resource = str(raw["resource"]).rstrip("/")
+        if topic == "payment" and "/payments/" in resource:
+            payment_id = resource.split("/")[-1]
+        elif topic == "merchant_order" and "/merchant_orders/" in resource:
+            mo_id = resource.split("/")[-1]
+            try:
+                r_mo = requests.get(
+                    f"https://api.mercadolibre.com/merchant_orders/{mo_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=12,
+                )
+                payments = (r_mo.json().get("payments") or [])
+                if payments:
+                    payment_id = str(payments[-1].get("id"))
+            except Exception as e:
+                print("[webhook] merchant_order error:", e, flush=True)
+
+    if not payment_id:
+        print("[webhook] sin payment_id, ignoro", flush=True)
+        return jsonify({"status": "ignored"}), 200
+
+    # --------- Consultar detalle del pago ----------
     try:
-        payment_id = data.get("data", {}).get("id")
-        if not payment_id:
-            return jsonify({"status": "sin id de pago"}), 400
-
-        # Consultar el pago a MP
-        pay = mp.payment().get(payment_id).get("response", {})
-        estado = pay.get("status")
-
-        if (estado or "").lower() == "approved":
-            meta = pay.get("metadata", {})
-            producto_id = meta.get("producto_id")
-            producto_nombre = meta.get("producto_nombre", "Producto desconocido")
-
-            mqtt_publish({
-                "comando": "activar",
-                "producto": producto_nombre,
-                "producto_id": producto_id,
-                "pago_id": str(payment_id)
-            })
-            print(f"[webhook] MQTT publicado OK -> {producto_id} - {producto_nombre}", flush=True)
-
+        r_pay = requests.get(
+            f"https://api.mercadopago.com/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=12,
+        )
+        pay = r_pay.json()
+        print("[webhook] payment resp:", r_pay.status_code, {"id": pay.get("id"), "status": pay.get("status")}, flush=True)
     except Exception as e:
-        print("[webhook] Error publicando MQTT:", e, flush=True)
+        print("[webhook] error consultando payment:", e, flush=True)
+        return jsonify({"status": "ok"}), 200
 
-    # Siempre devolver 200 para que MP no reintente
+    estado = (pay.get("status") or "").lower()
+
+    # --------- Resolver nombre e ID del producto ----------
+    ai = pay.get("additional_info") or {}
+    items = ai.get("items") or []
+    meta = pay.get("metadata") or {}
+
+    producto_id = meta.get("producto_id")
+    producto = (
+        meta.get("producto_nombre")
+        or (items[0].get("title") if items and isinstance(items[0], dict) else None)
+        or pay.get("description")
+        or "Desconocido"
+    )
+
+    # --------- Guardar/actualizar en DB ----------
+    try:
+        reg = Pago.query.filter_by(id_pago=str(payment_id)).first()
+        if reg:
+            reg.estado = estado
+            reg.producto = producto
+        else:
+            reg = Pago(
+                id_pago=str(payment_id),
+                estado=estado,
+                producto=producto,
+                dispensado=False,
+            )
+            db.session.add(reg)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print("[webhook] error guardando pago:", e, flush=True)
+
+    # --------- Calcular POS (índice según orden de tabla) ----------
+    pos = None
+    try:
+        productos = Producto.query.order_by(Producto.id.asc()).all()
+        ids = [p.id for p in productos]
+        if producto_id is not None and producto_id in ids:
+            pos = ids.index(producto_id)  # 0..N-1
+        elif producto and productos:
+            # fallback por nombre (normalizado)
+            nombre_norm = (producto or "").strip().lower()
+            nombres = [ (p.nombre or "").strip().lower() for p in productos ]
+            if nombre_norm in nombres:
+                pos = nombres.index(nombre_norm)
+        print(f"[webhook] pos resuelta = {pos}", flush=True)
+    except Exception as e:
+        print("[webhook] error resolviendo pos:", e, flush=True)
+
+    # --------- Publicar a MQTT si aprobado ----------
+    if estado == "approved":
+        payload_mqtt = {
+            "comando": "activar",
+            "producto": producto,
+            "producto_id": producto_id,
+            "pago_id": str(payment_id),
+        }
+        if pos is not None:
+            payload_mqtt["pos"] = pos  # ESP32: mapear pos→pin
+
+        try:
+            mqtt_publish(payload_mqtt)  # usa tu helper (topic por defecto)
+            print("[webhook] MQTT publicado:", payload_mqtt, flush=True)
+        except Exception as e:
+            print("[webhook] error MQTT:", e, flush=True)
+
+    # Siempre 200 para que MP no reintente
     return jsonify({"status": "ok"}), 200
     
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
