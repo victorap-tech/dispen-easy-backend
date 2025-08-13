@@ -184,15 +184,13 @@ def eliminar_producto(id):
 # -----------------------------------------
 @app.route("/api/generar_qr/<int:id>", methods=["GET"])
 def generar_qr(id):
-    # 1) Buscar producto
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "Producto no encontrado"}), 404
+    # 1) Buscar producto en la DB
+    producto = Producto.query.get_or_404(id)
 
     # 2) Token MP
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
-        return jsonify({"error": "Falta MP_ACCESS_TOKEN en variables de entorno"}), 500
+        return jsonify({"error": "Falta MP_ACCESS_TOKEN"}), 500
 
     # 3) Preferencia
     url = "https://api.mercadopago.com/checkout/preferences"
@@ -201,26 +199,26 @@ def generar_qr(id):
         "Authorization": f"Bearer {token}",
     }
 
-    # 🔵 Título grande que ve el cliente en la cabecera de MP
-    titulo_visible = f"{producto.nombre} - DISPENEASY"
+    # Título visible que verá el cliente (puede ser solo el nombre)
+    titulo_visible = producto.nombre
 
     payload = {
         "items": [{
-            "title": titulo_visible,                    # ← acá va producto + marca
+            "title": titulo_visible,                 # ← nombre del producto
             "quantity": 1,
             "unit_price": float(producto.precio)
         }],
-        "description": producto.nombre,                 # redundante, ayuda a otros flujos
+        "description": producto.nombre,             # ← refuerzo
         "additional_info": {
-            "items": [{"title": producto.nombre}]
+            "items": [{"title": producto.nombre}]   # ← refuerzo para webhook
         },
-        "metadata": {
+        "metadata": {                               # ← clave para que el webhook tenga el nombre
             "producto_id": producto.id,
             "producto_nombre": producto.nombre
         },
         "external_reference": f"prod:{producto.id}",
 
-        # Ajustá estas URLs a tus dominios actuales
+        # AJUSTA ESTAS URLs A TUS DOMINIOS
         "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
         "back_urls": {
             "success": "https://dispen-easy-web-production.up.railway.app/",
@@ -231,9 +229,8 @@ def generar_qr(id):
     }
 
     # 4) Crear preferencia
-    resp = requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload, timeout=12)
     if resp.status_code != 201:
-        # log útil para depurar
         try:
             detalle = resp.json()
         except Exception:
@@ -244,29 +241,28 @@ def generar_qr(id):
     # 5) Link de pago
     link = resp.json().get("init_point")
 
-    # 6) Generar QR PNG → Base64
+    # 6) Generar QR (PNG Base64)
     import qrcode, io, base64
     img = qrcode.make(link)
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    qr_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    return jsonify({"qr_base64": qr_base64, "link": link})
+    return jsonify({"qr_base64": qr_base64, "link": link}), 200
 
-# === Webhook Mercado Pago: guarda nombre real del producto ===
+# -----------------------------------------
+# Webhook Mercado Pago (con MQTT)
+# -----------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) Obtener el cuerpo crudo
     raw = request.get_json(silent=True) or {}
     print("[webhook] raw body =", raw, flush=True)
 
-    # 2) Token MP
     token = os.getenv("MP_ACCESS_TOKEN")
     if not token:
-        print("[webhook] Falta MP_ACCESS_TOKEN", flush=True)
-        return jsonify({"error": "missing token"}), 500
+        return jsonify({"error": "missing MP_ACCESS_TOKEN"}), 500
 
-    # 3) Resolver payment_id (MP puede mandar 2 formatos)
+    # ---- Resolver payment_id (dos formatos posibles) ----
     payment_id = None
 
     # Formato nuevo: {"data": {"id": "123"}}
@@ -277,22 +273,17 @@ def webhook():
     if not payment_id and raw.get("resource") and raw.get("topic"):
         topic = raw["topic"]
         resource = str(raw["resource"]).rstrip("/")
-
-        # /v1/payments/{id}
         if topic == "payment" and "/payments/" in resource:
             payment_id = resource.split("/")[-1]
-
-        # /merchant_orders/{id} -> consultar merchant order para sacar payments
-        if not payment_id and topic == "merchant_order" and "/merchant_orders/" in resource:
+        elif topic == "merchant_order" and "/merchant_orders/" in resource:
             mo_id = resource.split("/")[-1]
             try:
                 r_mo = requests.get(
-                    f"https://api.mercadolibre.com/merchant_orders/{mo_id}",
+                    f"https://api.mercadopago.com/merchant_orders/{mo_id}",
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=12,
                 )
                 mo = r_mo.json()
-                print(f"[webhook] MO resp {r_mo.status_code}", flush=True)
                 payments = mo.get("payments", [])
                 if payments:
                     payment_id = str(payments[-1].get("id"))
@@ -300,11 +291,10 @@ def webhook():
                 print("[webhook] Error consultando merchant_orders:", e, flush=True)
 
     if not payment_id:
-        print("[webhook] No se pudo resolver payment_id, ignoro.", flush=True)
-        # Muy importante devolver 200 para que MP no reintente infinito
-        return jsonify({"status": "ignored"}), 200
+        print("[webhook] No se pudo resolver payment_id", flush=True)
+        return jsonify({"status": "ignored"}), 200  # siempre 200 para evitar reintentos infinitos
 
-    # 4) Traer detalle del pago
+    # ---- Traer detalle del pago ----
     try:
         r_pay = requests.get(
             f"https://api.mercadopago.com/v1/payments/{payment_id}",
@@ -312,29 +302,24 @@ def webhook():
             timeout=12,
         )
         pay = r_pay.json()
-        print(
-            "[webhook] payment resp:",
-            r_pay.status_code,
-            {"id": pay.get("id"), "status": pay.get("status")},
-            flush=True,
-        )
+        print("[webhook] payment resp:", r_pay.status_code, {"id": pay.get("id"), "status": pay.get("status")}, flush=True)
     except Exception as e:
         print("[webhook] Error consultando payment:", e, flush=True)
-        return jsonify({"status": "ok"}), 200  # devolvemos 200 igual
+        return jsonify({"status": "ok"}), 200
 
-    # 5) Extraer estado + nombre real del producto
+    # ---- Extraer estado y NOMBRE REAL del producto ----
     estado = pay.get("status")  # approved / pending / rejected / in_process
     ai = pay.get("additional_info") or {}
     items = ai.get("items") or []
 
     producto = (
-        (items[0].get("title") if items and isinstance(items[0], dict) else None)
-        or pay.get("description")
-        or (pay.get("metadata", {}) or {}).get("producto_nombre")
-        or "Desconocido"
+        (pay.get("metadata") or {}).get("producto_nombre") or
+        (items[0].get("title") if items and isinstance(items[0], dict) else None) or
+        pay.get("description") or
+        "Desconocido"
     )
 
-    # 6) Guardar/actualizar en DB
+    # ---- Guardar/actualizar en DB ----
     try:
         reg = Pago.query.filter_by(id_pago=str(payment_id)).first()
         if reg:
@@ -355,20 +340,20 @@ def webhook():
         db.session.rollback()
         print("[webhook] ERROR guardando pago:", e, flush=True)
 
-    # 7) Publicar a MQTT si está aprobado
+    # ---- Publicar a MQTT si aprobado ----
     try:
-        if estado == "approved":
-            # Opción A (tu helper acepta dict y publica a 'dispen-easy/dispensar')
-            mqtt_publish({"comando": "activar", "producto": producto, "pago_id": str(payment_id)})
-
-            # Opción B (si tu helper es publicar_mqtt(topic, payload), usa esta línea en su lugar):
-            # publicar_mqtt("dispen-easy/dispensar", "activar")
-
+        if (estado or "").lower() == "approved":
+            # Payload claro hacia el dispositivo
+            mqtt_publish({
+                "comando": "activar",
+                "producto": producto,            # ← nombre real
+                "pago_id": str(payment_id)
+            })  # usa MQTT_TOPIC por defecto (desde tu helper)
             print("[webhook] MQTT publicado OK", flush=True)
     except Exception as e:
         print("[webhook] Error publicando MQTT:", e, flush=True)
 
-    # 8) Siempre 200 a MP
+    # Siempre responder 200 a MP
     return jsonify({"status": "ok"}), 200
     
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
