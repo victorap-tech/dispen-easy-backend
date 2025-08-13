@@ -256,7 +256,7 @@ def generar_qr(id):
 # === Webhook Mercado Pago: guarda nombre real del producto ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 1) Obtener cuerpo crudo
+    # 1) Obtener el cuerpo crudo
     raw = request.get_json(silent=True) or {}
     print("[webhook] raw body =", raw, flush=True)
 
@@ -266,14 +266,14 @@ def webhook():
         print("[webhook] Falta MP_ACCESS_TOKEN", flush=True)
         return jsonify({"error": "missing token"}), 500
 
-    # 3) Resolver payment_id desde los 2 formatos
+    # 3) Resolver payment_id (MP puede mandar 2 formatos)
     payment_id = None
 
-    # Formato nuevo { "data": { "id": ... } }
+    # Formato nuevo: {"data": {"id": "123"}}
     if isinstance(raw.get("data"), dict) and raw["data"].get("id"):
         payment_id = str(raw["data"]["id"])
 
-    # Formato clásico { "resource": ".../payments/{id}", "topic": "payment" } o merchant_order
+    # Formato clásico: {"resource": ".../payments/{id}", "topic": "payment"} o merchant_order
     if not payment_id and raw.get("resource") and raw.get("topic"):
         topic = raw["topic"]
         resource = str(raw["resource"]).rstrip("/")
@@ -282,7 +282,7 @@ def webhook():
         if topic == "payment" and "/payments/" in resource:
             payment_id = resource.split("/")[-1]
 
-        # /merchant_orders/{id} -> consultar y sacar el último payment
+        # /merchant_orders/{id} -> consultar merchant order para sacar payments
         if not payment_id and topic == "merchant_order" and "/merchant_orders/" in resource:
             mo_id = resource.split("/")[-1]
             try:
@@ -301,7 +301,7 @@ def webhook():
 
     if not payment_id:
         print("[webhook] No se pudo resolver payment_id, ignoro.", flush=True)
-        # Muy importante devolver 200 para que MP no reintente infinitamente
+        # Muy importante devolver 200 para que MP no reintente infinito
         return jsonify({"status": "ignored"}), 200
 
     # 4) Traer detalle del pago
@@ -320,7 +320,7 @@ def webhook():
         )
     except Exception as e:
         print("[webhook] Error consultando payment:", e, flush=True)
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok"}), 200  # devolvemos 200 igual
 
     # 5) Extraer estado + nombre real del producto
     estado = pay.get("status")  # approved / pending / rejected / in_process
@@ -358,8 +358,12 @@ def webhook():
     # 7) Publicar a MQTT si está aprobado
     try:
         if estado == "approved":
-            # Ajustá la lógica si querés usar litros/tiempo según producto
-            mqtt_publish({"comando": "dispensar", "producto": producto, "pago_id": str(payment_id)})
+            # Opción A (tu helper acepta dict y publica a 'dispen-easy/dispensar')
+            mqtt_publish({"comando": "activar", "producto": producto, "pago_id": str(payment_id)})
+
+            # Opción B (si tu helper es publicar_mqtt(topic, payload), usa esta línea en su lugar):
+            # publicar_mqtt("dispen-easy/dispensar", "activar")
+
             print("[webhook] MQTT publicado OK", flush=True)
     except Exception as e:
         print("[webhook] Error publicando MQTT:", e, flush=True)
