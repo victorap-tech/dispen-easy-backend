@@ -252,6 +252,7 @@ def generar_qr(id):
     qr_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     return jsonify({"qr_base64": qr_base64, "link": link})
+
 # === Webhook Mercado Pago: guarda nombre real del producto ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
