@@ -165,20 +165,22 @@ def listar_productos():
     return jsonify(data)
 
 @app.route("/api/productos", methods=["POST"])
-def agregar_producto():
-    data = request.json or {}
-    try:
-        nuevo = Producto(
-            nombre=data["nombre"],
-            precio=float(data["precio"]),
-            cantidad=int(data["cantidad"])
-        )
-        db.session.add(nuevo)
-        db.session.commit()
-        return jsonify({"mensaje": "Producto agregado correctamente"})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"No se pudo agregar el producto: {e}"}), 400
+def crear_producto():
+    data = request.get_json(force=True)
+    nombre = data.get("nombre")
+    precio = float(data.get("precio", 0))
+    cantidad = int(data.get("cantidad", 1))
+
+    slot_id = data.get("slot_id")
+    if slot_id is None:
+        # siguiente posición disponible por orden (cíclico 0..5 si querés 6 salidas)
+        existentes = Producto.query.order_by(Producto.id.asc()).all()
+        slot_id = len(existentes) % 6
+
+    p = Producto(nombre=nombre, precio=precio, cantidad=cantidad, slot_id=int(slot_id))
+    db.session.add(p)
+    db.session.commit()
+    return jsonify(p.to_dict()), 201
 
 @app.route("/api/productos/<int:id>", methods=["DELETE"])
 def eliminar_producto(id):
