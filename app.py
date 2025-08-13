@@ -124,9 +124,19 @@ class Pago(db.Model):
 
 class Producto(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(100), nullable=False)
+    nombre = db.Column(db.String(120), nullable=False)
     precio = db.Column(db.Float, nullable=False)
-    cantidad = db.Column(db.Integer, nullable=False)  # stock / cantidad
+    cantidad = db.Column(db.Integer, nullable=False, default=1)
+    slot_id = db.Column(db.Integer, nullable=False, default=0)  # <--- NUEVO
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "nombre": self.nombre,
+            "precio": self.precio,
+            "cantidad": self.cantidad,
+            "slot_id": self.slot_id,            # <--- incluir en API
+        }
 
 
 # Crear tablas si no existen
