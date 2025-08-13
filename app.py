@@ -450,6 +450,34 @@ def marcar_dispensado():
     p.dispensado = True
     db.session.commit()
     return jsonify({'mensaje': 'Pago marcado como dispensado'}), 200
+    
+#----api test-mqtt------
+@app.route("/api/test-mqtt", methods=["POST"])
+def test_mqtt():
+    try:
+        data = request.get_json() or {}
+        producto = data.get("producto", "prueba")
+        pago_id = data.get("pago_id", "test123")
+
+        mqtt_payload = {
+            "comando": "dispensar",
+            "producto": producto,
+            "pago_id": pago_id
+        }
+
+        resultado = publicar_mqtt(
+            topic=os.getenv("MQTT_TOPIC", "dispen-easy/pagos"),
+            mensaje=json.dumps(mqtt_payload)
+        )
+
+        return jsonify({
+            "status": "ok",
+            "mensaje": "MQTT enviado",
+            "resultado": resultado
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detalle": str(e)}), 500
+
 
 @app.route("/", methods=["GET"])
 def home():
