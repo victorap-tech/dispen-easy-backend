@@ -291,9 +291,9 @@ def webhook():
 
     estado = (pay.get("status") or "").lower()
 
-    # --------- Extraer metadatos (ID que usará el ESP) ----------
+    # --------- Extraer metadata / nombre ----------
     meta = pay.get("metadata") or {}
-    producto_id = meta.get("producto_id")           # <-- CLAVE
+    producto_id_real = meta.get("producto_id")  # ID real en DB (puede ser 22, 37, etc.)
     producto_nom = (
         meta.get("producto_nombre")
         or (pay.get("additional_info") or {}).get("items", [{}])[0].get("title")
@@ -320,24 +320,49 @@ def webhook():
         db.session.rollback()
         print("[webhook] error guardando pago:", e, flush=True)
 
+    # --------- Resolver POS (0..5) según orden visible de la tabla ----------
+    pos = None
+    try:
+        productos = Producto.query.order_by(Producto.id.asc()).all()  # ajusta el orden si tu front usa otro
+        ids = [p.id for p in productos]
+        # 1) Preferir metadata.id si vino
+        if producto_id_real is not None and producto_id_real in ids:
+            pos = ids.index(producto_id_real)  # 0..N-1
+        # 2) Fallback por nombre (si hiciera falta)
+        elif producto_nom and productos:
+            nombre_norm = (producto_nom or "").strip().lower()
+            nombres = [(p.nombre or "").strip().lower() for p in productos]
+            if nombre_norm in nombres:
+                pos = nombres.index(nombre_norm)
+        print(f"[webhook] pos={pos}", flush=True)
+    except Exception as e:
+        print("[webhook] error resolviendo pos:", e, flush=True)
+
+    # --------- Calcular slot_id (1..6) para el ESP ---------
+    slot_id = None
+    if pos is not None:
+        slot_id = pos + 1  # 0→1, 1→2, ... 5→6
+        if not (1 <= slot_id <= 6):
+            slot_id = None
+
     # --------- Publicar a MQTT si aprobado ----------
-    if estado == "approved" and producto_id:
+    if estado == "approved" and slot_id:
         try:
-            # tiempo default (ms) configurable por ENV
-            ms = int(os.getenv("DISPENSE_MS", "2000"))
+            ms = int(os.getenv("DISPENSE_MS", "2000"))  # configurable por ENV
             payload = {
                 "comando": "activar",
-                "producto_id": int(producto_id),   # el ESP usa este ID (1..6)
+                "producto_id": slot_id,       # <<--- slot 1..6 que tu ESP mapea a GPIO
                 "pago_id": str(payment_id),
                 "ms": ms
-                # "producto": producto_nom,        # opcional, por si querés logear nombre
+                # "producto": producto_nom,   # opcional (logging)
             }
-            mqtt_publish(payload)  # usa tu helper: topic = dispen-easy/dispensar
+            mqtt_publish(payload)  # tu helper publica en dispen-easy/dispensar
             print("[webhook] MQTT publicado:", payload, flush=True)
         except Exception as e:
             print("[webhook] error MQTT:", e, flush=True)
+    else:
+        print(f"[webhook] no MQTT (estado={estado}, slot_id={slot_id})", flush=True)
 
-    # Siempre 200 para evitar reintentos infinitos
     return jsonify({"status": "ok"}), 200
     
 # ==== ENDPOINT SIMPLE PARA AUDITAR PAGOS ====
