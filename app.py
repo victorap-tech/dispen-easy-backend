@@ -27,10 +27,12 @@ db = SQLAlchemy(app)
 # CORS para todo lo que cuelgue de /api/*
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ==== MIGRACIÓN SIMPLE (agrega slot_id y created_at) ====
+# -----------------------------------
+# Migración robusta de columnas en 'producto'
+# -----------------------------------
 import os
 from flask import Blueprint, jsonify, request
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 
 migrate_bp = Blueprint("migrate_bp", __name__)
 
@@ -41,45 +43,91 @@ def _exec(engine, sql):
 @migrate_bp.get("/admin/migrate")
 def admin_migrate():
     token = request.args.get("token")
-    if token != os.getenv("MIGRATION_TOKEN"):
+    expected = os.getenv("MIGRATION_TOKEN")
+    if not expected or token != expected:
         return jsonify({"ok": False, "detail": "forbidden"}), 403
 
-    engine = app.extensions["sqlalchemy"].db.engine  # usa tu referencia a db/engine
+    engine = db.engine
+    insp = inspect(engine)
     actions = []
-
-    # Postgres (Railway) y SQLite: ADD COLUMN si no existen
-    # slot_id
     try:
-        _exec(engine, "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 1;")
-        actions.append("slot_id OK")
-    except Exception as e:
-        actions.append(f"slot_id: {e}")
+        # 1) Verificar que exista la tabla
+        tables = insp.get_table_names()
+        if "producto" not in tables:
+            return jsonify({"ok": False, "detail": "tabla 'producto' no existe"}), 400
 
-    # created_at (timestamp actual por defecto)
-    # En Postgres TIMESTAMPTZ, en SQLite CURRENT_TIMESTAMP funciona también
-    try:
-        _exec(engine, "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
-        actions.append("created_at OK")
-    except Exception:
-        # fallback para SQLite si falla la línea anterior
+        # 2) Columnas existentes
+        cols = {c["name"] for c in insp.get_columns("producto")}
+        dialect = engine.url.get_dialect().name.lower()
+
+        # 3) Agregar slot_id
+        if "slot_id" not in cols:
+            try:
+                if dialect in ("postgresql", "postgres"):
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 1;")
+                else:  # sqlite / otros
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 1;")
+                actions.append("ADD slot_id")
+            except Exception as e:
+                actions.append(f"slot_id SKIP/ERR: {e}")
+        else:
+            actions.append("slot_id ya existe")
+
+        # 4) Agregar created_at
+        if "created_at" not in cols:
+            try:
+                if dialect in ("postgresql", "postgres"):
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+                else:  # sqlite
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP);")
+                actions.append("ADD created_at")
+            except Exception as e:
+                actions.append(f"created_at SKIP/ERR: {e}")
+        else:
+            actions.append("created_at ya existe")
+
+        # 5) (Opcional) updated_at
+        if "updated_at" not in cols:
+            try:
+                if dialect in ("postgresql", "postgres"):
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at TIMESTAMPTZ;")
+                else:
+                    _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at DATETIME;")
+                actions.append("ADD updated_at")
+            except Exception as e:
+                actions.append(f"updated_at SKIP/ERR: {e}")
+        else:
+            actions.append("updated_at ya existe")
+
+        # 6) Índice por slot_id (siempre best effort)
         try:
-            _exec(engine, "ALTER TABLE producto ADD COLUMN created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP);")
-            actions.append("created_at OK (sqlite)")
-        except Exception as e2:
-            actions.append(f"created_at: {e2}")
+            _exec(engine, "CREATE INDEX IF NOT EXISTS idx_producto_slot_id ON producto (slot_id);")
+            actions.append("INDEX slot_id OK")
+        except Exception as e:
+            actions.append(f"INDEX SKIP/ERR: {e}")
 
-    # índice por slot_id (opcional)
-    try:
-        _exec(engine, "CREATE INDEX IF NOT EXISTS idx_producto_slot_id ON producto (slot_id);")
-        actions.append("index OK")
+        return jsonify({"ok": True, "dialect": dialect, "actions": actions})
     except Exception as e:
-        actions.append(f"index: {e}")
+        # devolvé detalle si algo explota
+        return jsonify({"ok": False, "error": str(e), "actions": actions}), 500
 
-    return jsonify({"ok": True, "actions": actions})
-# Registrar el blueprint
+# Ruta útil para ver columnas actuales
+@migrate_bp.get("/admin/dbinfo")
+def admin_dbinfo():
+    token = request.args.get("token")
+    expected = os.getenv("MIGRATION_TOKEN")
+    if not expected or token != expected:
+        return jsonify({"ok": False, "detail": "forbidden"}), 403
+    engine = db.engine
+    insp = inspect(engine)
+    cols = insp.get_columns("producto") if "producto" in insp.get_table_names() else []
+    return jsonify({
+        "ok": True,
+        "dialect": engine.url.get_dialect().name,
+        "columns": [{k: v for k, v in c.items() if k in ("name","type","nullable","default")} for c in cols]
+    })
+
 app.register_blueprint(migrate_bp)
-
-# ==== FIN MIGRACIÓN ====
 # -----------------------------
 # Modelos
 # -----------------------------
