@@ -21,6 +21,7 @@ flask_cors
 qrcode
 gunicorn
 pillow
+mercadopago
 
 
 
