@@ -175,32 +175,105 @@ def productos_options():
 def productos_id_options(id):
     return "", 204
 
-# ------------------------
-# CRUD Productos
-# ------------------------
+# ==== CRUD Productos =========================================================
+
+def _producto_to_dict(p: "Producto"):
+    return {
+        "id": p.id,
+        "nombre": p.nombre,
+        "precio": p.precio,
+        "cantidad": p.cantidad,
+        "slot_id": p.slot_id,
+    }
+
 @app.route("/api/productos", methods=["GET"])
 def listar_productos():
-    productos = Producto.query.all()
-    data = [{"id": p.id, "nombre": p.nombre, "precio": p.precio, "cantidad": p.cantidad} for p in productos]
-    return jsonify(data)
+    productos = Producto.query.order_by(Producto.id.asc()).all()
+    return jsonify([_producto_to_dict(p) for p in productos])
+
+@app.route("/api/productos/<int:id>", methods=["GET"])
+def obtener_producto(id):
+    p = Producto.query.get(id)
+    if not p:
+        return jsonify({"error": "Producto no encontrado"}), 404
+    return jsonify(_producto_to_dict(p))
 
 @app.route("/api/productos", methods=["POST"])
 def crear_producto():
-    data = request.get_json(force=True)
-    nombre = data.get("nombre")
-    precio = float(data.get("precio", 0))
+    data = request.get_json(force=True) or {}
+
+    nombre   = (data.get("nombre") or "").strip()
+    precio   = float(data.get("precio", 0))
     cantidad = int(data.get("cantidad", 1))
 
+    if not nombre:
+        return jsonify({"error": "nombre es requerido"}), 400
+    if precio <= 0:
+        return jsonify({"error": "precio debe ser > 0"}), 400
+    if cantidad <= 0:
+        return jsonify({"error": "cantidad debe ser > 0"}), 400
+
+    # slot_id opcional; si no viene, se asigna automáticamente (0..5)
     slot_id = data.get("slot_id")
     if slot_id is None:
-        # siguiente posición disponible por orden (cíclico 0..5 si querés 6 salidas)
         existentes = Producto.query.order_by(Producto.id.asc()).all()
         slot_id = len(existentes) % 6
+    else:
+        try:
+            slot_id = int(slot_id)
+        except Exception:
+            return jsonify({"error": "slot_id inválido"}), 400
+        if not (0 <= slot_id <= 5):
+            return jsonify({"error": "slot_id fuera de rango (0..5)"}), 400
 
-    p = Producto(nombre=nombre, precio=precio, cantidad=cantidad, slot_id=int(slot_id))
+    p = Producto(nombre=nombre, precio=precio, cantidad=cantidad, slot_id=slot_id)
     db.session.add(p)
     db.session.commit()
-    return jsonify(p.to_dict()), 201
+    return jsonify(_producto_to_dict(p)), 201
+
+@app.route("/api/productos/<int:id>", methods=["PUT", "PATCH"])
+def actualizar_producto(id):
+    p = Producto.query.get(id)
+    if not p:
+        return jsonify({"error": "Producto no encontrado"}), 404
+
+    data = request.get_json(force=True) or {}
+
+    if "nombre" in data:
+        nombre = (data.get("nombre") or "").strip()
+        if not nombre:
+            return jsonify({"error": "nombre no puede ser vacío"}), 400
+        p.nombre = nombre
+
+    if "precio" in data:
+        try:
+            precio = float(data.get("precio"))
+        except Exception:
+            return jsonify({"error": "precio inválido"}), 400
+        if precio <= 0:
+            return jsonify({"error": "precio debe ser > 0"}), 400
+        p.precio = precio
+
+    if "cantidad" in data:
+        try:
+            cantidad = int(data.get("cantidad"))
+        except Exception:
+            return jsonify({"error": "cantidad inválida"}), 400
+        if cantidad <= 0:
+            return jsonify({"error": "cantidad debe ser > 0"}), 400
+        p.cantidad = cantidad
+
+    if "slot_id" in data:
+        try:
+            slot_id = int(data.get("slot_id"))
+        except Exception:
+            return jsonify({"error": "slot_id inválido"}), 400
+        if not (0 <= slot_id <= 5):
+            return jsonify({"error": "slot_id fuera de rango (0..5)"}), 400
+        p.slot_id = slot_id
+
+    db.session.commit()
+    return jsonify(_producto_to_dict(p))
 
 @app.route("/api/productos/<int:id>", methods=["DELETE"])
 def eliminar_producto(id):
@@ -210,7 +283,7 @@ def eliminar_producto(id):
     db.session.delete(p)
     db.session.commit()
     return jsonify({"mensaje": "Producto eliminado"})
-
+# ============================================================================
 # -----------------------------------------
 # Generar QR de pago (Mercado Pago)
 # -----------------------------------------
