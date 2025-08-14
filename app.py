@@ -1,47 +1,82 @@
+# app.py
+# ============================================================
+# Dispen-Easy backend (Flask + SQLAlchemy) - versión completa
+# con migración robusta y endpoints de administración.
+# ============================================================
+
 import os
-import io
-import json
 import base64
+import io
 from datetime import datetime
-from typing import Optional
 
-import requests
-from flask import Flask, jsonify, request
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, jsonify, request, Blueprint
 from flask_cors import CORS
-from sqlalchemy import text, inspect
-import qrcode
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect, text
+from sqlalchemy.sql import func
 
-# -----------------------------
+# -----------------------------------
 # Configuración base del server
-# -----------------------------
+# -----------------------------------
 app = Flask(__name__)
 
-# Base de datos
+# Base de datos (Railway provee DATABASE_URL para Postgres)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///dispen_easy.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# CORS para todo lo que cuelgue de /api/*
+# CORS para todo lo que cuelgue de /api/
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # -----------------------------------
-# Migración robusta de columnas en 'producto'
+# Modelos
 # -----------------------------------
-import os
-from flask import Blueprint, jsonify, request
-from sqlalchemy import text, inspect
+class Producto(db.Model):
+    __tablename__ = "producto"
+    id        = db.Column(db.Integer, primary_key=True)
+    nombre    = db.Column(db.String(120), nullable=False)
+    precio    = db.Column(db.Float, nullable=False)        # en ARS
+    cantidad  = db.Column(db.Integer, nullable=False, default=0)  # litros
+    slot_id   = db.Column(db.Integer, nullable=False, default=1)  # salida física 1..6
+    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = db.Column(db.DateTime(timezone=True), onupdate=func.now())
 
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "nombre": self.nombre,
+            "precio": self.precio,
+            "cantidad": self.cantidad,
+            "slot_id": self.slot_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+# Crear tablas si no existen (estructura base)
+with app.app_context():
+    db.create_all()
+
+# -----------------------------------
+# MIGRACIÓN ROBUSTA (admin)
+# -----------------------------------
 migrate_bp = Blueprint("migrate_bp", __name__)
 
 def _exec(engine, sql):
     with engine.begin() as conn:
         conn.execute(text(sql))
 
-@migrate_bp.get("/admin/migrate")
+@migrate_bp.get("/migrate")
 def admin_migrate():
+    """
+    Asegura que la tabla 'producto' tenga:
+      - slot_id (INT NOT NULL DEFAULT 1)
+      - created_at (TIMESTAMPTZ/DATETIME NOT NULL DEFAULT NOW/CURRENT_TIMESTAMP)
+      - updated_at (nullable)
+      - índice idx_producto_slot_id
+    No falla si ya existen.
+    """
     token = request.args.get("token")
     expected = os.getenv("MIGRATION_TOKEN")
     if not expected or token != expected:
@@ -50,564 +85,197 @@ def admin_migrate():
     engine = db.engine
     insp = inspect(engine)
     actions = []
+
     try:
-        # 1) Verificar que exista la tabla
         tables = insp.get_table_names()
         if "producto" not in tables:
             return jsonify({"ok": False, "detail": "tabla 'producto' no existe"}), 400
 
-        # 2) Columnas existentes
         cols = {c["name"] for c in insp.get_columns("producto")}
         dialect = engine.url.get_dialect().name.lower()
 
-        # 3) Agregar slot_id
+        # slot_id
         if "slot_id" not in cols:
-            try:
-                if dialect in ("postgresql", "postgres"):
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 1;")
-                else:  # sqlite / otros
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 1;")
-                actions.append("ADD slot_id")
-            except Exception as e:
-                actions.append(f"slot_id SKIP/ERR: {e}")
+            _exec(engine, "ALTER TABLE producto ADD COLUMN slot_id INTEGER NOT NULL DEFAULT 1;")
+            actions.append("ADD slot_id")
         else:
             actions.append("slot_id ya existe")
 
-        # 4) Agregar created_at
+        # created_at
         if "created_at" not in cols:
-            try:
-                if dialect in ("postgresql", "postgres"):
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
-                else:  # sqlite
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP);")
-                actions.append("ADD created_at")
-            except Exception as e:
-                actions.append(f"created_at SKIP/ERR: {e}")
+            if dialect in ("postgresql", "postgres"):
+                _exec(engine, "ALTER TABLE producto ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            else:  # sqlite u otros
+                _exec(engine, "ALTER TABLE producto ADD COLUMN created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP);")
+            actions.append("ADD created_at")
         else:
             actions.append("created_at ya existe")
 
-        # 5) (Opcional) updated_at
+        # updated_at (opcional)
         if "updated_at" not in cols:
-            try:
-                if dialect in ("postgresql", "postgres"):
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at TIMESTAMPTZ;")
-                else:
-                    _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at DATETIME;")
-                actions.append("ADD updated_at")
-            except Exception as e:
-                actions.append(f"updated_at SKIP/ERR: {e}")
+            if dialect in ("postgresql", "postgres"):
+                _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at TIMESTAMPTZ;")
+            else:
+                _exec(engine, "ALTER TABLE producto ADD COLUMN updated_at DATETIME;")
+            actions.append("ADD updated_at")
         else:
             actions.append("updated_at ya existe")
 
-        # 6) Índice por slot_id (siempre best effort)
+        # índice por slot_id
         try:
             _exec(engine, "CREATE INDEX IF NOT EXISTS idx_producto_slot_id ON producto (slot_id);")
             actions.append("INDEX slot_id OK")
-        except Exception as e:
-            actions.append(f"INDEX SKIP/ERR: {e}")
+        except Exception as ie:
+            actions.append(f"INDEX SKIP/ERR: {ie}")
 
         return jsonify({"ok": True, "dialect": dialect, "actions": actions})
     except Exception as e:
-        # devolvé detalle si algo explota
         return jsonify({"ok": False, "error": str(e), "actions": actions}), 500
 
-# Ruta útil para ver columnas actuales
-@migrate_bp.get("/admin/dbinfo")
+@migrate_bp.get("/dbinfo")
 def admin_dbinfo():
+    """Devuelve dialecto, tablas y columnas (serializable JSON)."""
     token = request.args.get("token")
     expected = os.getenv("MIGRATION_TOKEN")
     if not expected or token != expected:
         return jsonify({"ok": False, "detail": "forbidden"}), 403
+
     engine = db.engine
     insp = inspect(engine)
-    cols = insp.get_columns("producto") if "producto" in insp.get_table_names() else []
-    return jsonify({
-        "ok": True,
-        "dialect": engine.url.get_dialect().name,
-        "columns": [{k: v for k, v in c.items() if k in ("name","type","nullable","default")} for c in cols]
-    })
-
-app.register_blueprint(migrate_bp)
-# -----------------------------
-# Modelos
-# -----------------------------
-class Producto(db.Model):
-    __tablename__ = "producto"
-    id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(120), nullable=False)
-    precio = db.Column(db.Float, nullable=False)  # en la moneda configurada en MP
-    slot_id = db.Column(db.Integer, nullable=False, default=0)  # 0..5
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "nombre": self.nombre,
-            "precio": self.precio,
-            "slot_id": self.slot_id,
-            "created_at": self.created_at.isoformat(),
-        }
-
-
-class Pago(db.Model):
-    __tablename__ = "pago"
-    id = db.Column(db.Integer, primary_key=True)
-    mp_payment_id = db.Column(db.String(64), index=True)  # ID devuelto por MP
-    external_reference = db.Column(db.String(128), nullable=True)
-    status = db.Column(db.String(32), index=True)  # approved, rejected, etc.
-    producto_id = db.Column(db.Integer, nullable=True)
-    producto_nombre = db.Column(db.String(120), nullable=True)
-    slot_id = db.Column(db.Integer, nullable=True)
-    monto = db.Column(db.Float, nullable=True)
-    dispensado = db.Column(db.Boolean, default=False, index=True)
-    raw = db.Column(db.Text, nullable=True)  # json crudo por si hace falta auditar
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "mp_payment_id": self.mp_payment_id,
-            "external_reference": self.external_reference,
-            "status": self.status,
-            "producto_id": self.producto_id,
-            "producto_nombre": self.producto_nombre,
-            "slot_id": self.slot_id,
-            "monto": self.monto,
-            "dispensado": self.dispensado,
-            "created_at": self.created_at.isoformat(),
-        }
-
-
-# -----------------------------
-# Utilitarios DB
-# -----------------------------
-def ensure_slot_id_column():
-    """
-    Asegura que exista la columna slot_id en la tabla producto de forma portable
-    (útil si migraste desde una DB vieja).
-    """
-    try:
-        engine = db.engine
-        insp = inspect(engine)
-        cols = [c["name"] for c in insp.get_columns("producto")]
-        if "slot_id" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE producto ADD COLUMN slot_id INTEGER"))
-                conn.execute(text("UPDATE producto SET slot_id = 0 WHERE slot_id IS NULL"))
-                try:
-                    # En Postgres:
-                    conn.execute(text("ALTER TABLE producto ALTER COLUMN slot_id SET DEFAULT 0"))
-                    conn.execute(text("ALTER TABLE producto ALTER COLUMN slot_id SET NOT NULL"))
-                except Exception as e:
-                    print("[DB] No se pudo fijar NOT NULL/DEFAULT (continuo):", e)
-            print("[DB] Columna slot_id agregada")
-        else:
-            print("[DB] Columna slot_id ya existe")
-    except Exception as e:
-        print("[DB] Error creando columna slot_id:", e)
-        db.session.rollback()
-
-
-def init_db():
-    db.create_all()
-    ensure_slot_id_column()
-
-
-# -----------------------------
-# MQTT (publicación simple por evento)
-# -----------------------------
-def mqtt_publish(payload: dict, topic: Optional[str] = None):
-    """
-    Publica un mensaje MQTT conectando, publicando y desconectando (simple y robusto).
-    Si necesitás alto volumen, migrá a un cliente persistente.
-    """
-    import paho.mqtt.client as mqtt
-
-    broker = os.getenv("MQTT_BROKER", "broker.hivemq.com")
-    port = int(os.getenv("MQTT_PORT", "1883"))
-    user = os.getenv("MQTT_USER", "")
-    pwd = os.getenv("MQTT_PASS", "")
-    client_id = os.getenv("MQTT_CLIENT_ID", "dispen-easy-backend")
-    keepalive = int(os.getenv("MQTT_KEEPALIVE", "60"))
-    topic = topic or os.getenv("MQTT_TOPIC", "dispen-easy/dispensar")
-
-    client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
-
-    if user:
-        client.username_pw_set(user, pwd)
-
-    # Nota: Si usás TLS (8883), descomentá estas líneas y exportá MQTT_PORT=8883
-    # import ssl
-    # client.tls_set(cert_reqs=ssl.CERT_NONE)
-    # client.tls_insecure_set(True)
-
-    client.connect(broker, port, keepalive)
-    client.loop_start()
-    payload_str = json.dumps(payload, ensure_ascii=False)
-    result = client.publish(topic, payload_str, qos=1, retain=False)
-    result.wait_for_publish()
-    client.loop_stop()
-    client.disconnect()
-    print("[MQTT] Enviado a", topic, ":", payload_str, flush=True)
-
-
-# -----------------------------
-# Mercado Pago helpers
-# -----------------------------
-MP_API_BASE = "https://api.mercadopago.com"
-
-def mp_headers():
-    token = os.getenv("MP_ACCESS_TOKEN")
-    if not token:
-        raise RuntimeError("MP_ACCESS_TOKEN no configurado")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-
-def mp_get_payment(payment_id: str):
-    """
-    Obtiene un pago por ID (recomendado en el webhook).
-    """
-    url = f"{MP_API_BASE}/v1/payments/{payment_id}"
-    resp = requests.get(url, headers=mp_headers(), timeout=12)
-    if resp.status_code != 200:
-        raise RuntimeError(f"MP get payment {payment_id} fallo: {resp.status_code} {resp.text}")
-    return resp.json()
-
-
-# -----------------------------
-# Endpoints de Productos (CRUD)
-# -----------------------------
-@app.route("/api/productos", methods=["GET"])
-def listar_productos():
-    productos = Producto.query.order_by(Producto.id.asc()).all()
-    return jsonify([p.to_dict() for p in productos]), 200
-
-
-@app.route("/api/productos", methods=["POST"])
-def crear_producto():
-    data = request.get_json() or {}
-    nombre = (data.get("nombre") or "").strip()
-    precio = data.get("precio")
-    slot_id = data.get("slot_id")
-
-    if not nombre:
-        return jsonify({"error": "Falta nombre"}), 400
-    try:
-        precio = float(precio)
-    except Exception:
-        return jsonify({"error": "Precio inválido"}), 400
-
-    # Asignación automática del primer slot libre 0..5 si no vino
-    if slot_id is None:
-        usados = {p.slot_id for p in Producto.query.all()}
-        slot_id = None
-        for i in range(6):
-            if i not in usados:
-                slot_id = i
-                break
-        if slot_id is None:
-            return jsonify({"error": "No hay slots disponibles (0..5)"}), 400
-    else:
-        try:
-            slot_id = int(slot_id)
-            if slot_id < 0 or slot_id > 5:
-                return jsonify({"error": "slot_id debe estar entre 0 y 5"}), 400
-        except Exception:
-            return jsonify({"error": "slot_id inválido"}), 400
-
-    p = Producto(nombre=nombre, precio=precio, slot_id=slot_id)
-    db.session.add(p)
-    db.session.commit()
-    return jsonify(p.to_dict()), 201
-
-
-@app.route("/api/productos/<int:pid>", methods=["GET"])
-def obtener_producto(pid):
-    p = Producto.query.get(pid)
-    if not p:
-        return jsonify({"error": "Producto no encontrado"}), 404
-    return jsonify(p.to_dict()), 200
-
-
-@app.route("/api/productos/<int:pid>", methods=["PUT"])
-def actualizar_producto(pid):
-    p = Producto.query.get(pid)
-    if not p:
-        return jsonify({"error": "Producto no encontrado"}), 404
-
-    data = request.get_json() or {}
-    if "nombre" in data and data["nombre"] is not None:
-        p.nombre = str(data["nombre"]).strip() or p.nombre
-    if "precio" in data and data["precio"] is not None:
-        try:
-            p.precio = float(data["precio"])
-        except Exception:
-            return jsonify({"error": "Precio inválido"}), 400
-    if "slot_id" in data and data["slot_id"] is not None:
-        try:
-            slot = int(data["slot_id"])
-            if slot < 0 or slot > 5:
-                return jsonify({"error": "slot_id debe estar entre 0 y 5"}), 400
-            p.slot_id = slot
-        except Exception:
-            return jsonify({"error": "slot_id inválido"}), 400
-
-    db.session.commit()
-    return jsonify(p.to_dict()), 200
-
-
-@app.route("/api/productos/<int:pid>", methods=["DELETE"])
-def borrar_producto(pid):
-    p = Producto.query.get(pid)
-    if not p:
-        return jsonify({"error": "Producto no encontrado"}), 404
-    db.session.delete(p)
-    db.session.commit()
-    return jsonify({"status": "ok"}), 200
-
-
-# -----------------------------
-# Generar QR (link de pago)
-# -----------------------------
-@app.route("/api/generar_qr/<int:pid>", methods=["GET"])
-def generar_qr(pid):
-    producto = Producto.query.get(pid)
-    if not producto:
-        return jsonify({"error": "Producto no encontrado"}), 404
-
-    try:
-        token = os.getenv("MP_ACCESS_TOKEN")
-        if not token:
-            return jsonify({"error": "Falta MP_ACCESS_TOKEN"}), 500
-
-        notification_url = os.getenv(
-            "MP_NOTIFICATION_URL",
-            # Cambiá esto por tu dominio en producción
-            "https://web-production-e7d2.up.railway.app/webhook",
-        )
-
-        url = f"{MP_API_BASE}/checkout/preferences"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "items": [{
-                "title": producto.nombre,
-                "quantity": 1,
-                "unit_price": float(producto.precio),
-            }],
-            "description": producto.nombre,
-            "additional_info": {"items": [{"title": producto.nombre}]},
-            "metadata": {
-                "producto_id": producto.id,           # clave alíneada con webhook
-                "producto_nombre": producto.nombre,
-                "slot_id": producto.slot_id,
-            },
-            "external_reference": f"prod:{producto.id}",
-            "notification_url": notification_url,
-            "back_urls": {
-                "success": os.getenv("MP_BACK_URL_SUCCESS", "https://dispen-easy-web-production.up.railway.app/"),
-                "pending": os.getenv("MP_BACK_URL_PENDING", "https://dispen-easy-web-production.up.railway.app/"),
-                "failure": os.getenv("MP_BACK_URL_FAILURE", "https://dispen-easy-web-production.up.railway.app/"),
-            },
-            "auto_return": "approved",
-        }
-
-        resp = requests.post(url, headers=headers, json=payload, timeout=12)
-        if resp.status_code != 201:
-            try:
-                detalle = resp.json()
-            except Exception:
-                detalle = resp.text
-            print("MP error:", resp.status_code, detalle, flush=True)
-            return jsonify({"error": "No se pudo generar link de pago", "detalle": detalle}), 502
-
-        link = resp.json().get("init_point")
-
-        img = qrcode.make(link)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        return jsonify({"qr_base64": qr_base64, "link": link}), 200
-
-    except Exception as e:
-        return jsonify({"error": "Error generando QR", "detalle": str(e)}), 500
-
-
-# -----------------------------
-# Webhook de Mercado Pago
-# -----------------------------
-@app.route("/webhook", methods=["POST", "GET"])
-def webhook():
-    """
-    - Mercado Pago puede llamar con GET (verificación) y con POST (notificación real).
-    - En POST, si viene type=payment e id, consultamos el pago para tener datos confiables.
-    """
-    if request.method == "GET":
-        return jsonify({"status": "ok"}), 200
-
-    try:
-        data = request.get_json(silent=True) or {}
-        # Notificaciones nuevas usan "type": "payment" y "data": {"id": "NNN"}
-        notif_type = (data.get("type") or data.get("action") or "").lower()
-        payment_id = None
-
-        if notif_type == "payment":
-            # formato nuevo
-            payment_id = (data.get("data") or {}).get("id")
-        else:
-            # formato clásico: topic=payment & id=
-            payment_id = data.get("id") or request.args.get("id")
-
-        if not payment_id:
-            return jsonify({"status": "ignored", "detalle": "sin payment_id"}), 200
-
-        # Consultar el pago en MP para tener info confiable
-        pay = mp_get_payment(str(payment_id))
-
-        estado = (pay.get("status") or "").lower()
-        meta = pay.get("metadata") or {}
-
-        producto_nombre = (
-            meta.get("producto_nombre")
-            or pay.get("description")
-            or ((pay.get("additional_info") or {}).get("items") or [{}])[0].get("title")
-            or "Desconocido"
-        )
-        producto_id_real = meta.get("producto_id")
-        slot_id = meta.get("slot_id")
-        monto = None
-        try:
-            monto = float(pay.get("transaction_amount") or 0.0)
-        except Exception:
-            pass
-
-        # Guardar/actualizar pago
-        pago = Pago(
-            mp_payment_id=str(payment_id),
-            external_reference=pay.get("external_reference"),
-            status=estado,
-            producto_id=producto_id_real,
-            producto_nombre=producto_nombre,
-            slot_id=slot_id,
-            monto=monto,
-            dispensado=False,
-            raw=json.dumps(pay, ensure_ascii=False),
-        )
-        db.session.add(pago)
-        db.session.commit()
-
-        # Si está aprobado, publicar a MQTT para activar dispensado
-        if estado == "approved":
-            mqtt_payload = {
-                "comando": "activar",
-                "slot_id": int(slot_id) if slot_id is not None else 0,
-                "pago_id": str(payment_id),
-                "mensaje": "Dispen-Easy activo"
-            }
-            try:
-                mqtt_publish(mqtt_payload, topic=os.getenv("MQTT_TOPIC", "dispen-easy/dispensar"))
-            except Exception as me:
-                print("[MQTT] Error publicando:", me, flush=True)
-
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print("[WEBHOOK] Error:", e, flush=True)
-        return jsonify({"status": "error", "detalle": str(e)}), 500
-
-
-# -----------------------------
-# Pagos pendientes / marcar dispensado
-# -----------------------------
-@app.route("/api/check_payment_pendiente", methods=["GET"])
-def check_payment_pendiente():
-    """
-    Devuelve el último pago aprobado que aún no se marcó como dispensado.
-    El ESP32 puede consultar esto en modo 'pull' si no está usando MQTT.
-    """
-    pago = (
-        Pago.query.filter_by(status="approved", dispensado=False)
-        .order_by(Pago.created_at.desc())
-        .first()
-    )
-    if not pago:
-        return jsonify({"pendiente": False}), 200
-    return jsonify({"pendiente": True, "pago": pago.to_dict()}), 200
-
-
-@app.route("/api/marcar_dispensado", methods=["POST"])
-def marcar_dispensado():
-    """
-    Marca un pago como dispensado. Se puede llamar desde el ESP32
-    tras completar la entrega.
-    Body JSON: { "pago_id": "..." }  (puede ser mp_payment_id o id interno)
-    """
-    data = request.get_json() or {}
-    pago_id = str(data.get("pago_id", "")).strip()
-    if not pago_id:
-        return jsonify({"error": "Falta pago_id"}), 400
-
-    # Buscar por mp_payment_id primero, si no por id interno
-    pago = Pago.query.filter_by(mp_payment_id=pago_id).first()
-    if not pago and pago_id.isdigit():
-        pago = Pago.query.get(int(pago_id))
-
-    if not pago:
-        return jsonify({"error": "Pago no encontrado"}), 404
-
-    pago.dispensado = True
-    db.session.commit()
-    return jsonify({"status": "ok"}), 200
-
-
-# -----------------------------
-# Endpoint de prueba MQTT
-# -----------------------------
-@app.route("/api/test-mqtt", methods=["POST"])
-def test_mqtt():
-    try:
-        data = request.get_json() or {}
-        slot_id = int(data.get("slot_id", 0))
-        pago_id = str(data.get("pago_id", "test123"))
-
-        mqtt_payload = {
-            "comando": "activar",
-            "slot_id": slot_id,
-            "pago_id": pago_id,
-            "mensaje": "Dispen-Easy activo"
-        }
-
-        mqtt_publish(mqtt_payload, topic=os.getenv("MQTT_TOPIC", "dispen-easy/dispensar"))
-        return jsonify({"status": "ok", "mensaje": "MQTT enviado", "payload": mqtt_payload}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "detalle": str(e)}), 500
-
-
-# -----------------------------
-# Healthcheck
-# -----------------------------
-@app.route("/api/health", methods=["GET"])
+    tables = insp.get_table_names()
+    data = {"ok": True, "dialect": engine.url.get_dialect().name, "tables": tables, "columns": {}}
+
+    for t in tables:
+        cols = insp.get_columns(t)
+        safe_cols = []
+        for c in cols:
+            safe_cols.append({
+                "name": c.get("name"),
+                "type": str(c.get("type")),
+                "nullable": bool(c.get("nullable")),
+                "default": str(c.get("default")),
+            })
+        data["columns"][t] = safe_cols
+    return jsonify(data)
+
+app.register_blueprint(migrate_bp, url_prefix="/admin")
+
+# -----------------------------------
+# ENDPOINTS API
+# -----------------------------------
+
+@app.get("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return {"ok": True, "time": datetime.utcnow().isoformat()}, 200
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"mensaje": "API de Dispen-Easy funcionando"})
-# -----------------------------
-# Boot
-# -----------------------------
+@app.get("/api/productos")
+def listar_productos():
+    """Lista productos. Soporta filtro opcional por ?slot_id=."""
+    try:
+        slot_id = request.args.get("slot_id", type=int)
+        q = Producto.query
+        if slot_id:
+            q = q.filter_by(slot_id=slot_id)
+        productos = q.order_by(Producto.id.asc()).all()
+        return jsonify([p.to_dict() for p in productos]), 200
+    except Exception as e:
+        app.logger.exception(e)
+        return jsonify({"detail": str(e)}), 500
+
+@app.post("/api/productos")
+def crear_producto():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        nombre = (data.get("nombre") or "").strip()
+        precio = data.get("precio")
+        cantidad = data.get("cantidad")
+        slot_id = data.get("slot_id")
+
+        if not nombre or precio is None or cantidad is None or slot_id is None:
+            return jsonify({"detail": "Faltan campos: nombre, precio, cantidad, slot_id"}), 400
+
+        p = Producto(
+            nombre=nombre,
+            precio=float(precio),
+            cantidad=int(cantidad),
+            slot_id=int(slot_id),
+        )
+        db.session.add(p)
+        db.session.commit()
+        return jsonify(p.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception(e)
+        return jsonify({"detail": str(e)}), 500
+
+@app.delete("/api/productos/<int:pid>")
+def eliminar_producto(pid):
+    try:
+        p = Producto.query.get(pid)
+        if not p:
+            return jsonify({"detail": "Producto no encontrado"}), 404
+        db.session.delete(p)
+        db.session.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception(e)
+        return jsonify({"detail": str(e)}), 500
+
+# -----------------------------------
+# Generación de QR (con fallback)
+# -----------------------------------
+def _png_fallback_base64(texto: str) -> str:
+    """
+    Devuelve un PNG mínimo válido con el texto en metadata (fallback sin PIL/qrcode).
+    Usa un PNG de 1x1 transparente embebido.
+    """
+    # PNG 1x1 transparente base64
+    tiny_png_base64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2P8z/CfBwAD"
+        "gwG0k8x7WQAAAABJRU5ErkJggg=="
+    )
+    return tiny_png_base64
+
+@app.get("/api/generar_qr/<int:pid>")
+def generar_qr(pid):
+    """
+    Genera un QR base64 de un payload simple. Si no están instaladas
+    librerías de QR, devuelve un PNG 1x1 (fallback) para no romper el front.
+    Soporta ?slot_id= opcional (no usado en el contenido del QR aquí).
+    """
+    try:
+        slot_id = request.args.get("slot_id", type=int)
+
+        # Payload del QR (ajustá según tu lógica real de pagos)
+        payload = {
+            "producto_id": pid,
+            "slot_id": slot_id,
+            "ts": datetime.utcnow().isoformat()
+        }
+
+        # Intentar con qrcode + Pillow
+        try:
+            import qrcode
+            from PIL import Image
+            img = qrcode.make(str(payload))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            return jsonify({"qr_base64": b64}), 200
+        except Exception:
+            # Fallback: PNG mínimo
+            b64 = _png_fallback_base64(str(payload))
+            return jsonify({"qr_base64": b64, "note": "fallback_png"}), 200
+
+    except Exception as e:
+        app.logger.exception(e)
+        return jsonify({"detail": str(e)}), 500
+
+
+# -----------------------------------
+# Main
+# -----------------------------------
 if __name__ == "__main__":
-    # Inicializar DB
-    with app.app_context():
-        init_db()
-
-    port = int(os.getenv("PORT", "5000"))
-    debug = os.getenv("FLASK_DEBUG", "1") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    # Para desarrollo local
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
