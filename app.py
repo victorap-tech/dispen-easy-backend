@@ -27,7 +27,59 @@ db = SQLAlchemy(app)
 # CORS para todo lo que cuelgue de /api/*
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+# ==== MIGRACIÓN SIMPLE (agrega slot_id y created_at) ====
+import os
+from flask import Blueprint, jsonify, request
+from sqlalchemy import text
 
+migrate_bp = Blueprint("migrate_bp", __name__)
+
+def _exec(engine, sql):
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+
+@migrate_bp.get("/admin/migrate")
+def admin_migrate():
+    token = request.args.get("token")
+    if token != os.getenv("MIGRATION_TOKEN"):
+        return jsonify({"ok": False, "detail": "forbidden"}), 403
+
+    engine = app.extensions["sqlalchemy"].db.engine  # usa tu referencia a db/engine
+    actions = []
+
+    # Postgres (Railway) y SQLite: ADD COLUMN si no existen
+    # slot_id
+    try:
+        _exec(engine, "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 1;")
+        actions.append("slot_id OK")
+    except Exception as e:
+        actions.append(f"slot_id: {e}")
+
+    # created_at (timestamp actual por defecto)
+    # En Postgres TIMESTAMPTZ, en SQLite CURRENT_TIMESTAMP funciona también
+    try:
+        _exec(engine, "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+        actions.append("created_at OK")
+    except Exception:
+        # fallback para SQLite si falla la línea anterior
+        try:
+            _exec(engine, "ALTER TABLE producto ADD COLUMN created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP);")
+            actions.append("created_at OK (sqlite)")
+        except Exception as e2:
+            actions.append(f"created_at: {e2}")
+
+    # índice por slot_id (opcional)
+    try:
+        _exec(engine, "CREATE INDEX IF NOT EXISTS idx_producto_slot_id ON producto (slot_id);")
+        actions.append("index OK")
+    except Exception as e:
+        actions.append(f"index: {e}")
+
+    return jsonify({"ok": True, "actions": actions})
+# Registrar el blueprint
+app.register_blueprint(migrate_bp)
+
+# ==== FIN MIGRACIÓN ====
 # -----------------------------
 # Modelos
 # -----------------------------
