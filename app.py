@@ -272,6 +272,10 @@ def generar_qr(pid: int):
     except Exception as e:
         app.logger.exception(e)
         return jsonify({"detail": str(e)}), 500
+
+@app.route('/')
+def home():
+    return "Dispen-Easy backend activo"
 # -----------------------------------
 # Main
 # -----------------------------------
