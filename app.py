@@ -497,7 +497,9 @@ def test_mqtt():
 def health():
     return jsonify({"status": "ok"}), 200
 
-
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"mensaje": "API de Dispen-Easy funcionando"})
 # -----------------------------
 # Boot
 # -----------------------------
