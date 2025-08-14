@@ -222,57 +222,56 @@ def eliminar_producto(pid):
         app.logger.exception(e)
         return jsonify({"detail": str(e)}), 500
 
-# -----------------------------------
-# Generación de QR (con fallback)
-# -----------------------------------
-def _png_fallback_base64(texto: str) -> str:
-    """
-    Devuelve un PNG mínimo válido con el texto en metadata (fallback sin PIL/qrcode).
-    Usa un PNG de 1x1 transparente embebido.
-    """
-    # PNG 1x1 transparente base64
-    tiny_png_base64 = (
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2P8z/CfBwAD"
-        "gwG0k8x7WQAAAABJRU5ErkJggg=="
-    )
-    return tiny_png_base64
+# --- Generar QR con link de Mercado Pago ---
+import os, io, base64, qrcode, mercadopago
+from flask import jsonify, request
+
+MP_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+mp_sdk = mercadopago.SDK(MP_TOKEN) if MP_TOKEN else None
 
 @app.get("/api/generar_qr/<int:pid>")
-def generar_qr(pid):
-    """
-    Genera un QR base64 de un payload simple. Si no están instaladas
-    librerías de QR, devuelve un PNG 1x1 (fallback) para no romper el front.
-    Soporta ?slot_id= opcional (no usado en el contenido del QR aquí).
-    """
+def generar_qr(pid: int):
     try:
-        slot_id = request.args.get("slot_id", type=int)
+        if not mp_sdk:
+            return jsonify({"detail": "Configura MP_ACCESS_TOKEN en Railway"}), 500
 
-        # Payload del QR (ajustá según tu lógica real de pagos)
-        payload = {
-            "producto_id": pid,
-            "slot_id": slot_id,
-            "ts": datetime.utcnow().isoformat()
+        p = Producto.query.get(pid)
+        if not p:
+            return jsonify({"detail": "Producto no encontrado"}), 404
+
+        slot_id = request.args.get("slot_id", type=int) or 0
+
+        # URL para notificaciones (opcional pero recomendable)
+        # Usa el host actual del backend para no hardcodear.
+        notification_url = request.url_root.rstrip("/") + "/webhook"
+
+        # 1) Crear preferencia (link de pago)
+        pref_data = {
+            "items": [{
+                "title": p.nombre,
+                "quantity": 1,
+                "unit_price": float(p.precio),
+                "currency_id": "ARS",
+            }],
+            "external_reference": f"prod-{p.id}-slot-{slot_id}",
+            "auto_return": "approved",
+            "notification_url": notification_url,
         }
+        pref_res = mp_sdk.preference().create(pref_data)
+        mp_url = pref_res["response"]["init_point"]  # <- link de pago
 
-        # Intentar con qrcode + Pillow
-        try:
-            import qrcode
-            from PIL import Image
-            img = qrcode.make(str(payload))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            return jsonify({"qr_base64": b64}), 200
-        except Exception:
-            # Fallback: PNG mínimo
-            b64 = _png_fallback_base64(str(payload))
-            return jsonify({"qr_base64": b64, "note": "fallback_png"}), 200
+        # 2) Generar QR del link
+        img = qrcode.make(mp_url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        qr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        # Devolvemos QR (para mostrar) y mp_url (por si querés abrirlo con un botón)
+        return jsonify({"qr_base64": qr_b64, "mp_url": mp_url}), 200
 
     except Exception as e:
         app.logger.exception(e)
         return jsonify({"detail": str(e)}), 500
-
-
 # -----------------------------------
 # Main
 # -----------------------------------
