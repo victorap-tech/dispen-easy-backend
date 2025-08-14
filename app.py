@@ -1,16 +1,8 @@
 # ============================================================
 # Dispen-Easy backend: Flask + SQLAlchemy + MercadoPago + MQTT
-# - /                → "Dispen-Easy backend activo"
-# - /api/productos   → CRUD simple
-# - /api/generar_qr  → crea preferencia MP y devuelve QR (link embebido)
-# - /webhook         → recibe notificación, verifica pago y publica MQTT
-# - /admin/migrate   → agrega slot_id/created_at/updated_at (idempotente)
-# - /admin/dbinfo    → inspección de columnas
 # ============================================================
 
-import os
-import io
-import base64
+import os, io, base64
 from datetime import datetime
 
 from flask import Flask, jsonify, request, Blueprint
@@ -19,7 +11,6 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text
 from sqlalchemy.sql import func
 
-# ---- Opcionales instalados vía requirements.txt ----
 import qrcode
 import mercadopago
 import paho.mqtt.client as mqtt
@@ -32,7 +23,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///dispen_easy.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
-
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ---------------------------
@@ -42,9 +32,9 @@ class Producto(db.Model):
     __tablename__ = "producto"
     id         = db.Column(db.Integer, primary_key=True)
     nombre     = db.Column(db.String(120), nullable=False)
-    precio     = db.Column(db.Float, nullable=False)            # ARS
-    cantidad   = db.Column(db.Integer, nullable=False, default=0)  # Litros (o unidades)
-    slot_id    = db.Column(db.Integer, nullable=False, default=1)  # Salida 1..6
+    precio     = db.Column(db.Float, nullable=False)                 # ARS
+    cantidad   = db.Column(db.Integer, nullable=False, default=0)    # litros/unidades
+    slot_id    = db.Column(db.Integer, nullable=False, default=1)    # salida física
     created_at = db.Column(db.DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=func.now())
 
@@ -126,7 +116,7 @@ def generar_qr(pid: int):
     """
     Crea preferencia MP y devuelve:
       - mp_url: link de pago
-      - qr_base64: PNG del QR con ese link (al escanear abre MP directo)
+      - qr_base64: PNG de QR con ese link (al escanear abre MP directo)
     """
     try:
         if not mp_sdk:
@@ -153,10 +143,16 @@ def generar_qr(pid: int):
         }
 
         pref_res = mp_sdk.preference().create(pref_data)
+        # Estructura esperada: {"response": {...}, "status": 201, ...}
         resp = pref_res.get("response", {}) if isinstance(pref_res, dict) else {}
         mp_url = resp.get("init_point") or resp.get("sandbox_init_point")
+
         if not mp_url:
-            return jsonify({"detail": "Mercado Pago no devolvió init_point", "mp_response": resp}), 400
+            return jsonify({
+                "detail": "Mercado Pago no devolvió init_point",
+                "mp_status": pref_res.get("status"),
+                "mp_response": resp
+            }), 400
 
         img = qrcode.make(mp_url)
         buf = io.BytesIO()
@@ -170,7 +166,7 @@ def generar_qr(pid: int):
         return jsonify({"detail": str(e)}), 500
 
 # ---------------------------
-# MQTT (publicación al aprobar pago)
+# MQTT (publicación tras pago aprobado)
 # ---------------------------
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -192,14 +188,15 @@ def publish_mqtt(payload: dict):
         app.logger.exception(f"[MQTT] error: {e}")
 
 # ---------------------------
-# Webhook MP
+# Webhook Mercado Pago
 # ---------------------------
 @app.post("/webhook")
 def webhook():
     """
     Recibe notificaciones de MP.
-    Si es de tipo 'payment', consulta el pago y si está 'approved'
-    usa external_reference para saber qué slot/producto accionar y publica MQTT.
+    Si es 'payment', consulta el pago; si está 'approved' publica MQTT:
+      topic: {MQTT_TOPIC_PREFIX}/dispense
+      payload: {"slot": <slot_id>, "litros": <cantidad>, "product_id": <id>}
     """
     try:
         info = request.get_json(silent=True) or {}
@@ -209,13 +206,14 @@ def webhook():
         app.logger.info(f"[WEBHOOK] type={_type} id={data_id} body={info}")
 
         if not mp_sdk:
-            return jsonify({"ok": False, "detail": "MP SDK no init"}), 200
+            return jsonify({"ok": False, "detail": "MP SDK no inicializado"}), 200
 
         if _type == "payment" and data_id:
             pay = mp_sdk.payment().get(data_id)
             presp = pay.get("response", {}) if isinstance(pay, dict) else {}
             status = (presp.get("status") or "").lower()
             extref = presp.get("external_reference") or ""
+
             app.logger.info(f"[WEBHOOK] status={status} external_reference={extref}")
 
             if status == "approved" and extref.startswith("prod-"):
@@ -227,15 +225,12 @@ def webhook():
                 except Exception:
                     prod_id, slot_id = None, 1
 
-                # Podés buscar el producto para obtener cantidad, etc.
                 p = Producto.query.get(prod_id) if prod_id else None
-                cantidad_litros = p.cantidad if p else 1
+                litros = p.cantidad if p else 1
 
-                # Publicar a MQTT -> tu firmware escucha y dispensa
-                publish_mqtt({"slot": slot_id, "litros": cantidad_litros, "product_id": prod_id, "ts": datetime.utcnow().isoformat()})
+                publish_mqtt({"slot": slot_id, "litros": litros, "product_id": prod_id, "ts": datetime.utcnow().isoformat()})
                 return jsonify({"ok": True})
 
-        # Otros tipos (merchant_order, etc.) los ignoramos por simplicidad
         return jsonify({"ok": True})
     except Exception as e:
         app.logger.exception(e)
