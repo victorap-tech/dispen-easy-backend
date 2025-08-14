@@ -235,17 +235,16 @@ def generar_qr(pid: int):
         if not mp_sdk:
             return jsonify({"detail": "Configura MP_ACCESS_TOKEN en Railway"}), 500
 
+        # Traemos el producto desde la BD
         p = Producto.query.get(pid)
         if not p:
             return jsonify({"detail": "Producto no encontrado"}), 404
 
         slot_id = request.args.get("slot_id", type=int) or 0
 
-        # URL para notificaciones (opcional pero recomendable)
-        # Usa el host actual del backend para no hardcodear.
+        # URL de notificación (opcional, pero recomendable)
         notification_url = request.url_root.rstrip("/") + "/webhook"
 
-        # 1) Crear preferencia (link de pago)
         pref_data = {
             "items": [{
                 "title": p.nombre,
@@ -257,16 +256,24 @@ def generar_qr(pid: int):
             "auto_return": "approved",
             "notification_url": notification_url,
         }
-        pref_res = mp_sdk.preference().create(pref_data)
-        mp_url = pref_res["response"]["init_point"]  # <- link de pago
 
-        # 2) Generar QR del link
+        pref_res = mp_sdk.preference().create(pref_data)
+        resp = pref_res.get("response", {}) if isinstance(pref_res, dict) else {}
+        mp_url = resp.get("init_point") or resp.get("sandbox_init_point")
+
+        if not mp_url:
+            # devolvemos lo que vino para diagnóstico
+            return jsonify({
+                "detail": "Mercado Pago no devolvió init_point",
+                "mp_response": resp
+            }), 400
+
+        # Generar QR del link
         img = qrcode.make(mp_url)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Devolvemos QR (para mostrar) y mp_url (por si querés abrirlo con un botón)
         return jsonify({"qr_base64": qr_b64, "mp_url": mp_url}), 200
 
     except Exception as e:
