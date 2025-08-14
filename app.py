@@ -409,6 +409,7 @@ def webhook():
                 "comando": "activar",
                 "slot_id": int(slot_id) if slot_id is not None else 0,
                 "pago_id": str(payment_id),
+                "mensaje": "Dispen-Easy activo"
             }
             try:
                 mqtt_publish(mqtt_payload, topic=os.getenv("MQTT_TOPIC", "dispen-easy/dispensar"))
@@ -480,6 +481,7 @@ def test_mqtt():
             "comando": "activar",
             "slot_id": slot_id,
             "pago_id": pago_id,
+            "mensaje": "Dispen-Easy activo"
         }
 
         mqtt_publish(mqtt_payload, topic=os.getenv("MQTT_TOPIC", "dispen-easy/dispensar"))
