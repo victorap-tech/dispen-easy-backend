@@ -195,10 +195,10 @@ def generar_qr(slot_id: int):
             return jsonify({"error": "Producto inválido (habilitado/nombre/precio)"}), 400
 
        init_point, err = crear_preferencia(p)
-if err:
+       if err:
     # burbujea la respuesta cruda de MP si existe
-    detalle = err.get("detalle")
-    return jsonify({
+          detalle = err.get("detalle")
+           return jsonify({
         "error": err.get("error", "mp_error"),
         "detalle": detalle
     }), 400
