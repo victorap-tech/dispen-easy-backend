@@ -5,6 +5,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 import requests
 import qrcode
+import mercadopago
 
 # ---------------------------
 # Flask / CORS
@@ -26,6 +27,9 @@ CORS(app, resources={r"/api/*": {
     "methods": ["GET", "POST", "DELETE", "OPTIONS"]
 }})
 
+#----SDK------
+MP_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+sdk = mercadopago.SDK(MP_TOKEN) if MP_TOKEN else None
 # ---------------------------
 # Modelos
 # ---------------------------
@@ -280,14 +284,58 @@ def eliminar_por_slot(slot_id):
 # ---- Generar QR (MercadoPago) ----
 @app.route("/api/generar_qr/<int:slot_id>", methods=["GET"])
 def generar_qr(slot_id):
-    p = Producto.query.filter_by(slot_id=slot_id).first()
-    if not p or not p.habilitado or not p.nombre or p.precio <= 0:
-        return jsonify({"error": "Producto no válido (habilitado/nombre/precio)"}), 400
     try:
-        link, pref_id, raw = mp_create_preference(p)
+        if not sdk:
+            return jsonify({"error": "Falta MP_ACCESS_TOKEN"}), 500
+
+        producto = Producto.query.filter_by(slot_id=slot_id).first()
+        if not producto:
+            return jsonify({"error": "Producto no encontrado para ese slot"}), 404
+
+        if not producto.habilitado or not producto.nombre or float(producto.precio or 0) <= 0:
+            return jsonify({"error": "Producto no habilitado o sin nombre/precio"}), 400
+
+        preference_data = {
+            "items": [{
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio),
+            }],
+            "description": producto.nombre,
+            "metadata": {
+                "producto_id": producto.id,
+                "slot_id": producto.slot_id
+            },
+            "external_reference": f"prod:{producto.id}",
+            "notification_url": "https://web-production-e7d2.up.railway.app/webhook",
+            "back_urls": {
+                "success": "https://dispen-easy-web-production.up.railway.app/",
+                "pending": "https://dispen-easy-web-production.up.railway.app/",
+                "failure": "https://dispen-easy-web-production.up.railway.app/"
+            },
+            "auto_return": "approved",
+        }
+
+        pref = sdk.preference().create(preference_data)
+        if pref.get("status") != 201:
+            detalle = pref.get("response")
+            print("[MP] error pref:", pref.get("status"), detalle, flush=True)
+            return jsonify({"error": "No se pudo crear preferencia", "detalle": detalle}), 502
+
+        link = pref["response"].get("init_point")
+        if not link:
+            return jsonify({"error": "MP no devolvió link"}), 502
+
+        img = qrcode.make(link)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        qr_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return jsonify({"qr_base64": qr_base64, "link": link}), 200
+
     except Exception as e:
-        print("MP preferencia error:", e, flush=True)
-        return jsonify({"error": "No se pudo generar link de pago"}), 502
+        print("[QR] exception:", e, flush=True)
+        return jsonify({"error": str(e)}), 500
 
     # QR PNG -> base64
     buf = io.BytesIO()
