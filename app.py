@@ -88,6 +88,34 @@ def delete_producto(slot_id):
     db.session.commit()
     return jsonify({"success": True})
 
+#---generar qr----
+
+@app.route("/api/generar_qr/<int:slot>", methods=["GET"])
+def generar_qr(slot):
+    producto = Producto.query.get(slot)
+    if not producto or not producto.habilitado or producto.precio <= 0:
+        return jsonify({"error": "Producto no válido"}), 400
+
+    preference_data = {
+        "items": [
+            {
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio),
+                "currency_id": "ARS"
+            }
+        ],
+        "back_urls": {
+            "success": "https://tu-frontend.com/success",
+            "failure": "https://tu-frontend.com/failure",
+            "pending": "https://tu-frontend.com/pending"
+        },
+        "auto_return": "approved"
+    }
+
+    preference = sdk.preference().create(preference_data)
+    return jsonify({"init_point": preference["response"]["init_point"]})
+
 # -------------------------------
 # MQTT Config
 # -------------------------------
