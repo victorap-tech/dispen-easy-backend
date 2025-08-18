@@ -194,9 +194,14 @@ def generar_qr(slot_id: int):
         if not p or not p.habilitado or not p.nombre or p.precio <= 0:
             return jsonify({"error": "Producto inválido (habilitado/nombre/precio)"}), 400
 
-        init_point, err = crear_preferencia(p)
-        if err:
-            return jsonify(err), 400
+       init_point, err = crear_preferencia(p)
+if err:
+    # burbujea la respuesta cruda de MP si existe
+    detalle = err.get("detalle")
+    return jsonify({
+        "error": err.get("error", "mp_error"),
+        "detalle": detalle
+    }), 400
 
         png = qr_png_bytes(init_point)
         return send_file(io.BytesIO(png), mimetype="image/png")
