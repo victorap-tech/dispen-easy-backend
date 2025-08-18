@@ -168,7 +168,7 @@ def generar_qr(slot_id: int):
         return jsonify({"error": "Producto no habilitado o sin nombre/precio"}), 400
 
     # Armar preferencia Checkout Pro
-   pref_data = {
+pref_data = {
     "items": [{
         "title": p.nombre,
         "quantity": 1,
