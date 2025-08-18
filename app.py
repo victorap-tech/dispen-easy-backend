@@ -210,27 +210,42 @@ def listar_productos():
 
 @app.route("/api/productos", methods=["POST"])
 def crear_o_actualizar_producto():
-    data = request.get_json(force=True)
-    slot_id   = int(data.get("slot_id", 0))
-    nombre    = (data.get("nombre") or "").strip()
-    precio    = float(data.get("precio", 0) or 0)
-    cantidad  = int(data.get("cantidad", 1) or 1)
-    habilitado= bool(data.get("habilitado", False))
+    data = request.get_json(force=True) or {}
+    print("[POST /api/productos] body:", data, flush=True)
+
+    try:
+        slot_id   = int(data.get("slot_id", 0) or 0)
+        nombre    = (data.get("nombre") or "").strip()
+        precio    = float(data.get("precio", 0) or 0)
+        cantidad  = int(data.get("cantidad", 1) or 1)
+        habilitado= bool(data.get("habilitado", False))
+    except Exception as e:
+        print("[POST /api/productos] parse error:", e, flush=True)
+        return jsonify({"error": "payload inválido"}), 400
 
     if slot_id not in range(1, 7):
         return jsonify({"error": "slot_id inválido (1..6)"}), 400
 
-    p = Producto.query.filter_by(slot_id=slot_id).first()
-    if not p:
-        p = Producto(slot_id=slot_id)
-        db.session.add(p)
+    try:
+        p = Producto.query.filter_by(slot_id=slot_id).first()
+        created = False
+        if not p:
+            p = Producto(slot_id=slot_id)
+            db.session.add(p)
+            created = True
 
-    p.nombre = nombre
-    p.precio = precio
-    p.cantidad = cantidad
-    p.habilitado = habilitado
-    db.session.commit()
-    return jsonify(p.to_dict())
+        p.nombre = nombre
+        p.precio = precio
+        p.cantidad = cantidad
+        p.habilitado = habilitado
+
+        db.session.commit()
+        print(f"[POST /api/productos] OK slot={slot_id} {'(new)' if created else '(upd)'}", flush=True)
+        return jsonify(p.to_dict())
+    except Exception as e:
+        db.session.rollback()
+        print("[POST /api/productos] DB error:", e, flush=True)
+        return jsonify({"error": "DB error"}), 500
 
 @app.route("/api/productos/<int:slot_id>", methods=["DELETE"])
 def eliminar_por_slot(slot_id):
