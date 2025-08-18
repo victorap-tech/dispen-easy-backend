@@ -260,79 +260,91 @@ def generar_qr_get(slot_id: int):
 # -----------------------------------------------------------------------------
 # Webhook Mercado Pago
 # -----------------------------------------------------------------------------
+from flask import request, jsonify
+from datetime import datetime
+import json, re
+
 @app.post("/webhook")
-def webhook_mp():
+def webhook():
     """
-    Mercado Pago enviará distintos eventos. 
-    Para simplificar: si hay un 'data.id', intentamos consultar el payment,
-    guardamos un registro en 'pago' y, si está approved, publicamos por MQTT.
+    Webhook idempotente para Mercado Pago.
+    - Inserta el pago si no existe.
+    - Si existe, lo actualiza sin romper por duplicate key.
+    - Intenta consultar el pago en MP para completar datos.
     """
-    body = request.get_json(silent=True) or {}
-    topic = request.args.get("topic") or body.get("type") or ""
-    raw_str = json.dumps(body, ensure_ascii=False)
-
-    # Valores por defecto
-    id_pago = str(body.get("data", {}).get("id") or body.get("resource") or "unknown")
-    estado = "pendiente"
-    monto = None
-    prod_nombre = None
-    slot_id = None
-
     try:
-        if sdk and id_pago.isdigit() and (topic in ("payment", "merchant_order", "payment.updated", "payment.created")):
-            # Obtener info del pago
-            py = sdk.payment().get(id_pago)
-            info = py.get("response", {}) if py else {}
-            estado = (info.get("status") or estado)
-            monto = info.get("transaction_amount")
+        body = request.get_json(silent=True) or {}
+        args = request.args.to_dict()
+        headers = dict(request.headers)
 
-            md = info.get("metadata") or {}
-            slot_id = md.get("slot_id")
-            # el nombre del item puede venir en additional_info o en items
-            items = (info.get("additional_info", {}) or {}).get("items") or []
-            if items and items[0].get("title"):
-                prod_nombre = items[0]["title"]
+        # ---- 1) Detectar ID de pago de todas las formas posibles
+        pago_id = None
+        # v1: {"id": "..."} o {"data":{"id":"..."}}
+        pago_id = (body.get("id") or (body.get("data") or {}).get("id") or None)
+        # v2: query ?id=... o ?id_pago=...
+        pago_id = pago_id or args.get("id") or args.get("id_pago")
+        # v3: resource .../payments/123456 o .../merchant_orders/...
+        resource = body.get("resource") or args.get("resource") or ""
+        if not pago_id and resource:
+            m = re.search(r"(\d+)$", resource)
+            if m:
+                pago_id = m.group(1)
 
-            # fallback por metadata
-            if not prod_nombre:
-                prod = Producto.query.filter_by(slot_id=slot_id).first()
-                prod_nombre = prod.nombre if prod else None
+        # Guardamos el RAW para auditoría
+        raw = json.dumps({"headers": headers, "args": args, "body": body}, ensure_ascii=False)
 
-    except Exception as e:
-        # solo log, seguimos guardando raw
-        print("[webhook] error:", e, flush=True)
+        # ---- 2) UPSERT: si existe, actualizar; si no, insertar
+        registro = None
+        if pago_id:
+            registro = Pago.query.filter_by(id_pago=str(pago_id)).first()
 
-    # Guardar registro
-    try:
-        reg = Pago(
-            id_pago=str(id_pago),
-            estado=str(estado),
-            producto=prod_nombre,
-            slot_id=slot_id if isinstance(slot_id, int) else None,
-            monto=float(monto) if monto is not None else None,
-            raw=raw_str,
-            dispensado=False,
-        )
-        db.session.add(reg)
+        if registro:
+            # ya existe -> solo refrescamos raw y dejamos estado para cuando consultemos MP
+            registro.raw = raw
+        else:
+            # no existe -> insertamos con datos mínimos
+            registro = Pago(
+                id_pago=str(pago_id or f"NO_ID_{int(datetime.utcnow().timestamp())}"),
+                estado="pendiente",
+                producto="(via webhook)",
+                raw=raw,
+                created_at=datetime.utcnow(),
+            )
+            db.session.add(registro)
+
         db.session.commit()
-    except Exception as e:
-        print("[DB] error guardando pago:", e, flush=True)
 
-    # MQTT si approved
-    if str(estado).lower() == "approved":
-        client = _mqtt_client()
-        if client:
+        # ---- 3) Si tenemos SDK y un pago_id válido, consultamos el pago en MP
+        if sdk is not None and pago_id:
             try:
-                # Publicamos el slot aprobado (si no tenemos, publicamos 0)
-                client.publish("dispen/approved", json.dumps({
-                    "slot_id": slot_id or 0,
-                    "id_pago": id_pago
-                }), qos=1)
-                client.disconnect()
-            except Exception as e:
-                print("[MQTT] error publish:", e, flush=True)
+                resp = sdk.payment().get(pago_id)
+                r = resp.get("response", {}) if isinstance(resp, dict) else {}
+                status = r.get("status") or registro.estado
+                description = r.get("description") or ""
+                amount = r.get("transaction_amount")
+                meta = r.get("metadata") or {}
+                slot_id = meta.get("slot_id")
 
-    return jsonify({"ok": True})
+                # actualizar con datos reales
+                registro.estado = status
+                if amount is not None:
+                    registro.monto = float(amount)
+                if description:
+                    registro.producto = description
+                if slot_id is not None:
+                    registro.slot_id = int(slot_id)
+                registro.raw = raw
+                db.session.commit()
+            except Exception as e:
+                print("[webhook] error consultando pago en MP:", e, flush=True)
+
+        # Devolver SIEMPRE 200 para que MP no reintente infinitamente
+        return jsonify({"ok": True}), 200
+
+    except Exception as e:
+        # Logueamos pero igualmente respondemos 200 (MP reintenta si no)
+        print("[webhook] error inesperado:", e, flush=True)
+        return jsonify({"ok": True}), 200
 
 
 # -----------------------------------------------------------------------------
