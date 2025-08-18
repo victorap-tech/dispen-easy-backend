@@ -1,363 +1,276 @@
-import os, json
-from datetime import datetime
-from typing import List, Dict, Any
-
+# app.py
+import os, json, base64, io, datetime as dt
 from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
-from io import BytesIO
+from sqlalchemy import text, UniqueConstraint
+from flask_cors import CORS
 
-# QR
-import qrcode
-
-# MQTT (opcional)
+# ---------- Mercado Pago SDK ----------
 try:
-    import paho.mqtt.client as mqtt
+    import mercadopago
 except Exception:
-    mqtt = None
+    mercadopago = None
 
-# Mercado Pago SDK
-from mercadopago import SDK
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip() or None
+sdk = mercadopago.SDK(MP_ACCESS_TOKEN) if (mercadopago and MP_ACCESS_TOKEN) else None
 
-
-# -----------------------------------------------------------------------------
-# App & DB
-# -----------------------------------------------------------------------------
+# ---------- Flask / DB ----------
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql://")
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+CORS(app)
 
-# CORS (permití tu front)
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "*")
-CORS(app, resources={r"/api/*": {"origins": frontend_origin}}, supports_credentials=True)
+db_url = os.environ.get("DATABASE_URL")
+# Compatibilidad con postgres://
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# Mercado Pago
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-sdk = SDK(MP_ACCESS_TOKEN) if MP_ACCESS_TOKEN else None
-
-# MQTT opcional
-def _mqtt_client():
-    if not mqtt: 
-        return None
-    broker = os.getenv("MQTT_BROKER")
-    if not broker:
-        return None
-    client = mqtt.Client()
-    user = os.getenv("MQTT_USER")
-    pwd  = os.getenv("MQTT_PASSWORD")
-    if user and pwd:
-        client.username_pw_set(user, pwd)
-    try:
-        client.connect(broker, 1883, 60)
-        return client
-    except Exception:
-        return None
-
-
-# -----------------------------------------------------------------------------
-# Modelos
-# -----------------------------------------------------------------------------
+# ---------- Modelos ----------
 class Producto(db.Model):
     __tablename__ = "producto"
-    id         = db.Column(db.Integer, primary_key=True)
-    slot_id    = db.Column(db.Integer, nullable=False, index=True)    # 1..6
-    nombre     = db.Column(db.String(120), nullable=False, default="")
-    precio     = db.Column(db.Float, nullable=False, default=0.0)      # ARS
-    cantidad   = db.Column(db.Integer, nullable=False, default=1)      # litros (o unidades)
-    habilitado = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    id          = db.Column(db.Integer, primary_key=True, index=True)
+    slot_id     = db.Column(db.Integer, nullable=False)
+    nombre      = db.Column(db.String(120), nullable=False, default="")
+    precio      = db.Column(db.Float, nullable=False, default=0.0)   # en ARS
+    cantidad    = db.Column(db.Integer, nullable=False, default=1)   # litros
+    habilitado  = db.Column(db.Boolean, nullable=False, default=False)
+    created_at  = db.Column(db.DateTime, nullable=False, default=dt.datetime.utcnow)
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "slot_id": self.slot_id,
-            "nombre": self.nombre,
-            "precio": self.precio,
-            "cantidad": self.cantidad,
-            "habilitado": self.habilitado,
-            "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
-        }
-
+    __table_args__ = (UniqueConstraint("slot_id", name="idx_producto_slot"),)
 
 class Pago(db.Model):
     __tablename__ = "pago"
-    id           = db.Column(db.Integer, primary_key=True)
-    id_pago      = db.Column(db.String(64), index=True)   # id payment u order
-    estado       = db.Column(db.String(32))               # approved / pending / etc
-    producto     = db.Column(db.String(120))
-    slot_id      = db.Column(db.Integer)
-    monto        = db.Column(db.Float)                    # guardamos entero/float
-    raw          = db.Column(db.Text)                     # JSON crudo
-    dispensado   = db.Column(db.Boolean, default=False)
-    created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    id          = db.Column(db.Integer, primary_key=True)
+    id_pago     = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    estado      = db.Column(db.String(32), nullable=False, default="pendiente")
+    producto    = db.Column(db.String(120), nullable=True)
+    slot_id     = db.Column(db.Integer, nullable=True)
+    monto       = db.Column(db.Float, nullable=True)
+    raw         = db.Column(db.Text, nullable=True)
+    dispensado  = db.Column(db.Boolean, nullable=False, default=False)
+    created_at  = db.Column(db.DateTime, nullable=False, default=dt.datetime.utcnow)
 
-
-# -----------------------------------------------------------------------------
-# Auto-esquema (idempotente para Railway)
-# -----------------------------------------------------------------------------
+# ---------- Utils ----------
 def ensure_schema():
-    """Crea tablas y columnas si faltan (seguro para correr en cada boot)."""
-    dialect = db.engine.url.get_backend_name()
-    db.create_all()
-    if dialect.startswith("postgres"):
-        stmts = [
-            # columnas producto
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS nombre VARCHAR(120) NOT NULL DEFAULT '';",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS precio DOUBLE PRECISION NOT NULL DEFAULT 0;",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS cantidad INTEGER NOT NULL DEFAULT 1;",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS habilitado BOOLEAN NOT NULL DEFAULT FALSE;",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();",
-            # índice único por slot
-            """
-            DO $$ BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_producto_slot') THEN
-                CREATE UNIQUE INDEX idx_producto_slot ON producto(slot_id);
-              END IF;
-            END $$;
-            """,
-            # tabla pago columnas
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(64);",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(32);",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(120);",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS raw TEXT;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS dispensado BOOLEAN DEFAULT FALSE;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();",
-        ]
-        with db.engine.begin() as conn:
-            for s in stmts:
-                conn.execute(text(s))
+    """
+    Crea tablas y agrega columnas/índices que pudieran faltar (idempotente).
+    Railway a veces arranca la DB sin migraciones; esto lo deja en orden.
+    """
+    db.create_all()  # crea tablas si no existen
 
-with app.app_context():
-    ensure_schema()
+    # Ajustes idempotentes específicos para Postgres
+    try:
+        dialect = db.engine.url.get_backend_name()
+        if dialect.startswith("postgres"):
+            stmts = [
+                # asegurar columnas (por si vienen de una versión previa)
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS nombre VARCHAR(120) NOT NULL DEFAULT '';",
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS precio DOUBLE PRECISION NOT NULL DEFAULT 0;",
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS cantidad INTEGER NOT NULL DEFAULT 1;",
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS habilitado BOOLEAN NOT NULL DEFAULT FALSE;",
+                "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP;",
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_producto_slot') THEN "
+                "CREATE UNIQUE INDEX idx_producto_slot ON producto(slot_id); END IF; END $$;",
 
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(64);",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(32) DEFAULT 'pendiente';",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(120);",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER;",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION;",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS raw TEXT;",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS dispensado BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP;",
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_pago_id_pago') THEN "
+                "CREATE UNIQUE INDEX idx_pago_id_pago ON pago(id_pago); END IF; END $$;",
+            ]
+            with db.engine.begin() as conn:
+                for s in stmts:
+                    conn.execute(text(s))
+        print("[DB] esquema OK", flush=True)
+    except Exception as e:
+        print("[DB] error ensure_schema:", e, flush=True)
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-SLOTS = [1,2,3,4,5,6]
+def base_url():
+    # https://web-production-xxxx.up.railway.app
+    # request.host_url ya trae https en Railway
+    return request.host_url.rstrip("/")
 
-def fila_vacia(slot_id: int) -> Dict[str, Any]:
-    return {
-        "id": None, "slot_id": slot_id, "nombre": "", "precio": 0.0,
-        "cantidad": 1, "habilitado": False, "created_at": None
-    }
+def make_qr_png_base64(texto: str) -> str:
+    import qrcode
+    from PIL import Image
+    img = qrcode.make(texto)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
+# ---------- Rutas ----------
+@app.route("/")
+def root():
+    return jsonify({"ok": True, "message": "Dispen-Easy backend activo"})
 
-# -----------------------------------------------------------------------------
-# API Productos (GET/UPSERT/DELETE)
-# -----------------------------------------------------------------------------
 @app.get("/api/productos")
-def get_productos():
-    # traigo todos y relleno faltantes con filas vacías
-    existentes: List[Producto] = Producto.query.all()
-    por_slot = {p.slot_id: p for p in existentes}
-    out = []
-    for s in SLOTS:
-        out.append(por_slot[s].to_dict() if s in por_slot else fila_vacia(s))
-    return jsonify(out)
+def listar_productos():
+    # siempre devolvemos slots 1..6 para el panel
+    slots = {p.slot_id: p for p in Producto.query.all()}
+    data = []
+    for sid in range(1, 7):
+        p = slots.get(sid)
+        data.append({
+            "slot_id": sid,
+            "nombre": p.nombre if p else "",
+            "precio": p.precio if p else 0,
+            "cantidad": p.cantidad if p else 1,
+            "habilitado": p.habilitado if p else False,
+        })
+    return jsonify(data)
 
 @app.post("/api/productos/<int:slot_id>")
 def upsert_producto(slot_id: int):
-    data = request.get_json(force=True) or {}
-    nombre     = (data.get("nombre") or "").strip()
-    precio     = float(data.get("precio") or 0)
-    cantidad   = int(data.get("cantidad") or 1)
-    habilitado = bool(data.get("habilitado") or False)
+    body = request.get_json(silent=True) or {}
+    nombre     = (body.get("nombre") or "").strip()
+    precio     = float(body.get("precio") or 0)
+    cantidad   = int(body.get("cantidad") or 1)
+    habilitado = bool(body.get("habilitado"))
 
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
         p = Producto(slot_id=slot_id)
         db.session.add(p)
+
     p.nombre = nombre
     p.precio = precio
     p.cantidad = cantidad
     p.habilitado = habilitado
     db.session.commit()
-    return jsonify(p.to_dict())
+
+    return jsonify({"ok": True})
 
 @app.delete("/api/productos/<int:slot_id>")
 def delete_producto(slot_id: int):
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
-        return jsonify({"ok": True})
+        return jsonify({"ok": True})  # idempotente
     db.session.delete(p)
     db.session.commit()
     return jsonify({"ok": True})
 
-
-# -----------------------------------------------------------------------------
-# Generar QR (POST desde front y GET directo)
-# -----------------------------------------------------------------------------
-def _crear_preferencia_para_slot(slot_id: int) -> Dict[str, Any]:
-    if not sdk:
-        return {"error": "MP_ACCESS_TOKEN no configurado", "status": 500}
+@app.get("/api/generar_qr/<int:slot_id>")
+def generar_qr(slot_id: int):
+    if sdk is None:
+        return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
 
     p = Producto.query.filter_by(slot_id=slot_id).first()
-    if not p or (not p.habilitado) or (not p.nombre) or (p.precio <= 0):
-        return {"error": "Producto inválido/inhabilitado", "status": 400}
+    if not p or not p.habilitado or not p.nombre or (p.precio or 0) <= 0:
+        return jsonify({"error": "Producto no habilitado o sin nombre/precio"}), 400
 
-    preference_data = {
+    # Armar preferencia Checkout Pro
+    pref_data = {
         "items": [{
             "title": p.nombre,
             "quantity": 1,
             "unit_price": float(p.precio),
-            "currency_id": "ARS",
-            "description": p.nombre
         }],
-        "metadata": {"producto_id": p.id, "slot_id": p.slot_id},
+        "metadata": {
+            "producto_id": p.id,
+            "slot_id": p.slot_id,
+        },
         "external_reference": f"prod:{p.id}",
         "back_urls": {
-            "success": "/",
-            "pending": "/",
-            "failure": "/"
+            "success": base_url() + "/",
+            "pending": base_url() + "/",
+            "failure": base_url() + "/",
         },
+        "notification_url": base_url() + "/webhook",
         "auto_return": "approved",
-        "notification_url": f"{request.url_root.strip('/')}/webhook"
     }
 
-    pref = sdk.preference().create(preference_data)
+    pref = sdk.preference().create(pref_data)
     if pref.get("status") != 201:
         detalle = pref.get("response")
-        return {"error": "No se pudo crear preferencia", "detalle": detalle, "status": 502}
+        print("[MP] error pref:", pref.get("status"), detalle, flush=True)
+        return jsonify({"error": "No se pudo crear preferencia", "detalle": detalle}), 502
 
-    return {"ok": True, "pref": pref.get("response"), "slot": p}
+    init_point = pref["response"].get("init_point") or pref["response"].get("sandbox_init_point")
+    qr_png = make_qr_png_base64(init_point)
 
-def _qr_png_from_url(url: str) -> bytes:
-    img = qrcode.make(url)
-    bio = BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio.read()
+    return jsonify({
+        "ok": True,
+        "url": init_point,
+        "qr_png": qr_png,
+        "producto": {"nombre": p.nombre, "precio": p.precio, "slot_id": p.slot_id},
+    })
 
-@app.post("/api/generar_qr/<int:slot_id>")
-def generar_qr_post(slot_id: int):
-    res = _crear_preferencia_para_slot(slot_id)
-    if "error" in res:
-        return jsonify({"error": res["error"], "detalle": res.get("detalle")}), res.get("status", 400)
-
-    init_point = res["pref"].get("init_point") or res["pref"].get("sandbox_init_point")
-    png = _qr_png_from_url(init_point)
-    return send_file(BytesIO(png), mimetype="image/png")
-
-@app.get("/api/generar_qr/<int:slot_id>")
-def generar_qr_get(slot_id: int):
-    # mismo comportamiento pero accesible por GET (útil para abrir en el navegador)
-    res = _crear_preferencia_para_slot(slot_id)
-    if "error" in res:
-        return jsonify({"error": res["error"], "detalle": res.get("detalle")}), res.get("status", 400)
-
-    init_point = res["pref"].get("init_point") or res["pref"].get("sandbox_init_point")
-    png = _qr_png_from_url(init_point)
-    return send_file(BytesIO(png), mimetype="image/png")
-
-
-# -----------------------------------------------------------------------------
-# Webhook Mercado Pago
-# -----------------------------------------------------------------------------
-from flask import request, jsonify
-from datetime import datetime
-import json, re
-
-@app.post("/webhook")
+# Webhook compatible GET/POST
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """
-    Webhook idempotente para Mercado Pago.
-    - Inserta el pago si no existe.
-    - Si existe, lo actualiza sin romper por duplicate key.
-    - Intenta consultar el pago en MP para completar datos.
-    """
     try:
-        body = request.get_json(silent=True) or {}
-        args = request.args.to_dict()
-        headers = dict(request.headers)
-
-        # ---- 1) Detectar ID de pago de todas las formas posibles
-        pago_id = None
-        # v1: {"id": "..."} o {"data":{"id":"..."}}
-        pago_id = (body.get("id") or (body.get("data") or {}).get("id") or None)
-        # v2: query ?id=... o ?id_pago=...
-        pago_id = pago_id or args.get("id") or args.get("id_pago")
-        # v3: resource .../payments/123456 o .../merchant_orders/...
-        resource = body.get("resource") or args.get("resource") or ""
-        if not pago_id and resource:
-            m = re.search(r"(\d+)$", resource)
-            if m:
-                pago_id = m.group(1)
-
-        # Guardamos el RAW para auditoría
-        raw = json.dumps({"headers": headers, "args": args, "body": body}, ensure_ascii=False)
-
-        # ---- 2) UPSERT: si existe, actualizar; si no, insertar
-        registro = None
-        if pago_id:
-            registro = Pago.query.filter_by(id_pago=str(pago_id)).first()
-
-        if registro:
-            # ya existe -> solo refrescamos raw y dejamos estado para cuando consultemos MP
-            registro.raw = raw
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            topic = body.get("type") or body.get("topic")
+            id_ref = (body.get("data") or {}).get("id")
         else:
-            # no existe -> insertamos con datos mínimos
-            registro = Pago(
-                id_pago=str(pago_id or f"NO_ID_{int(datetime.utcnow().timestamp())}"),
-                estado="pendiente",
-                producto="(via webhook)",
-                raw=raw,
-                created_at=datetime.utcnow(),
-            )
-            db.session.add(registro)
+            topic = request.args.get("topic") or request.args.get("type")
+            id_ref = request.args.get("id") or request.args.get("data.id")
 
-        db.session.commit()
+        print("[webhook] method=", request.method, "topic=", topic, "id=", id_ref, flush=True)
 
-        # ---- 3) Si tenemos SDK y un pago_id válido, consultamos el pago en MP
-        if sdk is not None and pago_id:
-            try:
-                resp = sdk.payment().get(pago_id)
-                r = resp.get("response", {}) if isinstance(resp, dict) else {}
-                status = r.get("status") or registro.estado
-                description = r.get("description") or ""
-                amount = r.get("transaction_amount")
-                meta = r.get("metadata") or {}
-                slot_id = meta.get("slot_id")
+        if not topic or not id_ref:
+            return jsonify({"ok": True}), 200
 
-                # actualizar con datos reales
-                registro.estado = status
-                if amount is not None:
-                    registro.monto = float(amount)
-                if description:
-                    registro.producto = description
-                if slot_id is not None:
-                    registro.slot_id = int(slot_id)
-                registro.raw = raw
-                db.session.commit()
-            except Exception as e:
-                print("[webhook] error consultando pago en MP:", e, flush=True)
+        if topic in ("payment", "payments"):
+            if sdk is None:
+                return jsonify({"ok": True}), 200
 
-        # Devolver SIEMPRE 200 para que MP no reintente infinitamente
+            pago = sdk.payment().get(id_ref)
+            status_code = pago.get("status")
+            data = pago.get("response", {}) if isinstance(pago, dict) else {}
+            print("[webhook] pago.status", status_code, "pago.id", id_ref, flush=True)
+
+            if status_code == 200:
+                estado = data.get("status") or "pendiente"
+                metadata = data.get("metadata") or {}
+                producto_id = metadata.get("producto_id")
+                slot_id = metadata.get("slot_id")
+                monto = data.get("transaction_amount")
+                try:
+                    sql = """
+                        INSERT INTO pago (id_pago, estado, producto, slot_id, monto, raw, dispensado)
+                        VALUES (:id_pago, :estado, :producto, :slot_id, :monto, :raw, FALSE)
+                        ON CONFLICT (id_pago) DO UPDATE
+                        SET estado=EXCLUDED.estado,
+                            producto=EXCLUDED.producto,
+                            slot_id=EXCLUDED.slot_id,
+                            monto=EXCLUDED.monto,
+                            raw=EXCLUDED.raw;
+                    """
+                    params = {
+                        "id_pago": str(id_ref),
+                        "estado": estado,
+                        "producto": str(producto_id) if producto_id is not None else None,
+                        "slot_id": slot_id,
+                        "monto": float(monto) if monto is not None else None,
+                        "raw": json.dumps(data),
+                    }
+                    db.session.execute(text(sql), params)
+                    db.session.commit()
+                except Exception as e:
+                    db.session.rollback()
+                    print("[DB] error guardando pago:", e, flush=True)
+
         return jsonify({"ok": True}), 200
 
     except Exception as e:
-        # Logueamos pero igualmente respondemos 200 (MP reintenta si no)
-        print("[webhook] error inesperado:", e, flush=True)
+        print("[webhook] exception:", e, flush=True)
         return jsonify({"ok": True}), 200
 
+# ---------- Inicio ----------
+with app.app_context():
+    ensure_schema()
 
-# -----------------------------------------------------------------------------
-# Salud
-# -----------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return jsonify({"mensaje": "API de Dispen-Easy funcionando"})
-
-
-# -----------------------------------------------------------------------------
-# Run local
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
