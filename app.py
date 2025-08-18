@@ -247,6 +247,27 @@ def crear_o_actualizar_producto():
         print("[POST /api/productos] DB error:", e, flush=True)
         return jsonify({"error": "DB error"}), 500
 
+@app.route("/api/productos/<int:slot_id>", methods=["POST"])
+def crear_o_actualizar_producto_slot(slot_id):
+    data = request.json
+    producto = Producto.query.filter_by(slot_id=slot_id).first()
+    if producto:
+        producto.nombre = data.get("nombre", producto.nombre)
+        producto.precio = data.get("precio", producto.precio)
+        producto.cantidad = data.get("cantidad", producto.cantidad)
+        producto.habilitado = data.get("habilitado", producto.habilitado)
+    else:
+        producto = Producto(
+            slot_id=slot_id,
+            nombre=data.get("nombre"),
+            precio=data.get("precio"),
+            cantidad=data.get("cantidad", 0),
+            habilitado=data.get("habilitado", True)
+        )
+        db.session.add(producto)
+    db.session.commit()
+    return jsonify({"message": "Producto guardado", "producto": producto.to_dict()})
+
 @app.route("/api/productos/<int:slot_id>", methods=["DELETE"])
 def eliminar_por_slot(slot_id):
     p = Producto.query.filter_by(slot_id=slot_id).first()
