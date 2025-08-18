@@ -220,14 +220,16 @@ def delete_producto(slot_id: int):
     return jsonify({"ok": True})
 
 
-@app.post("/api/generar_qr/<int:slot_id>")
+@app.route("/api/generar_qr/<int:slot_id>", methods=["POST", "GET"])
 def generar_qr(slot_id: int):
     if sdk is None:
         return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
-
+    
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p or not p.habilitado or not p.nombre or p.precio <= 0:
-        return jsonify({"error": "Producto inválido o no habilitado"}), 400
+        return jsonify({"error": "Producto no válido"}), 400
+
+    # --- tu lógica MercadoPago actual ---
 
     pref_data = {
         "items": [{
