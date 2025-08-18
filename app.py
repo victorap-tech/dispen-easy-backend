@@ -168,25 +168,23 @@ def generar_qr(slot_id: int):
         return jsonify({"error": "Producto no habilitado o sin nombre/precio"}), 400
 
     # Armar preferencia Checkout Pro
-    pref_data = {
-        "items": [{
-            "title": p.nombre,
-            "quantity": 1,
-            "unit_price": float(p.precio),
-        }],
-        "metadata": {
-            "producto_id": p.id,
-            "slot_id": p.slot_id,
-        },
-        "external_reference": f"prod:{p.id}",
-        "back_urls": {
-            "success": base_url() + "/",
-            "pending": base_url() + "/",
-            "failure": base_url() + "/",
-        },
-        "notification_url": base_url() + "/webhook",
-        "auto_return": "approved",
-    }
+   pref_data = {
+    "items": [{
+        "title": p.nombre,
+        "quantity": 1,
+        "unit_price": float(p.precio)
+    }],
+    "metadata": {"producto_id": p.id, "slot_id": p.slot_id},
+    "external_reference": f"prod:{p.id}",
+    "back_urls": {
+        "success": request.host_url.rstrip("/") + "/pago_exitoso",
+        "pending": request.host_url.rstrip("/") + "/pago_pendiente",
+        "failure": request.host_url.rstrip("/") + "/pago_fallido",
+    },
+    "notification_url": request.host_url.rstrip("/") + "/webhook",
+    "auto_return": "approved",
+    "currency_id": "ARS"
+}
 
     pref = sdk.preference().create(pref_data)
     if pref.get("status") != 201:
