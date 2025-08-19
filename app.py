@@ -223,47 +223,33 @@ def delete_producto(slot_id: int):
 # Generar QR (Mercado Pago)
 # -----------------------------
 
-@app.post("/api/generar_qr/<int:slot_id>")
-def generar_qr(slot_id: int):
-    p = Producto.query.filter_by(slot_id=slot_id).first()
-    if not p or not p.habilitado or not p.nombre or p.precio <= 0:
-        return jsonify({"error": "producto inválido (habilitado/nombre/precio)"}), 400
+@app.route("/api/generar_qr/<int:producto_id>", methods=["GET", "POST"])
+def generar_qr(producto_id):
+    sdk = get_mp_sdk()
+    producto = Producto.query.get(producto_id)
+    if not producto:
+        return jsonify({"error": "Producto no encontrado"}), 404
 
-    try:
-        sdk = get_mp_sdk()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    base = base_url()
     preference_data = {
-        "items": [{
-            "title": p.nombre,
-            "quantity": 1,
-            "unit_price": float(p.precio),
-            "currency_id": "ARS",
-            "description": p.nombre,
-        }],
-        "external_reference": f"prod:{p.id}",
-        "metadata": {"producto_id": p.id, "slot_id": p.slot_id},
-        "notification_url": f"{base}/webhook",
+        "items": [
+            {
+                "title": producto.nombre,
+                "quantity": 1,
+                "unit_price": float(producto.precio)
+            }
+        ],
         "back_urls": {
-            "success": f"{base}/success",
-            "failure": f"{base}/failure",
-            "pending": f"{base}/pending",
+            "success": base_url() + "success",
+            "failure": base_url() + "failure",
+            "pending": base_url() + "pending"
         },
-        "auto_return": "approved",
+        "auto_return": "approved"
     }
 
-    print("[MP] Creando preferencia ->", preference_data, flush=True)
-    pref = sdk.preference().create(preference_data)
-
-    if pref.get("status") != 201:
-        detalle = pref.get("response")
-        print("[MP] error pref:", pref.get("status"), detalle, flush=True)
-        return jsonify({"error": "no se pudo crear preferencia", "detalle": detalle}), 400
-
-    init_point = pref["response"]["init_point"]
-    return jsonify({"init_point": init_point})
+    preference = sdk.preference().create(preference_data)
+    return jsonify({
+        "qr_link": preference["response"]["init_point"]
+    })
 
 
 # -----------------------------
