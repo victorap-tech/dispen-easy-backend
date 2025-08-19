@@ -146,15 +146,44 @@ def delete_producto(slot_id: int):
     return jsonify({"ok": True})
 
 # --- Generar QR / Preferencia MP ---
-@app.route("/api/generar_qr/<int:slot_id>", methods=["GET", "POST"])
-def generar_qr(slot_id: int):
-    token = get_mp_token()
-    if not token:
-        return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
+@app.route('/api/generar_qr/<int:producto_id>', methods=['POST'])
+def generar_qr(producto_id):
+    producto = Producto.query.get(producto_id)
 
-    p = Producto.query.filter_by(slot_id=slot_id).first()
-    if not p or not p.habilitado or not p.nombre or p.precio <= 0:
-        return jsonify({"error": "producto inválido (habilitado/nombre/precio)"}), 400
+    if not producto:
+        return jsonify({"error": "Producto no encontrado"}), 404
+
+    # Log para debugging
+    print(f"Generando QR para producto: id={producto.id}, nombre={producto.nombre}, precio={producto.precio}, habilitado={producto.habilitado}")
+
+    if not producto.habilitado or not producto.nombre or producto.precio <= 0:
+        return jsonify({"error": "Producto no válido para generar QR"}), 400
+
+    try:
+        preference_data = {
+            "items": [{
+                "title": producto.nombre,
+                "quantity": 1,
+                "currency_id": "ARS",
+                "unit_price": float(producto.precio)
+            }],
+            "back_urls": {
+                "success": "https://tu-dominio/success",
+                "failure": "https://tu-dominio/failure",
+                "pending": "https://tu-dominio/pending"
+            },
+            "auto_return": "approved",
+            "notification_url": "https://web-production-e7d2.up.railway.app/webhook"
+        }
+
+        sdk = mercadopago.SDK(os.environ["MP_ACCESS_TOKEN"])
+        preference = sdk.preference().create(preference_data)
+
+        return jsonify({"init_point": preference["response"]["init_point"]})
+
+    except Exception as e:
+        print(f"Error al generar QR: {e}")
+        return jsonify({"error": str(e)}), 500
 
     # Datos de preferencia
     back = base_url()
