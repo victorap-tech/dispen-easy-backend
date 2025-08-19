@@ -1,51 +1,51 @@
+# app.py
 import os
 import json
 from datetime import datetime
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text, UniqueConstraint
 
-# SDK oficial de Mercado Pago
 import mercadopago
 
+# -------------------------------------------------
+# App / DB
+# -------------------------------------------------
+app = Flask(__name__, static_url_path="", static_folder="static")
 
-# -----------------------------
-# Config Flask
-# -----------------------------
+CORS(app, resources={r"/api/*": {"origins": "*"}, r"/webhook": {"origins": "*"}})
 
-app = Flask(__name__)
-CORS(app)
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL no configurada")
 
-# DATABASE_URL de Railway (puede venir con "postgres://", lo normalizamos a "postgresql://")
-db_url = os.getenv("DATABASE_URL", "")
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+# compatibilidad con postgres://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-
-# -----------------------------
+# -------------------------------------------------
 # Modelos
-# -----------------------------
-
+# -------------------------------------------------
 class Producto(db.Model):
     __tablename__ = "producto"
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    slot_id = db.Column(db.Integer, nullable=False, index=True, default=0)
+
+    id = db.Column(db.Integer, primary_key=True, index=True)
+    slot_id = db.Column(db.Integer, nullable=False, index=True)
     nombre = db.Column(db.String(120), nullable=False, default="")
-    precio = db.Column(db.Float, nullable=False, default=0.0)  # si querés centavos cambiá a Numeric
-    cantidad = db.Column(db.Integer, nullable=False, default=1)  # litros/ml
+    precio = db.Column(db.Float, nullable=False, default=0.0)  # ARS, sin centavos si querés
+    cantidad = db.Column(db.Integer, nullable=False, default=1)  # litros/ml u otra unidad
     habilitado = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        # cada slot tiene 0..1 producto
-        db.Index("idx_producto_slot", "slot_id", unique=True),
+        UniqueConstraint("slot_id", name="uniq_producto_slot"),
     )
 
     def to_dict(self):
@@ -53,7 +53,7 @@ class Producto(db.Model):
             "id": self.id,
             "slot_id": self.slot_id,
             "nombre": self.nombre,
-            "precio": self.precio,
+            "precio": float(self.precio),
             "cantidad": self.cantidad,
             "habilitado": self.habilitado,
         }
@@ -61,140 +61,105 @@ class Producto(db.Model):
 
 class Pago(db.Model):
     __tablename__ = "pago"
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    id_pago = db.Column(db.String(64), nullable=False)        # id de MP o merchant_order / payment
+
+    id = db.Column(db.Integer, primary_key=True)
+    id_pago = db.Column(db.String(64), nullable=False, unique=True, index=True)
     estado = db.Column(db.String(32), nullable=False, default="pendiente")
-    producto = db.Column(db.String(180), nullable=False, default="")
-    slot_id = db.Column(db.Integer, nullable=False, default=0)
-    monto = db.Column(db.Float, nullable=False, default=0.0)
+    producto = db.Column(db.String(120), nullable=True)
+    slot_id = db.Column(db.Integer, nullable=True)
+    monto = db.Column(db.Float, nullable=True)
     raw = db.Column(db.Text, nullable=True)
     dispensado = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("id_pago", name="pago_id_pago_key"),
-    )
 
-
-# -----------------------------
-# Esquema / migración simple
-# -----------------------------
-
+# -------------------------------------------------
+# Esquema (Railway/Postgres: idempotente)
+# -------------------------------------------------
 def ensure_schema():
-    """
-    Crea tablas y agrega columnas/índices si faltan (idempotente),
-    útil para Postgres en Railway cuando ya hay una base creada.
-    """
-    from sqlalchemy import inspect
-
-    # Crear tablas si no existen
+    """Crea tablas y agrega columnas/índices si faltan (idempotente)."""
     db.create_all()
 
-    dialect = db.engine.url.get_backend_name()
-    if not dialect.startswith("postgres"):
-        return
+    # Solo para Postgres
+    try:
+        dialect = db.engine.url.get_backend_name()
+    except Exception:
+        dialect = ""
 
-    stmts = [
-        # Producto
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS nombre VARCHAR(120) NOT NULL DEFAULT '';",
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS precio DOUBLE PRECISION NOT NULL DEFAULT 0;",
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS cantidad INTEGER NOT NULL DEFAULT 1;",
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS habilitado BOOLEAN NOT NULL DEFAULT FALSE;",
-        "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();",
-        """DO $$
-        BEGIN
-           IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_producto_slot') THEN
-               CREATE UNIQUE INDEX idx_producto_slot ON producto(slot_id);
-           END IF;
-        END $$;""",
-        # Pago
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(64) NOT NULL;",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(32) NOT NULL DEFAULT 'pendiente';",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(180) NOT NULL DEFAULT '';",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION NOT NULL DEFAULT 0;",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS raw TEXT;",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS dispensado BOOLEAN NOT NULL DEFAULT FALSE;",
-        "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();",
-        """DO $$
-        BEGIN
-           IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='pago_id_pago_key') THEN
-               ALTER TABLE pago ADD CONSTRAINT pago_id_pago_key UNIQUE (id_pago);
-           END IF;
-        END $$;""",
-    ]
-
-    with db.engine.begin() as conn:
-        for s in stmts:
-            conn.execute(text(s))
+    if dialect.startswith("postgres"):
+        stmts = [
+            # Producto
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS nombre VARCHAR(120) NOT NULL DEFAULT '';",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS precio DOUBLE PRECISION NOT NULL DEFAULT 0;",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS cantidad INTEGER NOT NULL DEFAULT 1;",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS habilitado BOOLEAN NOT NULL DEFAULT FALSE;",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();",
+            """DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uniq_producto_slot') THEN
+                CREATE UNIQUE INDEX uniq_producto_slot ON producto(slot_id);
+              END IF;
+            END; $$;""",
+            # Pago
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(64) NOT NULL;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(32) NOT NULL DEFAULT 'pendiente';",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(120);",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS raw TEXT;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS dispensado BOOLEAN NOT NULL DEFAULT FALSE;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();",
+            """DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'pago_id_pago_key') THEN
+                CREATE UNIQUE INDEX pago_id_pago_key ON pago(id_pago);
+              END IF;
+            END; $$;""",
+        ]
+        with db.engine.begin() as conn:
+            for s in stmts:
+                conn.execute(text(s))
 
 
 with app.app_context():
     ensure_schema()
 
-
-# -----------------------------
+# -------------------------------------------------
 # Utilidades
-# -----------------------------
-
-def base_url():
-    # Ej: "https://web-production-xxxx.up.railway.app"
-    url = request.host_url  # trae barra final y podría venir en http
-    if url.startswith("http://"):
-        url = url.replace("http://", "https://", 1)
-    return url.rstrip("/")
-
+# -------------------------------------------------
+def base_url() -> str:
+    # Siempre absoluta (requerido por MP)
+    # Ej: https://web-production-xxxx.up.railway.app/
+    return request.host_url
 
 def get_mp_sdk():
     access = os.environ.get("MP_ACCESS_TOKEN")
     if not access:
-        raise RuntimeError("MP_ACCESS_TOKEN no configurado")
-    return mercadopago.SDK(access)
+        return None
+    try:
+        return mercadopago.SDK(access)
+    except Exception:
+        return None
 
 
-# -----------------------------
-# Páginas de retorno de MP
-# -----------------------------
+# -------------------------------------------------
+# Rutas API
+# -------------------------------------------------
 
-@app.get("/success")
-def mp_success():
-    return "Pago aprobado", 200
-
-@app.get("/failure")
-def mp_failure():
-    return "Pago rechazado", 200
-
-@app.get("/pending")
-def mp_pending():
-    return "Pago pendiente", 200
-
-
-# -----------------------------
-# Rutas básicas
-# -----------------------------
-
-@app.get("/")
-def root():
-    return "OK", 200
-
-
-# -----------------------------
-# CRUD Productos (simple)
-# -----------------------------
-
-@app.get("/api/productos")
+@app.route("/api/productos", methods=["GET"])
 def listar_productos():
-    items = Producto.query.order_by(Producto.slot_id.asc()).all()
-    return jsonify([p.to_dict() for p in items])
+    ps = Producto.query.order_by(Producto.slot_id.asc()).all()
+    return jsonify([p.to_dict() for p in ps])
 
-@app.post("/api/productos/<int:slot_id>")
+
+@app.route("/api/productos/<int:slot_id>", methods=["POST"])
 def upsert_producto(slot_id: int):
-    body = request.get_json(silent=True) or {}
-    nombre = (body.get("nombre") or "").strip()
-    precio = float(body.get("precio") or 0)
-    cantidad = int(body.get("cantidad") or 1)
-    habilitado = bool(body.get("habilitado"))
+    data = request.get_json(silent=True) or {}
+    nombre = (data.get("nombre") or "").strip()
+    precio = float(data.get("precio") or 0)
+    cantidad = int(data.get("cantidad") or 1)
+    habilitado = bool(data.get("habilitado") or False)
 
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
@@ -209,89 +174,130 @@ def upsert_producto(slot_id: int):
     db.session.commit()
     return jsonify(p.to_dict())
 
-@app.delete("/api/productos/<int:slot_id>")
+
+@app.route("/api/productos/<int:slot_id>", methods=["DELETE"])
 def delete_producto(slot_id: int):
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
-        return jsonify({"ok": True})  # idempotente
+        # Idempotente
+        return jsonify({"ok": True})
     db.session.delete(p)
     db.session.commit()
     return jsonify({"ok": True})
 
 
-# -----------------------------
-# Generar QR (Mercado Pago)
-# -----------------------------
-
-@app.route("/api/generar_qr/<int:producto_id>", methods=["GET", "POST"])
-def generar_qr(producto_id):
+@app.route("/api/generar_qr/<int:slot_id>", methods=["GET"])
+def generar_qr(slot_id: int):
     sdk = get_mp_sdk()
-    producto = Producto.query.get(producto_id)
-    if not producto:
-        return jsonify({"error": "Producto no encontrado"}), 404
+    if sdk is None:
+        return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
+
+    p = Producto.query.filter_by(slot_id=slot_id).first()
+    if (not p) or (not p.habilitado) or (not p.nombre) or (p.precio is None) or (p.precio <= 0):
+        return jsonify({"error": "no se pudo crear preferencia (¿producto habilitado y con nombre/precio?)"}), 400
+
+    # Back URLs ABSOLUTAS (requerido por MP)
+    base = base_url().rstrip("/")
+    back_urls = {
+        "success": f"{base}/",
+        "pending": f"{base}/",
+        "failure": f"{base}/",
+    }
 
     preference_data = {
         "items": [
             {
-                "title": producto.nombre,
+                "title": p.nombre,
                 "quantity": 1,
-                "unit_price": float(producto.precio)
+                "currency_id": "ARS",
+                "unit_price": float(p.precio),
+                "description": p.nombre,
             }
         ],
-        "back_urls": {
-            "success": base_url() + "success",
-            "failure": base_url() + "failure",
-            "pending": base_url() + "pending"
+        "metadata": {
+            "producto_id": p.id,
+            "slot_id": p.slot_id,
         },
-        "auto_return": "approved"
+        "external_reference": f"prod:{p.id}",
+        "notification_url": f"{base}/webhook",
+        "back_urls": back_urls,
+        "auto_return": "approved",
     }
 
-    preference = sdk.preference().create(preference_data)
-    return jsonify({
-        "qr_link": preference["response"]["init_point"]
-    })
+    app.logger.info(f"[MP] Creando preferencia -> {json.dumps(preference_data)}")
+
+    pref = sdk.preference().create(preference_data)
+    status = pref.get("status")
+    resp = pref.get("response")
+
+    if status != 201:
+        app.logger.error(f"[MP] error pref -> status={status}, detalle={resp}")
+        return jsonify({"error": "no se pudo crear preferencia", "detalle": resp}), 400
+
+    # Devolvemos el link para QR/redirect
+    init_point = resp.get("init_point") or resp.get("sandbox_init_point")
+    return jsonify({"qr_link": init_point})
 
 
-# -----------------------------
-# Webhook Mercado Pago
-# -----------------------------
-
-@app.post("/webhook")
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    # Mercado Pago envía JSON con campos como: id, type, data:{id}
-    data = request.get_json(silent=True) or {}
-    print("[webhook] raw:", json.dumps(data, ensure_ascii=False), flush=True)
-
-    # Guardamos un registro básico (idempotente por id_pago UNIQUE)
+    """Recibe notificaciones de Mercado Pago y guarda en DB (tabla pago)."""
     try:
-        pago_id = str(data.get("id") or data.get("data", {}).get("id") or "")
-        if not pago_id:
-            pago_id = f"TEST_{datetime.utcnow().timestamp()}"
+        payload = request.get_json(silent=True) or {}
+        topic = payload.get("type") or payload.get("topic") or ""
+        data = payload.get("data") or {}
+        id_pago = str(data.get("id") or payload.get("id") or "TEST_PAYMENT_123")
 
-        # Para este ejemplo dejamos estado como 'pendiente' (luego podrías consultar a la API de MP)
-        registro = Pago(
-            id_pago=pago_id,
-            estado="pendiente",
-            producto="",
-            slot_id=0,
-            monto=0,
-            raw=json.dumps(data, ensure_ascii=False),
+        # Estado básico según topic/evento
+        estado = "pendiente"
+        if topic in ("payment", "payment.updated", "merchant_order"):
+            # Podrías consultar el detalle vía SDK si querés enriquecer.
+            estado = "approved" if "approved" in json.dumps(payload).lower() else "pendiente"
+
+        meta = {}
+        try:
+            meta = payload.get("metadata") or {}
+        except Exception:
+            pass
+
+        # Intento de producto/slot desde metadatos
+        producto = meta.get("producto") or ""
+        slot_id = meta.get("slot_id")
+
+        row = Pago(
+            id_pago=id_pago,
+            estado=estado,
+            producto=producto,
+            slot_id=slot_id,
+            monto=None,
+            raw=json.dumps(payload, ensure_ascii=False),
             dispensado=False,
         )
-        db.session.add(registro)
+        db.session.add(row)
         db.session.commit()
+
+        app.logger.info(f"[WEBHOOK] guardado {id_pago} estado={estado}")
+        return jsonify({"ok": True})
     except Exception as e:
-        db.session.rollback()
-        # Si es violación de UNIQUE, lo ignoramos para no fallar
-        print("[DB] error guardando pago:", repr(e), flush=True)
-
-    return jsonify({"ok": True})
+        # Evitar crash: log y 200 para que MP no reintente infinito
+        app.logger.exception(f"[WEBHOOK] error: {e}")
+        return jsonify({"ok": True})
 
 
-# -----------------------------
-# Main (Gunicorn usará 'app')
-# -----------------------------
+# -------------------------------------------------
+# Front static (opcional)
+# -------------------------------------------------
+@app.route("/", methods=["GET"])
+def index():
+    # Si tenés un build del front en /static, sirve index.html
+    index_path = os.path.join(app.static_folder, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(app.static_folder, "index.html")
+    return "OK", 200
 
+
+# -------------------------------------------------
+# Main (local)
+# -------------------------------------------------
 if __name__ == "__main__":
-    # Útil para correr local: FLASK_ENV=development python app.py
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
