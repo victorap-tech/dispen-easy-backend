@@ -1,80 +1,79 @@
 import os
 import json
-from datetime import datetime
+import datetime as dt
 
-from flask import Flask, request, jsonify, send_from_directory
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from sqlalchemy import text, String, Integer, Boolean, DateTime, Float
-from sqlalchemy.exc import SQLAlchemyError
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.sql import text
 
-# SDK Mercado Pago (pip install mercadopago)
-import mercadopago
+import requests
 
-# -------------------------------------------------
-# Config Flask / DB
-# -------------------------------------------------
+# ------------------------------------------------------------------------------
+# Config Flask
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL no está configurada")
-
-# Compatibilidad con postgres:// -> postgresql+psycopg2://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+# DB (Railway ya provee DATABASE_URL)
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///local.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# -------------------------------------------------
+# ------------------------------------------------------------------------------
 # Modelos
-# -------------------------------------------------
+# ------------------------------------------------------------------------------
 class Producto(db.Model):
     __tablename__ = "producto"
-    id = db.Column(Integer, primary_key=True, index=True)
-    slot_id = db.Column(Integer, nullable=False, default=0)
-    nombre = db.Column(String(120), nullable=False, default="")
-    precio = db.Column(Float, nullable=False, default=0.0)  # enteros o con decimales
-    cantidad = db.Column(Integer, nullable=False, default=1)
-    habilitado = db.Column(Boolean, nullable=False, default=False)
-    created_at = db.Column(DateTime, nullable=False, default=datetime.utcnow)
+    id = db.Column(db.Integer, primary_key=True)
+    slot_id = db.Column(db.Integer, nullable=False, default=0, index=True)
+    nombre = db.Column(db.String(120), nullable=False, default="")
+    precio = db.Column(db.Float, nullable=False, default=0.0)
+    cantidad = db.Column(db.Integer, nullable=False, default=1)
+    habilitado = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=dt.datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("slot_id", name="uq_producto_slot"),
+    )
 
     def to_dict(self):
         return {
             "id": self.id,
             "slot_id": self.slot_id,
             "nombre": self.nombre,
-            "precio": float(self.precio or 0),
+            "precio": self.precio,
             "cantidad": self.cantidad,
-            "habilitado": bool(self.habilitado),
+            "habilitado": self.habilitado,
         }
 
 
 class Pago(db.Model):
     __tablename__ = "pago"
-    id = db.Column(Integer, primary_key=True)
-    id_pago = db.Column(String(64), unique=True, index=True)       # MP payment id / external id
-    estado = db.Column(String(32), default="pendiente")
-    producto = db.Column(String(120))
-    slot_id = db.Column(Integer, default=0)
-    monto = db.Column(Float, default=0.0)
-    raw = db.Column(String)     # JSON en texto
-    dispensado = db.Column(Boolean, default=False)
-    created_at = db.Column(DateTime, default=datetime.utcnow, nullable=False)
+    id = db.Column(db.Integer, primary_key=True)
+    id_pago = db.Column(db.String(50), unique=True)     # id de MP (string)
+    estado = db.Column(db.String(40))                   # pending, approved, etc
+    producto = db.Column(db.String(200))                # título
+    slot_id = db.Column(db.Integer)
+    monto = db.Column(db.Float)
+    raw = db.Column(db.Text)                            # json crudo
+    created_at = db.Column(db.DateTime, nullable=False, default=dt.datetime.utcnow)
 
-# -------------------------------------------------
-# Crear/ajustar esquema (idempotente para Railway)
-# -------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Esquema (idempotente)
+# ------------------------------------------------------------------------------
 def ensure_schema():
-    """Crea tablas y agrega columnas/índices si faltan (seguro de ejecutar varias veces)."""
-    dialect = db.engine.url.get_backend_name()
+    """
+    - Crea tablas si no existen
+    - En Postgres agrega columnas/índices si faltan (idempotente)
+    """
     db.create_all()
 
-    if str(dialect).startswith("postgres"):
+    # Sólo para Postgres: ALTERs idempotentes
+    dialect = db.engine.url.get_backend_name()
+    if dialect.startswith("postgres"):
         stmts = [
             # producto
             "ALTER TABLE producto ADD COLUMN IF NOT EXISTS slot_id INTEGER NOT NULL DEFAULT 0;",
@@ -82,80 +81,139 @@ def ensure_schema():
             "ALTER TABLE producto ADD COLUMN IF NOT EXISTS precio DOUBLE PRECISION NOT NULL DEFAULT 0;",
             "ALTER TABLE producto ADD COLUMN IF NOT EXISTS cantidad INTEGER NOT NULL DEFAULT 1;",
             "ALTER TABLE producto ADD COLUMN IF NOT EXISTS habilitado BOOLEAN NOT NULL DEFAULT FALSE;",
-            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_producto_slot') THEN "
-            "CREATE UNIQUE INDEX idx_producto_slot ON producto(slot_id); END IF; END $$;",
+            "ALTER TABLE producto ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='uq_producto_slot') THEN "
+            "CREATE UNIQUE INDEX uq_producto_slot ON producto(slot_id); END IF; END $$;",
             # pago
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(64);",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(32) DEFAULT 'pendiente';",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(120);",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER DEFAULT 0;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION DEFAULT 0;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS id_pago VARCHAR(50);",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS estado VARCHAR(40);",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS producto VARCHAR(200);",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS slot_id INTEGER;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS monto DOUBLE PRECISION;",
             "ALTER TABLE pago ADD COLUMN IF NOT EXISTS raw TEXT;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS dispensado BOOLEAN DEFAULT FALSE;",
-            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now();",
-            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pago_id_pago_key') THEN "
-            "ALTER TABLE pago ADD CONSTRAINT pago_id_pago_key UNIQUE (id_pago); END IF; END $$;",
+            "ALTER TABLE pago ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='pago_id_pago_key') THEN "
+            "CREATE UNIQUE INDEX pago_id_pago_key ON pago(id_pago); END IF; END $$;",
         ]
         with db.engine.begin() as conn:
             for s in stmts:
                 conn.execute(text(s))
 
+# Ejecuta al levantar
 with app.app_context():
     ensure_schema()
+    print("[DB] esquema OK")
 
-# -------------------------------------------------
-# Utils
-# -------------------------------------------------
-def get_mp_sdk():
+# ------------------------------------------------------------------------------
+# Utilidades MP
+# ------------------------------------------------------------------------------
+def base_url() -> str:
+    # request.host_url trae https://.../ con barra final
+    return request.host_url
+
+def get_mp_token() -> str:
     access = os.environ.get("MP_ACCESS_TOKEN")
     if not access:
-        return None
-    return mercadopago.SDK(access)
+        raise RuntimeError("MP_ACCESS_TOKEN no configurado")
+    return access
 
-def base_url() -> str:
+def crear_preferencia_mp(prod: Producto) -> tuple[int, dict, str]:
     """
-    URL pública del backend, sin barra final.
-    Prioriza PUBLIC_BASE_URL; si no, usa request.host_url.
+    Crea preferencia en Checkout Pro.
+    Devuelve: (status_code, json_dict, raw_text)
     """
-    fixed = os.environ.get("PUBLIC_BASE_URL")
-    if fixed and fixed.strip():
-        return fixed.rstrip("/")
-    # request.host_url sólo existe dentro del request
+    url = "https://api.mercadopago.com/checkout/preferences"
+    headers = {
+        "Authorization": f"Bearer {get_mp_token()}",
+        "Content-Type": "application/json",
+    }
+
+    back = base_url()  # p.ej. https://web-xxx.up.railway.app/
+
+    payload = {
+        "items": [{
+            "title": prod.nombre,
+            "quantity": int(prod.cantidad or 1),
+            "unit_price": float(prod.precio),
+            "currency_id": "ARS",
+            "description": "Producto de DISPENEASY",
+        }],
+        "back_urls": {
+            "success": back,   # podés customizar (/success) si querés
+            "pending": back,
+            "failure": back
+        },
+        "auto_return": "approved",
+        "notification_url": back.rstrip("/") + "/webhook",
+        "external_reference": f"prod:{prod.id}|slot:{prod.slot_id}",
+        "metadata": {"producto_id": prod.id, "slot_id": prod.slot_id}
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+
     try:
-        return request.host_url.rstrip("/")
-    except RuntimeError:
-        # fuera de request; último recurso: Railway env var RAILWAY_PUBLIC_DOMAIN si existiera
-        dom = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-        return f"https://{dom}".rstrip("/") if dom else ""
+        data = resp.json()
+    except Exception:
+        data = {}
 
-# -------------------------------------------------
-# Productos API
-# -------------------------------------------------
+    # Logs para diagnóstico
+    print("[MP] Creando preferencia ->", json.dumps(payload, ensure_ascii=False))
+    print(f"[MP] status={resp.status_code} body={resp.text}")
+
+    return resp.status_code, data, resp.text
+
+def obtener_pago_mp(payment_id: str) -> dict:
+    """
+    Consulta /v1/payments/<id> y devuelve JSON (o {} si falla).
+    """
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {get_mp_token()}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        print(f"[MP] GET payment {payment_id} -> {r.status_code}")
+        return r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception as e:
+        print("[MP] error consultando pago:", e)
+        return {}
+
+# ------------------------------------------------------------------------------
+# Rutas base
+# ------------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return "DISPENEASY backend OK"
+
+# ------------------------------------------------------------------------------
+# Productos
+# ------------------------------------------------------------------------------
 @app.get("/api/productos")
-def list_productos():
+def listar_productos():
     prods = Producto.query.order_by(Producto.slot_id.asc()).all()
     return jsonify([p.to_dict() for p in prods])
 
 @app.post("/api/productos/<int:slot_id>")
 def upsert_producto(slot_id: int):
-    data = request.get_json(force=True) or {}
+    data = request.get_json(silent=True) or {}
+    nombre = (data.get("nombre") or "").strip()
+    precio = float(data.get("precio") or 0)
+    cantidad = int(data.get("cantidad") or 1)
+    habilitado = bool(data.get("habilitado") or False)
 
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
         p = Producto(slot_id=slot_id)
         db.session.add(p)
 
-    p.nombre = (data.get("nombre") or "").strip()
-    p.precio = float(data.get("precio") or 0)
-    p.cantidad = int(data.get("cantidad") or 1)
-    p.habilitado = bool(data.get("habilitado"))
-    db.session.commit()
+    p.nombre = nombre
+    p.precio = precio
+    p.cantidad = cantidad
+    p.habilitado = habilitado
 
+    db.session.commit()
     return jsonify(p.to_dict())
 
 @app.delete("/api/productos/<int:slot_id>")
-def delete_producto(slot_id: int):
+def borrar_producto(slot_id: int):
     p = Producto.query.filter_by(slot_id=slot_id).first()
     if not p:
         return jsonify({"ok": True})
@@ -163,126 +221,134 @@ def delete_producto(slot_id: int):
     db.session.commit()
     return jsonify({"ok": True})
 
-# -------------------------------------------------
-# Rutas de retorno para Mercado Pago
-# -------------------------------------------------
-@app.get("/success")
-def pago_success():
-    return "Pago aprobado ✅"
+# ------------------------------------------------------------------------------
+# Generar QR / Preferencia (por slot_id)
+# ------------------------------------------------------------------------------
+@app.get("/api/generar_qr/<int:slot_id>")
+def generar_qr(slot_id: int):
+    p = Producto.query.filter_by(slot_id=slot_id).first()
 
-@app.get("/pending")
-def pago_pending():
-    return "Pago pendiente ⏳"
-
-@app.get("/failure")
-def pago_failure():
-    return "Pago fallido ❌"
-
-# -------------------------------------------------
-# Generar QR / Preferencia (por ID de producto)
-# -------------------------------------------------
-# --- Generar QR por slot_id (con fallback por id) ---
-@app.get("/api/generar_qr/<int:slot_or_id>")
-def generar_qr(slot_or_id: int):
-    sdk = get_mp_sdk()
-    if sdk is None:
-        return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
-
-    # 1) Buscar por slot_id; si no hay, buscar por id
-    p = Producto.query.filter_by(slot_id=slot_or_id).first()
-    if not p:
-        p = Producto.query.filter_by(id=slot_or_id).first()
-
-    # 2) Validaciones mínimas
-    if not p or not p.habilitado or not p.nombre or (p.precio is None) or (float(p.precio) <= 0):
+    if not p or not p.habilitado or not p.nombre or not p.precio or p.precio <= 0:
         return jsonify({"error": "no se pudo crear preferencia (¿producto habilitado y con nombre/precio?)"}), 400
 
-    # 3) Armar preferencia MP (completa: currency_id, back_urls, auto_return, notification_url)
-    base = base_url().rstrip("/")
-    preference_data = {
-        "items": [{
-            "title": p.nombre,
-            "quantity": 1,
-            "unit_price": float(p.precio),
-            "currency_id": "ARS",
-            "description": f"slot {p.slot_id}"
-        }],
-        "external_reference": f"prod:{p.id}",
-        "back_urls": {
-            "success": f"{base}/",
-            "failure": f"{base}/",
-            "pending": f"{base}/"
-        },
-        "auto_return": "approved",
-        "notification_url": f"{base}/webhook",
-        "metadata": {
-            "producto_id": p.id,
-            "slot_id": p.slot_id
-        }
-    }
-
     try:
-        pref = sdk.preference().create(preference_data)
-        resp = pref.get("response", {})
-        link = resp.get("init_point") or resp.get("sandbox_init_point")
-        pref_id = resp.get("id")
-
-        if not link:
-            return jsonify({"error": "MP no devolvió init_point"}), 500
-
-        return jsonify({"ok": True, "pref_id": pref_id, "qr_link": link})
+        status, data, raw = crear_preferencia_mp(p)
     except Exception as e:
-        return jsonify({"error": f"error creando preferencia: {e}"}), 500
+        print("[MP] excepción creando preferencia:", e)
+        return jsonify({"error": "Error creando preferencia"}), 500
 
-# -------------------------------------------------
-# Webhook (POST)
-# -------------------------------------------------
+    if status != 201:
+        # MP debe devolver 201
+        return jsonify({
+            "error": data.get("message") or "MP no devolvió 201",
+            "detalle": data.get("cause"),
+            "raw": raw
+        }), 502
+
+    link = data.get("init_point") or data.get("sandbox_init_point")
+    if not link:
+        return jsonify({"error": "MP no devolvió init_point", "mp": data}), 502
+
+    return jsonify({"qr_link": link})
+
+# ------------------------------------------------------------------------------
+# Webhook Mercado Pago
+# ------------------------------------------------------------------------------
 @app.post("/webhook")
 def webhook():
+    """
+    MP envía:
+      - body JSON (o form) con {resource/type/data.id,...}
+      - headers con firma, etc. (no la validamos en este MVP)
+    Guardamos un registro idempotente por id_pago.
+    """
     try:
-        payload = request.get_json(silent=True) or {}
-        print("[WEBHOOK] payload:", payload)
+        # Preferir JSON; si viene como form, tomar 'data.id'
+        body = request.get_json(silent=True)
+        if not body and request.form:
+            # simulador MP suele mandar 'id', 'type', 'data[id]'
+            body = {"id": request.form.get("id"),
+                    "type": request.form.get("type"),
+                    "data": {"id": request.form.get("data.id")}}
+    except Exception:
+        body = None
 
-        topic = (payload.get("type") or payload.get("topic") or "").lower()
-        data = payload.get("data") or {}
-        payment_id = str(data.get("id") or data.get("payment_id") or "").strip()
+    print("[WEBHOOK] headers:", dict(request.headers))
+    print("[WEBHOOK] body:", body)
 
-        # Guardar evento "crudo"
-        rec = Pago.query.filter_by(id_pago=payment_id).first()
-        if not rec:
-            rec = Pago(id_pago=payment_id)
-            db.session.add(rec)
+    # Intentamos extraer payment_id
+    payment_id = None
+    if isinstance(body, dict):
+        # distintos formatos posibles
+        if "data" in body and isinstance(body["data"], dict) and body["data"].get("id"):
+            payment_id = str(body["data"]["id"])
+        elif "id" in body and body.get("type") == "payment":
+            payment_id = str(body["id"])
 
-        rec.raw = json.dumps(payload, ensure_ascii=False)
-        # No sabemos el estado todavía; si viniera en el payload:
-        estado = payload.get("action") or payload.get("status")
-        if estado:
-            rec.estado = str(estado)
-
+    # Si no tenemos id, igualmente guardamos algo para depurar
+    if not payment_id:
+        rec = Pago(
+            id_pago=None,
+            estado="pendiente",
+            producto="(via webhook)",
+            slot_id=None,
+            monto=None,
+            raw=json.dumps({"headers": dict(request.headers), "body": body}, ensure_ascii=False)
+        )
+        db.session.add(rec)
         db.session.commit()
         return jsonify({"ok": True})
-    except Exception as e:
-        print("[WEBHOOK] error:", e)
-        return jsonify({"ok": False}), 500
 
-# -------------------------------------------------
-# Root / Health
-# -------------------------------------------------
-@app.get("/")
-def root():
-    return "OK"
+    # Consultamos el pago en MP
+    pago_mp = obtener_pago_mp(payment_id) or {}
+    status = (pago_mp.get("status") or "pendiente")
+    title = None
+    amount = None
+    slot = None
 
-@app.get("/healthz")
-def healthz():
+    # Preferencia asociada (puede venir en 'additional_info' o 'description')
     try:
-        db.session.execute(text("SELECT 1"))
-        return jsonify({"ok": True})
-    except SQLAlchemyError as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        if pago_mp.get("additional_info") and pago_mp["additional_info"].get("items"):
+            title = pago_mp["additional_info"]["items"][0].get("title")
+    except Exception:
+        pass
 
-# -------------------------------------------------
-# Run local (opcional)
-# -------------------------------------------------
+    amount = pago_mp.get("transaction_amount") or pago_mp.get("money_release_amount")
+
+    # Intentamos leer metadata de la preferencia (cuando MP la devuelve)
+    try:
+        if pago_mp.get("metadata"):
+            meta = pago_mp["metadata"]
+            slot = meta.get("slot_id")
+            if not title and meta.get("producto_id"):
+                prod = Producto.query.get(int(meta["producto_id"]))
+                if prod:
+                    title = prod.nombre
+    except Exception:
+        pass
+
+    # Insert idempotente
+    try:
+        rec = Pago(
+            id_pago=str(payment_id),
+            estado=str(status),
+            producto=str(title) if title else "Producto de DISPENEASY",
+            slot_id=int(slot) if slot is not None else None,
+            monto=float(amount) if amount is not None else None,
+            raw=json.dumps(pago_mp, ensure_ascii=False)
+        )
+        db.session.add(rec)
+        db.session.commit()
+    except Exception as e:
+        # Si ya existe, ignoramos (idempotente)
+        db.session.rollback()
+        print("[DB] error guardando pago:", e)
+
+    return jsonify({"ok": True})
+
+# ------------------------------------------------------------------------------
+# Main (local)
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
