@@ -181,51 +181,58 @@ def pago_failure():
 # -------------------------------------------------
 # Generar QR / Preferencia (por ID de producto)
 # -------------------------------------------------
-@app.get("/api/generar_qr/<int:producto_id>")
-def generar_qr(producto_id: int):
+# --- Generar QR por slot_id (con fallback por id) ---
+@app.get("/api/generar_qr/<int:slot_or_id>")
+def generar_qr(slot_or_id: int):
     sdk = get_mp_sdk()
     if sdk is None:
         return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
 
-    p = Producto.query.filter_by(id=producto_id).first()
-    if not p or not p.habilitado or not p.nombre or (p.precio is None) or p.precio <= 0:
+    # 1) Buscar por slot_id; si no hay, buscar por id
+    p = Producto.query.filter_by(slot_id=slot_or_id).first()
+    if not p:
+        p = Producto.query.filter_by(id=slot_or_id).first()
+
+    # 2) Validaciones mínimas
+    if not p or not p.habilitado or not p.nombre or (p.precio is None) or (float(p.precio) <= 0):
         return jsonify({"error": "no se pudo crear preferencia (¿producto habilitado y con nombre/precio?)"}), 400
 
-    base = base_url()
-    if not base:
-        return jsonify({"error": "No se pudo determinar base_url"}), 500
-
-    back_urls = {
-        "success": f"{base}/success",
-        "pending": f"{base}/pending",
-        "failure": f"{base}/failure",
-    }
-    notification_url = f"{base}/webhook"
-
-    pref_payload = {
+    # 3) Armar preferencia MP (completa: currency_id, back_urls, auto_return, notification_url)
+    base = base_url().rstrip("/")
+    preference_data = {
         "items": [{
             "title": p.nombre,
             "quantity": 1,
             "unit_price": float(p.precio),
             "currency_id": "ARS",
+            "description": f"slot {p.slot_id}"
         }],
         "external_reference": f"prod:{p.id}",
-        "back_urls": back_urls,
+        "back_urls": {
+            "success": f"{base}/",
+            "failure": f"{base}/",
+            "pending": f"{base}/"
+        },
         "auto_return": "approved",
-        "notification_url": notification_url,
-        "metadata": {"producto_id": p.id, "slot_id": p.slot_id},
+        "notification_url": f"{base}/webhook",
+        "metadata": {
+            "producto_id": p.id,
+            "slot_id": p.slot_id
+        }
     }
 
     try:
-        preference = sdk.preference().create(pref_payload)
-        pref = preference.get("response", preference)
-        init_point = pref.get("init_point") or pref.get("sandbox_init_point")
-        if not init_point:
+        pref = sdk.preference().create(preference_data)
+        resp = pref.get("response", {})
+        link = resp.get("init_point") or resp.get("sandbox_init_point")
+        pref_id = resp.get("id")
+
+        if not link:
             return jsonify({"error": "MP no devolvió init_point"}), 500
-        return jsonify({"qr_link": init_point}), 200
+
+        return jsonify({"ok": True, "pref_id": pref_id, "qr_link": link})
     except Exception as e:
-        print("[MP] error creando preferencia ->", e)
-        return jsonify({"error": "no se pudo crear preferencia"}), 500
+        return jsonify({"error": f"error creando preferencia: {e}"}), 500
 
 # -------------------------------------------------
 # Webhook (POST)
