@@ -7,114 +7,118 @@ from sqlalchemy import func
 import qrcode
 import mercadopago
 
-# -------------------------------------------------
+# ----------------------------------------------------
 # Configuración básica
-# -------------------------------------------------
+# ----------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
-# DB: usa SQLite por defecto; si tienes DATABASE_URL la toma (Railway/Postgres)
+# Base de datos: usa SQLite por defecto; si existe DATABASE_URL (Railway/Postgres) la toma
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# -------------------------------------------------
-# Modelo
-# -------------------------------------------------
-class Product(db.Model):
-    __tablename__ = "products"
+# ----------------------------------------------------
+# Modelo de Producto
+# ----------------------------------------------------
+class Producto(db.Model):
+    __tablename__ = "productos"
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(180), nullable=False)
-    price = db.Column(db.Float, default=0)
-    qty = db.Column(db.Integer, default=1)
+    nombre = db.Column(db.String(180), nullable=False)
+    precio = db.Column(db.Float, default=0)
+    cantidad = db.Column(db.Integer, default=1)
     slot = db.Column(db.Integer, default=1)
-    active = db.Column(db.Boolean, default=True)
+    activo = db.Column(db.Boolean, default=True)
 
     def to_dict(self):
         return {
             "id": self.id,
-            "name": self.name,
-            "price": self.price,
-            "qty": self.qty,
+            "nombre": self.nombre,
+            "precio": self.precio,
+            "cantidad": self.cantidad,
             "slot": self.slot,
-            "active": self.active,
+            "activo": self.activo,
         }
 
-# Crea tablas si no existen
+# Crear tablas si no existen
 with app.app_context():
     db.create_all()
 
-# -------------------------------------------------
-# Salud
-# -------------------------------------------------
+# ----------------------------------------------------
+# Endpoints básicos
+# ----------------------------------------------------
 @app.route("/")
 def root():
-    return "Dispen-Easy backend activo"
+    return "✅ Backend de Dispen-Easy activo"
 
-# -------------------------------------------------
-# Productos
-# -------------------------------------------------
-@app.route("/api/products", methods=["GET"])
-def products_list():
-    prods = Product.query.order_by(Product.id.asc()).all()
-    return jsonify([p.to_dict() for p in prods])
 
-@app.route("/api/products", methods=["POST"])
-def products_create():
+# ----------------------------------------------------
+# CRUD de Productos
+# ----------------------------------------------------
+@app.route("/api/productos", methods=["GET"])
+def listar_productos():
+    productos = Producto.query.order_by(Producto.id.asc()).all()
+    return jsonify([p.to_dict() for p in productos])
+
+
+@app.route("/api/productos", methods=["POST"])
+def crear_producto():
     data = request.get_json(force=True) or {}
-    name = (data.get("name") or "").strip()
-    price = float(data.get("price") or 0)
-    qty = int(data.get("qty") or 1)
+
+    nombre = (data.get("nombre") or "").strip()
+    precio = float(data.get("precio") or 0)
+    cantidad = int(data.get("cantidad") or 1)
     slot = int(data.get("slot") or 1)
-    active = bool(data.get("active") if data.get("active") is not None else True)
+    activo = bool(data.get("activo")) if data.get("activo") is not None else True
 
-    if not name:
-        return jsonify({"ok": False, "error": "name requerido"}), 400
+    if not nombre:
+        return jsonify({"ok": False, "error": "El nombre es obligatorio"}), 400
 
-    pr = Product(name=name, price=price, qty=qty, slot=slot, active=active)
-    db.session.add(pr)
+    nuevo = Producto(nombre=nombre, precio=precio, cantidad=cantidad, slot=slot, activo=activo)
+    db.session.add(nuevo)
     db.session.commit()
-    return jsonify({"ok": True, "id": pr.id})
 
-@app.route("/api/products/<int:pid>", methods=["DELETE"])
-def products_delete(pid):
-    pr = Product.query.get(pid)
-    if not pr:
-        return jsonify({"ok": False, "error": "no encontrado"}), 404
-    db.session.delete(pr)
+    return jsonify({"ok": True, "id": nuevo.id})
+
+
+@app.route("/api/productos/<int:pid>", methods=["DELETE"])
+def eliminar_producto(pid):
+    producto = Producto.query.get(pid)
+    if not producto:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    db.session.delete(producto)
     db.session.commit()
     return jsonify({"ok": True})
 
-# -------------------------------------------------
-# Generar QR (MercadoPago -> PNG)
-# -------------------------------------------------
-@app.route("/api/generar_qr/<int:product_id>", methods=["GET"])
-def generar_qr(product_id):
-    """
-    Crea una preferencia en MercadoPago para el producto y devuelve
-    un PNG con el código QR que representa la URL de pago (init_point).
-    """
+
+# ----------------------------------------------------
+# Generar QR con MercadoPago
+# ----------------------------------------------------
+@app.route("/api/generar_qr/<int:pid>", methods=["GET"])
+def generar_qr(pid):
     # Buscar producto
-    producto = Product.query.get(product_id)
+    producto = Producto.query.get(pid)
     if not producto:
-        return jsonify({"ok": False, "error": "producto no existe"}), 404
+        return jsonify({"ok": False, "error": "El producto no existe"}), 404
 
     mp_token = os.getenv("MP_ACCESS_TOKEN")
     if not mp_token:
         return jsonify({"ok": False, "error": "Falta MP_ACCESS_TOKEN en variables de entorno"}), 500
 
-    # Construir preferencia básica
-    preference_data = {
+    # Armar preferencia básica
+    preferencia = {
         "items": [
             {
-                "title": producto.name,
+                "title": producto.nombre,
                 "quantity": 1,
                 "currency_id": os.getenv("MP_CURRENCY", "ARS"),
-                "unit_price": float(producto.price or 0),
+                "unit_price": float(producto.precio or 0),
             }
         ],
         "back_urls": {
@@ -125,30 +129,25 @@ def generar_qr(product_id):
         "auto_return": "approved",
     }
 
-    # Crear preferencia en MP
     try:
         sdk = mercadopago.SDK(mp_token)
-        result = sdk.preference().create(preference_data)
+        result = sdk.preference().create(preferencia)
+
         if "response" not in result or "init_point" not in result["response"]:
             return jsonify({"ok": False, "error": "Respuesta inesperada de MercadoPago", "mp": result}), 502
-        init_point = result["response"]["init_point"]
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Error MercadoPago: {str(e)}"}), 502
 
-    # Generar imagen PNG del QR desde la URL
-    try:
-        img = qrcode.make(init_point)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        # devuelve la imagen para <img src="/api/generar_qr/ID">
-        return send_file(buf, mimetype="image/png")
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"No se pudo generar el QR: {str(e)}"}), 500
+        link_pago = result["response"]["init_point"]
 
-# -------------------------------------------------
+        # Devolver link directo (más práctico para el front)
+        return jsonify({"ok": True, "qr": link_pago})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Error al generar QR en MP: {str(e)}"}), 500
+
+
+# ----------------------------------------------------
 # Arranque local
-# -------------------------------------------------
+# ----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
