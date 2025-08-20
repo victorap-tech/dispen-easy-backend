@@ -67,23 +67,31 @@ def listar_productos():
 
 
 @app.route("/api/productos", methods=["POST"])
-def crear_producto():
+def products_create():
     data = request.get_json(force=True) or {}
 
-    nombre = (data.get("nombre") or "").strip()
-    precio = float(data.get("precio") or 0)
-    cantidad = int(data.get("cantidad") or 1)
-    slot = int(data.get("slot") or 1)
-    activo = bool(data.get("activo")) if data.get("activo") is not None else True
+    # Aceptar claves en español o inglés
+    name = (data.get("name") or data.get("nombre") or "").strip()
+    price = float(data.get("price") or data.get("precio") or 0)
+    qty   = int(data.get("qty")   or data.get("cantidad") or 1)
+    slot  = int(data.get("slot")  or data.get("posicion") or 1)
 
-    if not nombre:
-        return jsonify({"ok": False, "error": "El nombre es obligatorio"}), 400
+    # Habilitado / active: aceptar varias formas
+    raw_active = data.get("active")
+    if raw_active is None:
+        raw_active = data.get("habilitado")
+    if isinstance(raw_active, str):
+        active = raw_active.strip().lower() in ("1", "true", "t", "yes", "si", "sí")
+    else:
+        active = bool(raw_active) if raw_active is not None else True
 
-    nuevo = Producto(nombre=nombre, precio=precio, cantidad=cantidad, slot=slot, activo=activo)
-    db.session.add(nuevo)
+    if not name:
+        return jsonify({"ok": False, "error": "name/nombre requerido"}), 400
+
+    pr = Product(name=name, price=price, qty=qty, slot=slot, active=active)
+    db.session.add(pr)
     db.session.commit()
-
-    return jsonify({"ok": True, "id": nuevo.id})
+    return jsonify({"ok": True, "id": pr.id})
 
 
 @app.route("/api/productos/<int:pid>", methods=["DELETE"])
