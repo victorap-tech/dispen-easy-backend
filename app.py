@@ -34,15 +34,15 @@ class Producto(db.Model):
     posicion = db.Column(db.Integer, nullable=False)
     habilitado = db.Column(db.Boolean, default=True)
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "nombre": self.nombre,
-            "precio": self.precio,
-            "cantidad": self.cantidad,
-            "posicion": self.posicion,
-            "habilitado": self.habilitado
-        }
+   def to_dict(self):
+    return {
+        "id": self.id,
+        "name": self.nombre,
+        "price": self.precio,
+        "qty": self.cantidad,
+        "slot": self.posicion,
+        "active": self.habilitado,
+    }
 # Crear tablas si no existen
 with app.app_context():
     db.create_all()
