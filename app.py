@@ -88,7 +88,7 @@ def products_create():
     if not name:
         return jsonify({"ok": False, "error": "name/nombre requerido"}), 400
 
-    pr = Product(name=name, price=price, qty=qty, slot=slot, active=active)
+    pr = Producto(name=name, price=price, qty=qty, slot=slot, active=active)
     db.session.add(pr)
     db.session.commit()
     return jsonify({"ok": True, "id": pr.id})
