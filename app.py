@@ -90,10 +90,10 @@ def products_create():
 
     pr = Producto(
     nombre=name,
-    precio=price,
-    cantidad=qty,
-    posicion=slot,
-    habilitado=active
+    price=price,
+    cty=qty,
+    slot=slot,
+    active=active
 )
     db.session.add(pr)
     db.session.commit()
