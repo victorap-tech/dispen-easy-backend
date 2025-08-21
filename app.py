@@ -34,7 +34,7 @@ class Producto(db.Model):
     posicion = db.Column(db.Integer, nullable=False)
     habilitado = db.Column(db.Boolean, default=True)
 
-   def to_dict(self):
+def to_dict(self):
     return {
         "id": self.id,
         "name": self.nombre,
