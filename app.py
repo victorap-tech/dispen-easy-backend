@@ -27,13 +27,12 @@ db = SQLAlchemy(app)
 # Modelo de Producto
 # ----------------------------------------------------
 class Producto(db.Model):
-    __tablename__ = "productos"
     id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(180), nullable=False)
-    precio = db.Column(db.Float, default=0)
-    cantidad = db.Column(db.Integer, default=1)
-    slot = db.Column(db.Integer, default=1)
-    activo = db.Column(db.Boolean, default=True)
+    nombre = db.Column(db.String(120), nullable=False)
+    precio = db.Column(db.Float, nullable=False)
+    cantidad = db.Column(db.Integer, nullable=False)
+    posicion = db.Column(db.Integer, nullable=False)
+    habilitado = db.Column(db.Boolean, default=True)
 
     def to_dict(self):
         return {
@@ -41,10 +40,9 @@ class Producto(db.Model):
             "nombre": self.nombre,
             "precio": self.precio,
             "cantidad": self.cantidad,
-            "slot": self.slot,
-            "activo": self.activo,
+            "posicion": self.posicion,
+            "habilitado": self.habilitado
         }
-
 # Crear tablas si no existen
 with app.app_context():
     db.create_all()
@@ -89,11 +87,11 @@ def products_create():
         return jsonify({"ok": False, "error": "name/nombre requerido"}), 400
 
     pr = Producto(
-    nombre=name,
-    price=price,
-    cty=qty,
-    slot=slot,
-    active=active
+    nombre=data.get("nombre"),
+    precio=float(data.get("precio")),
+    cantidad=int(data.get("cantidad")),
+    posicion=int(data.get("posicion")),
+    habilitado=data.get("habilitado", True)
 )
     db.session.add(pr)
     db.session.commit()
