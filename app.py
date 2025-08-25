@@ -1,363 +1,341 @@
 # app.py
-import os, json, ssl
+import os
+import json
 from datetime import datetime
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.sql import func
-import requests
 
-# MQTT
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+
+import mercadopago
 import paho.mqtt.client as mqtt
 
-# ------------------------------
-# Configuración básica
-# ------------------------------
+# -----------------------------
+# Config básica
+# -----------------------------
 app = Flask(__name__)
 CORS(app)
 
-# Base de datos (PostgreSQL en Railway)
-# Ej: postgresql://usuario:pass@host:puerto/db
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db = SQLAlchemy(app)
+DB_URL = os.getenv("DATABASE_URL", "sqlite:///data.db")
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-# Mercado Pago
-MP_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-MP_WEBHOOK_URL = os.getenv("MP_WEBHOOK_URL", "")  # https://tu-backend/api/mp/webhook
+engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
 
-# MQTT
-MQTT_HOST = os.getenv("MQTT_HOST", "")
+MP = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN", ""))
+
+MQTT_HOST = os.getenv("MQTT_HOST")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER = os.getenv("MQTT_USER", "")
-MQTT_PASS = os.getenv("MQTT_PASS", "")
-MQTT_ORDERS_TOPIC = os.getenv("MQTT_ORDERS_TOPIC", "dispense/orders")
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "backend-dispen-easy")
+MQTT_USER = os.getenv("MQTT_USER")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "disp/orden")
 
-mqttc = mqtt.Client(client_id=MQTT_CLIENT_ID)
-if MQTT_USER:
-    mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
-
-# TLS si usás 8883 (broker con SSL)
-if MQTT_PORT == 8883:
-    mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-    mqttc.tls_insecure_set(False)
-
-def _connect_mqtt():
+mqtt_client = None
+if MQTT_HOST:
+    mqtt_client = mqtt.Client()
+    if MQTT_USER:
+        mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD or "")
     try:
-        if MQTT_HOST:
-            mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
-            mqttc.loop_start()
-            app.logger.info("MQTT conectado")
-        else:
-            app.logger.warning("MQTT deshabilitado (sin MQTT_HOST)")
+        mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+        mqtt_client.loop_start()
+        print("MQTT conectado")
     except Exception as e:
-        app.logger.error(f"Error conectando MQTT: {e}")
+        print("MQTT no conectado:", e)
 
-# ------------------------------
-# Modelos
-# ------------------------------
-class Producto(db.Model):
-    __tablename__ = "producto"
-    id         = db.Column(db.Integer, primary_key=True)
-    nombre     = db.Column(db.String(100), nullable=False)
-    precio     = db.Column(db.Float, nullable=False)     # en ARS
-    cantidad   = db.Column(db.Float, nullable=False)     # litros disponibles
-    slot_id    = db.Column(db.Integer, nullable=False)   # salida física (1..6)
-    habilitado = db.Column(db.Boolean, nullable=False, default=False)
-    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
-    updated_at = db.Column(db.DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+# -----------------------------
+# SQL de esquema (productos + inventario + pagos)
+# -----------------------------
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS public.producto (
+  id              SERIAL PRIMARY KEY,
+  nombre          VARCHAR(100) NOT NULL,
+  precio_por_litro DOUBLE PRECISION NOT NULL DEFAULT 0,
+  presentacion_litros DOUBLE PRECISION NOT NULL DEFAULT 1,
+  slot_id         INTEGER NOT NULL,
+  stock_litros    DOUBLE PRECISION NOT NULL DEFAULT 0,
+  habilitado      BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "nombre": self.nombre,
-            "precio": self.precio,
-            "cantidad": self.cantidad,
-            "slot": self.slot_id,
-            "habilitado": self.habilitado,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+CREATE TABLE IF NOT EXISTS public.inventario_mov (
+  id            SERIAL PRIMARY KEY,
+  producto_id   INTEGER NOT NULL REFERENCES public.producto(id) ON DELETE CASCADE,
+  tipo          TEXT NOT NULL CHECK (tipo IN ('carga','venta','ajuste')),
+  litros        DOUBLE PRECISION NOT NULL CHECK (litros > 0),
+  ref_pago_id   INTEGER,
+  nota          TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_inv_mov_prod ON public.inventario_mov(producto_id);
 
-class Pago(db.Model):
-    __tablename__ = "pago"
-    id            = db.Column(db.Integer, primary_key=True)
-    mp_payment_id = db.Column(db.String(64), unique=True)  # id de MP
-    product_id    = db.Column(db.Integer, db.ForeignKey("producto.id"))
-    slot_id       = db.Column(db.Integer, nullable=False)
-    monto         = db.Column(db.Float, nullable=False)
-    estado        = db.Column(db.String(20), nullable=False)  # approved|pending|rejected
-    procesado     = db.Column(db.Boolean, nullable=False, default=False)
-    created_at    = db.Column(db.DateTime(timezone=True), server_default=func.now())
+CREATE OR REPLACE FUNCTION public.fn_recalc_stock(p_prod_id INT) RETURNS VOID AS $$
+BEGIN
+  UPDATE public.producto p
+  SET stock_litros = COALESCE((
+    SELECT SUM(CASE
+      WHEN m.tipo = 'carga'  THEN  m.litros
+      WHEN m.tipo = 'ajuste' THEN  m.litros   -- usa litros positivos o negativos vía dos registros si querés
+      WHEN m.tipo = 'venta'  THEN -m.litros
+      ELSE 0 END)
+    FROM public.inventario_mov m
+    WHERE m.producto_id = p.id
+  ), 0),
+  updated_at = now()
+  WHERE p.id = p_prod_id;
+END;
+$$ LANGUAGE plpgsql;
 
-class Reposicion(db.Model):
-    __tablename__ = "reposicion"
-    id          = db.Column(db.Integer, primary_key=True)
-    producto_id = db.Column(db.Integer, db.ForeignKey("producto.id"), nullable=False)
-    litros      = db.Column(db.Float, nullable=False)          # +X reponer, o diferencia en reset
-    motivo      = db.Column(db.String(20), nullable=False)     # "reponer" | "reset" | "ajuste"
-    created_at  = db.Column(db.DateTime(timezone=True), server_default=func.now())
+CREATE OR REPLACE FUNCTION public.trg_inv_mov_after_ins() RETURNS TRIGGER AS $$
+BEGIN
+  PERFORM public.fn_recalc_stock(NEW.producto_id);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-# ------------------------------
-# Utils
-# ------------------------------
-def mp_headers():
-    return {
-        "Authorization": f"Bearer {MP_TOKEN}",
-        "Content-Type": "application/json",
-    }
+DROP TRIGGER IF EXISTS trg_inv_mov_ai ON public.inventario_mov;
+CREATE TRIGGER trg_inv_mov_ai
+AFTER INSERT ON public.inventario_mov
+FOR EACH ROW EXECUTE FUNCTION public.trg_inv_mov_after_ins();
 
-def publicar_orden_mqtt(order_id:int, slot:int, product_id:int, amount:float):
-    """Publica una orden de dispensado para el ESP vía MQTT."""
-    if not MQTT_HOST:
-        app.logger.warning("MQTT no configurado: no se publica orden.")
+-- Pagos (registro de órdenes)
+CREATE TABLE IF NOT EXISTS public.pago (
+  id              SERIAL PRIMARY KEY,
+  producto_id     INTEGER NOT NULL REFERENCES public.producto(id),
+  litros          DOUBLE PRECISION NOT NULL,
+  monto           DOUBLE PRECISION NOT NULL,
+  estado          TEXT NOT NULL DEFAULT 'pendiente', -- pendiente | aprobado | rechazado
+  mp_preference_id TEXT,
+  mp_payment_id     TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+@app.before_first_request
+def bootstrap():
+    with engine.begin() as conn:
+        conn.execute(text(SCHEMA_SQL))
+
+# -----------------------------
+# Util
+# -----------------------------
+def publish_mqtt(slot_id: int, litros: float):
+    if not mqtt_client:
+        print("MQTT no disponible, mensaje:", {"slot": slot_id, "litros": litros})
         return
-    payload = {
-        "order_id": order_id,
-        "slot": slot,
-        "product_id": product_id,
-        "amount": amount,
-        "ts": datetime.utcnow().isoformat() + "Z",
-    }
-    mqttc.publish(MQTT_ORDERS_TOPIC, json.dumps(payload), qos=1, retain=False)
-    app.logger.info(f"[MQTT] Publicada orden {order_id} → slot {slot}")
+    payload = json.dumps({"slot": int(slot_id), "litros": float(litros)})
+    mqtt_client.publish(MQTT_TOPIC, payload, qos=1, retain=False)
 
-# ------------------------------
-# Rutas básicas
-# ------------------------------
-@app.get("/")
-def home():
-    return jsonify({"status": "ok", "message": "Backend Dispen-Easy operativo"})
-
-# ------------------------------
-# CRUD Productos
-# ------------------------------
+# -----------------------------
+# API Productos
+# -----------------------------
 @app.get("/api/productos")
 def productos_list():
-    rows = Producto.query.order_by(Producto.id.asc()).all()
-    return jsonify([r.to_dict() for r in rows])
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, nombre, precio_por_litro, presentacion_litros,
+                       slot_id, stock_litros, habilitado
+                FROM public.producto
+                ORDER BY id ASC;
+            """)).mappings().all()
+        return jsonify([dict(r) for r in rows])
+    except SQLAlchemyError as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/api/productos")
 def productos_create():
-    data = request.get_json(force=True, silent=True) or {}
-    nombre = (data.get("nombre") or "").strip()
-    if not nombre:
-        return jsonify({"ok": False, "error": "nombre requerido"}), 400
+    data = request.get_json() or {}
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(text("""
+                INSERT INTO public.producto(nombre, precio_por_litro, presentacion_litros, slot_id, habilitado)
+                VALUES (:n, :p, :pres, :slot, :hab)
+                RETURNING id;
+            """), {
+                "n": str(data.get("nombre","")).strip(),
+                "p": float(data.get("precio_por_litro", 0)),
+                "pres": float(data.get("presentacion_litros", 1)),
+                "slot": int(data.get("slot_id", 1)),
+                "hab": bool(data.get("habilitado", True)),
+            }).first()
+        return jsonify({"id": r[0]}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
-    p = Producto(
-        nombre=nombre,
-        precio=float(data.get("precio", 0)),
-        cantidad=float(data.get("cantidad", 0)),
-        slot_id=int(data.get("slot", data.get("slot_id", 1))),
-        habilitado=bool(data.get("habilitado", False)),
-    )
-    db.session.add(p)
-    db.session.commit()
-    return jsonify({"ok": True, "producto": p.to_dict()}), 201
-
-@app.put("/api/productos/<int:pid>")
+@app.patch("/api/productos/<int:pid>")
 def productos_update(pid):
-    p = Producto.query.get_or_404(pid)
-    d = request.get_json(force=True, silent=True) or {}
-    if "nombre" in d:    p.nombre = str(d["nombre"]).strip()
-    if "precio" in d:    p.precio = float(d["precio"])
-    if "cantidad" in d:  p.cantidad = float(d["cantidad"])
-    if "slot" in d:      p.slot_id = int(d["slot"])
-    if "slot_id" in d:   p.slot_id = int(d["slot_id"])
-    if "habilitado" in d:p.habilitado = bool(d["habilitado"])
-    db.session.commit()
-    return jsonify({"ok": True, "producto": p.to_dict()})
+    data = request.get_json() or {}
+    fields = []
+    params = {"id": pid}
+    for col in ("nombre","precio_por_litro","presentacion_litros","slot_id","habilitado"):
+        if col in data:
+            fields.append(f"{col} = :{col}")
+            params[col] = data[col]
+    if not fields:
+        return jsonify({"ok": True})
+    sql = f"UPDATE public.producto SET {', '.join(fields)}, updated_at=now() WHERE id=:id"
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(sql), params)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.delete("/api/productos/<int:pid>")
 def productos_delete(pid):
-    p = Producto.query.get_or_404(pid)
-    db.session.delete(p)
-    db.session.commit()
-    return jsonify({"ok": True}), 204
-
-# ------------------------------
-# Reposición / Reset stock / Historial
-# ------------------------------
-@app.post("/api/productos/<int:pid>/reponer")
-def reponer(pid):
-    p = Producto.query.get_or_404(pid)
-    data = request.get_json(force=True) or {}
-    litros = float(data.get("litros", 0))
-    if litros <= 0:
-        return jsonify({"ok": False, "error": "litros debe ser > 0"}), 400
-
-    p.cantidad += litros
-    db.session.add(Reposicion(producto_id=pid, litros=litros, motivo="reponer"))
-    db.session.commit()
-    return jsonify({"ok": True, "producto": p.to_dict()})
-
-@app.post("/api/productos/<int:pid>/reset_stock")
-def reset_stock(pid):
-    p = Producto.query.get_or_404(pid)
-    data = request.get_json(force=True) or {}
-    nuevo = float(data.get("litros", 0))
-    diff = nuevo - p.cantidad
-    p.cantidad = nuevo
-    db.session.add(Reposicion(producto_id=pid, litros=diff, motivo="reset"))
-    db.session.commit()
-    return jsonify({"ok": True, "producto": p.to_dict()})
-
-@app.get("/api/productos/<int:pid>/reposiciones")
-def ver_repos(pid):
-    rows = (Reposicion.query
-            .filter_by(producto_id=pid)
-            .order_by(Reposicion.created_at.desc()).all())
-    return jsonify([{
-        "id": r.id, "litros": r.litros, "motivo": r.motivo,
-        "created_at": r.created_at.isoformat() if r.created_at else None
-    } for r in rows])
-
-# ------------------------------
-# Mercado Pago: crear preferencia
-# external_reference = "product_id:slot_id"
-# ------------------------------
-@app.post("/api/pagos/preferencia")
-def crear_preferencia():
-    if not MP_TOKEN:
-        return jsonify({"ok": False, "error": "MP_ACCESS_TOKEN no configurado"}), 500
-
-    data = request.get_json(force=True) or {}
-    product_id = int(data.get("product_id", 0))
-    slot_id    = int(data.get("slot_id", 0))
-    prod = Producto.query.get_or_404(product_id)
-
-    pref_body = {
-        "items": [{
-            "title": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
-        "back_urls": {
-            "success": os.getenv("MP_BACK_SUCCESS", "https://www.mercadopago.com.ar"),
-            "failure": os.getenv("MP_BACK_FAILURE", "https://www.mercadopago.com.ar"),
-            "pending": os.getenv("MP_BACK_PENDING", "https://www.mercadopago.com.ar"),
-        },
-        "auto_return": "approved",
-        "external_reference": f"{product_id}:{slot_id}",
-        "metadata": { "product_id": product_id, "slot_id": slot_id },
-    }
-    if MP_WEBHOOK_URL:
-        pref_body["notification_url"] = MP_WEBHOOK_URL
-
-    r = requests.post(
-        "https://api.mercadopago.com/checkout/preferences",
-        headers=mp_headers(),
-        json=pref_body, timeout=15
-    )
-    r.raise_for_status()
-    pref = r.json()
-    return jsonify({
-        "ok": True,
-        "pref_id": pref.get("id"),
-        "init_point": pref.get("init_point"),
-        "sandbox_init_point": pref.get("sandbox_init_point"),
-    })
-
-# ------------------------------
-# Webhook Mercado Pago
-# - registra pago approved
-# - descuenta stock
-# - publica orden MQTT (slot)
-# ------------------------------
-@app.post("/api/mp/webhook")
-def mp_webhook():
     try:
-        # MP envía ?type=payment&id=... o JSON con data.id
-        payment_id = request.args.get("id")
-        if not payment_id:
-            body = request.get_json(silent=True) or {}
-            payment_id = (body.get("data") or {}).get("id")
-        if not payment_id:
-            return "ok", 200
-
-        pr = requests.get(
-            f"https://api.mercadopago.com/v1/payments/{payment_id}",
-            headers=mp_headers(), timeout=15
-        )
-        pr.raise_for_status()
-        pago_mp = pr.json()
-        status = pago_mp.get("status")
-        if status != "approved":
-            return "ok", 200
-
-        # idempotencia
-        ya = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-        if ya:
-            return "ok", 200
-
-        ext = pago_mp.get("external_reference", "0:0")
-        try:
-            product_id, slot_id = [int(x) for x in ext.split(":")]
-        except Exception:
-            # fallback: intenta metadata
-            md = pago_mp.get("metadata") or {}
-            product_id = int(md.get("product_id", 0))
-            slot_id    = int(md.get("slot_id", 0))
-
-        prod = Producto.query.get(product_id)
-        monto = float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))
-
-        # registrar pago
-        reg = Pago(mp_payment_id=str(payment_id),
-                   product_id=product_id,
-                   slot_id=slot_id,
-                   monto=monto,
-                   estado="approved",
-                   procesado=False)
-        db.session.add(reg)
-
-        # descontar 1 unidad (si usás unidades; ajusta a tu lógica)
-        if prod and prod.cantidad > 0:
-            prod.cantidad = max(0.0, float(prod.cantidad) - 1.0)
-
-        db.session.commit()
-
-        # publicar orden para el ESP
-        publicar_orden_mqtt(order_id=reg.id, slot=slot_id,
-                            product_id=product_id, amount=monto)
-        return "ok", 200
-
-    except requests.HTTPError as e:
-        app.logger.error(f"[MP] HTTPError: {e} - {getattr(e, 'response', None)}")
-        return "ok", 200
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM public.producto WHERE id=:id"), {"id": pid})
+        return jsonify({"ok": True})
     except Exception as e:
-        app.logger.exception(f"[MP] Error webhook: {e}")
-        return "ok", 200
+        return jsonify({"error": str(e)}), 400
 
-# ------------------------------
-# ACK opcional desde el ESP por HTTP
-# (si no querés escuchar ACKs por MQTT)
-# ------------------------------
-@app.post("/api/dispense/ack/<int:order_id>")
-def ack(order_id):
-    g = Pago.query.get_or_404(order_id)
-    if not g.procesado:
-        g.procesado = True
-        db.session.commit()
-    return jsonify({"ok": True})
+# -----------------------------
+# API Inventario (cargas/ajustes)
+# -----------------------------
+@app.post("/api/inventario/cargas")
+def inventario_carga():
+    data = request.get_json() or {}
+    prod_id = int(data.get("producto_id", 0))
+    litros  = float(data.get("litros", 0))
+    nota    = str(data.get("nota") or "")
+    if prod_id <= 0 or litros <= 0:
+        return jsonify({"error": "producto_id y litros > 0 son requeridos"}), 400
+    try:
+        with engine.begin() as conn:
+            # valida producto
+            p = conn.execute(text("SELECT id FROM public.producto WHERE id=:id"),
+                             {"id": prod_id}).first()
+            if not p:
+                return jsonify({"error": "Producto no existe"}), 404
+            conn.execute(text("""
+                INSERT INTO public.inventario_mov (producto_id, tipo, litros, nota)
+                VALUES (:pid, 'carga', :litros, :nota)
+            """), {"pid": prod_id, "litros": litros, "nota": nota})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
-# ------------------------------
-# Inicialización
-# ------------------------------
-def initialize_database():
-    with app.app_context():
-        db.create_all()
-        app.logger.info("Tablas verificadas/creadas.")
+# -----------------------------
+# API Pagos (MercadoPago)
+# -----------------------------
+@app.post("/api/pagos")
+def crear_pago():
+    """
+    Body: { producto_id, litros }
+    -> valida stock y devuelve { init_point, checkout_url, pago_id }
+    """
+    data = request.get_json() or {}
+    pid   = int(data.get("producto_id", 0))
+    litros = float(data.get("litros", 0))
+    if pid <= 0 or litros <= 0:
+        return jsonify({"error": "producto_id y litros > 0 son requeridos"}), 400
 
-# ------------------------------
-# Entry point
-# ------------------------------
+    try:
+        with engine.begin() as conn:
+            prod = conn.execute(text("""
+                SELECT id, nombre, precio_por_litro, slot_id, stock_litros
+                FROM public.producto WHERE id=:id AND habilitado = TRUE
+            """), {"id": pid}).mappings().first()
+            if not prod:
+                return jsonify({"error": "Producto no habilitado / inexistente"}), 404
+            if litros > float(prod["stock_litros"]):
+                return jsonify({"error": "Stock insuficiente"}), 409
+
+            monto = round(litros * float(prod["precio_por_litro"]), 2)
+
+            # crea registro de pago (pendiente)
+            pago = conn.execute(text("""
+                INSERT INTO public.pago(producto_id, litros, monto, estado)
+                VALUES (:pid, :litros, :monto, 'pendiente')
+                RETURNING id
+            """), {"pid": pid, "litros": litros, "monto": monto}).first()
+            pago_id = pago[0]
+
+        # Preferencia MP
+        pref = MP.preference().create({
+            "items": [{
+                "title": f"{prod['nombre']} - {litros} L",
+                "quantity": 1,
+                "currency_id": "ARS",
+                "unit_price": float(monto),
+            }],
+            "external_reference": str(pago_id),  # para encontrarlo en webhook
+            "notification_url": request.url_root.rstrip("/") + "/webhook/mp"
+        })
+
+        pref_id = pref["response"]["id"]
+        init_point = pref["response"].get("init_point") or pref["response"].get("sandbox_init_point")
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE public.pago SET mp_preference_id=:pref, updated_at=now()
+                WHERE id=:id
+            """), {"pref": pref_id, "id": pago_id})
+
+        return jsonify({"pago_id": pago_id, "init_point": init_point}), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# Webhook MP
+@app.post("/webhook/mp")
+def webhook_mp():
+    data = request.json or request.form or {}
+    # MP notifica topic + id de pago; luego hay que consultar el pago
+    topic = data.get("type") or data.get("topic")
+    payment_id = data.get("data", {}).get("id") or data.get("id")
+
+    try:
+        if topic == "payment" and payment_id:
+            pay = MP.payment().get(payment_id)
+            status = pay["response"].get("status")
+            ext_ref = pay["response"].get("external_reference")  # nuestro pago_id
+
+            if status == "approved" and ext_ref:
+                pago_id = int(ext_ref)
+                # leemos datos del pago y producto
+                with engine.begin() as conn:
+                    row = conn.execute(text("""
+                        SELECT p.id, p.producto_id, p.litros, pr.slot_id
+                        FROM public.pago p
+                        JOIN public.producto pr ON pr.id = p.producto_id
+                        WHERE p.id=:id
+                    """), {"id": pago_id}).mappings().first()
+                    if not row:
+                        return jsonify({"ok": True})  # nada que hacer
+
+                    # movimiento de venta
+                    conn.execute(text("""
+                        INSERT INTO public.inventario_mov (producto_id, tipo, litros, ref_pago_id, nota)
+                        VALUES (:pid, 'venta', :litros, :pago, 'MP OK')
+                    """), {"pid": row["producto_id"], "litros": row["litros"], "pago": pago_id})
+
+                    # actualizar pago
+                    conn.execute(text("""
+                        UPDATE public.pago
+                        SET estado='aprobado', mp_payment_id=:mpid, updated_at=now()
+                        WHERE id=:id
+                    """), {"mpid": str(payment_id), "id": pago_id})
+
+                # Publicar orden al dispensador por MQTT
+                publish_mqtt(slot_id=row["slot_id"], litros=row["litros"])
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        # no romper el webhook
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+# -----------------------------
+# Salud
+# -----------------------------
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "dispen-easy-backend"})
+
 if __name__ == "__main__":
-    initialize_database()
-    _connect_mqtt()
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
