@@ -1,114 +1,183 @@
-from flask import Flask, request, jsonify
+import os
+from datetime import datetime
+from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from datetime import datetime
-import os
+from sqlalchemy import func
+import mercadopago
 
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
-# Configuración base de datos Railway
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRES_URL_NON_POOLING")
+if not DATABASE_URL:
+    # local fallback (no se usa en Railway)
+    DATABASE_URL = "sqlite:///data.db"
+
+# Arreglo típico de Railway: postgres -> postgresql
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 db = SQLAlchemy(app)
 
-# Modelo de Producto
+# -----------------------------------------------------------------------------
+# Modelo (match exacto con tu tabla 'producto')
+# -----------------------------------------------------------------------------
 class Producto(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    nombre = db.Column(db.String(100), nullable=False)
-    precio = db.Column(db.Integer, nullable=False)  # en centavos
-    litros = db.Column(db.Float, nullable=False)    # litros que representa la compra
-    stock_real = db.Column(db.Float, default=0)     # litros disponibles en tanque
-    slot_id = db.Column(db.Integer, unique=True, nullable=False)
-    habilitado = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __tablename__ = "producto"
 
-# Modelo de Pago
-class Pago(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    producto_id = db.Column(db.Integer, db.ForeignKey("producto.id"), nullable=False)
-    estado = db.Column(db.String(50), nullable=False, default="pendiente")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    id         = db.Column(db.Integer, primary_key=True)
+    nombre     = db.Column(db.String(100), nullable=False)
+    precio     = db.Column(db.Float,       nullable=False)     # precio x presentación (o L)
+    cantidad   = db.Column(db.Integer,     nullable=False)     # presentación a vender (ej: 1L, 2L, etc.)
+    slot_id    = db.Column(db.Integer,     nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    habilitado = db.Column(db.Boolean,     nullable=False, default=True)
 
-# Ruta de verificación
-@app.route("/")
-def index():
-    return "✅ Dispen-Easy funcionando"
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "nombre": self.nombre,
+            "precio": self.precio,
+            "cantidad": self.cantidad,
+            "slot_id": self.slot_id,
+            "habilitado": self.habilitado,
+            "created_at": (self.created_at.isoformat() if self.created_at else None),
+            "updated_at": (self.updated_at.isoformat() if self.updated_at else None),
+        }
 
-# --- Endpoints API ---
-@app.route("/api/productos", methods=["GET"])
-def get_productos():
-    productos = Producto.query.all()
-    return jsonify([{
-        "id": p.id,
-        "nombre": p.nombre,
-        "precio": p.precio,
-        "litros": p.litros,
-        "stock_real": p.stock_real,
-        "slot_id": p.slot_id,
-        "habilitado": p.habilitado
-    } for p in productos])
+# -----------------------------------------------------------------------------
+# Salud
+# -----------------------------------------------------------------------------
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "service": "dispen-easy", "db": True}), 200
 
-@app.route("/api/productos", methods=["POST"])
+# -----------------------------------------------------------------------------
+# CRUD Productos
+# -----------------------------------------------------------------------------
+@app.get("/api/productos")
+def listar_productos():
+    q = Producto.query.order_by(Producto.id.asc()).all()
+    return jsonify([p.to_dict() for p in q])
+
+@app.post("/api/productos")
 def crear_producto():
-    data = request.json
-    nuevo = Producto(
-        nombre=data["nombre"],
-        precio=int(data["precio"]),
-        litros=float(data["litros"]),
-        stock_real=0,
-        slot_id=int(data["slot_id"]),
-        habilitado=True
-    )
-    db.session.add(nuevo)
-    db.session.commit()
-    return jsonify({"message": "Producto creado"}), 201
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        p = Producto(
+            nombre     = str(data.get("nombre", "")).strip(),
+            precio     = float(data.get("precio", 0) or 0),
+            cantidad   = int(data.get("cantidad", 1) or 1),
+            slot_id    = int(data.get("slot_id", 1) or 1),
+            habilitado = bool(data.get("habilitado", True)),
+        )
+        if not p.nombre:
+            return jsonify({"error": "nombre requerido"}), 400
+        db.session.add(p)
+        db.session.commit()
+        return jsonify(p.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/api/productos/<int:id>", methods=["DELETE"])
-def eliminar_producto(id):
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "No encontrado"}), 404
-    db.session.delete(producto)
-    db.session.commit()
-    return jsonify({"message": "Producto eliminado"})
+@app.put("/api/productos/<int:pid>")
+def actualizar_producto(pid):
+    data = request.get_json(force=True, silent=True) or {}
+    p = Producto.query.get(pid)
+    if not p:
+        return jsonify({"error": "no encontrado"}), 404
+    try:
+        if "nombre"     in data: p.nombre     = str(data["nombre"]).strip()
+        if "precio"     in data: p.precio     = float(data["precio"] or 0)
+        if "cantidad"   in data: p.cantidad   = int(data["cantidad"] or 1)
+        if "slot_id"    in data: p.slot_id    = int(data["slot_id"] or 1)
+        if "habilitado" in data: p.habilitado = bool(data["habilitado"])
+        p.updated_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify(p.to_dict())
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/api/productos/<int:id>", methods=["PUT"])
-def actualizar_producto(id):
-    data = request.json
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "No encontrado"}), 404
-    if "habilitado" in data:
-        producto.habilitado = data["habilitado"]
-    if "precio" in data:
-        producto.precio = int(data["precio"])
-    db.session.commit()
-    return jsonify({"message": "Producto actualizado"})
+@app.delete("/api/productos/<int:pid>")
+def borrar_producto(pid):
+    p = Producto.query.get(pid)
+    if not p:
+        return jsonify({"error": "no encontrado"}), 404
+    try:
+        db.session.delete(p)
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
-# Resetear tanque
-@app.route("/api/productos/<int:id>/reset_stock", methods=["POST"])
-def reset_stock(id):
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "No encontrado"}), 404
-    producto.stock_real = producto.litros  # capacidad nominal
-    db.session.commit()
-    return jsonify({"message": "Stock reseteado", "stock_real": producto.stock_real})
+# -----------------------------------------------------------------------------
+# MercadoPago: preferencia y link/QR
+# -----------------------------------------------------------------------------
+@app.post("/api/mp/preferencia/<int:pid>")
+def mp_preferencia(pid):
+    """Genera preferencia para el producto y devuelve init_point + id preferencia.
+       Requiere env MP_ACCESS_TOKEN (token de producción o test)."""
+    p = Producto.query.get(pid)
+    if not p or not p.habilitado:
+        return jsonify({"error": "producto inexistente o no habilitado"}), 404
 
-# Reponer stock manual
-@app.route("/api/productos/<int:id>/reponer", methods=["POST"])
-def reponer_stock(id):
-    producto = Producto.query.get(id)
-    if not producto:
-        return jsonify({"error": "No encontrado"}), 404
-    cantidad = request.json.get("cantidad", 0)
-    producto.stock_real += float(cantidad)
-    db.session.commit()
-    return jsonify({"message": "Stock repuesto", "stock_real": producto.stock_real})
+    access_token = os.getenv("MP_ACCESS_TOKEN")
+    if not access_token:
+        return jsonify({"error": "MP_ACCESS_TOKEN no configurado"}), 500
 
+    sdk = mercadopago.SDK(access_token)
+
+    # Ítem con precio y cantidad fija = 1 (una venta por vez)
+    preference_data = {
+        "items": [
+            {
+                "title": f"{p.nombre} ({p.cantidad}L) - Slot {p.slot_id}",
+                "quantity": 1,
+                "unit_price": round(float(p.precio), 2),
+                "currency_id": "ARS",
+            }
+        ],
+        "metadata": {
+            "producto_id": p.id,
+            "slot_id": p.slot_id,
+            "presentacion_l": p.cantidad,
+        },
+        "notification_url": os.getenv("MP_WEBHOOK_URL", ""),  # opcional si tenés webhook
+        "auto_return": "approved"
+    }
+
+    try:
+        pref = sdk.preference().create(preference_data)
+        body = pref.get("response", {})
+        init_point = body.get("init_point")
+        pref_id = body.get("id")
+
+        # Link QR “rápido”: muchos usan el init_point directo. Si tenés tu generador de QR en el front,
+        # con el init_point alcanza (se muestra como QR Canvas/IMG).
+        return jsonify({
+            "ok": True,
+            "preference_id": pref_id,
+            "init_point": init_point
+        })
+    except Exception as e:
+        return jsonify({"error": f"MercadoPago: {e}"}), 500
+
+# -----------------------------------------------------------------------------
+# Main local
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    # En Railway no se ejecuta, pero localmente sirve
     with app.app_context():
+        # NO crea tablas nuevas en Postgres si ya existen; en Postgres real tu esquema ya está creado.
         db.create_all()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
