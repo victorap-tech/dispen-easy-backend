@@ -312,9 +312,9 @@ def mp_webhook():
         payment_id = args.get("id")  # si topic/type = payment
         merchant_order_id = args.get("id") if topic == "merchant_order" else None
 
-        # live_mode (True = producción, False = sandbox)
-        live_mode = bool(body.get("live_mode", True))
-        base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+        # ignoramos live_mode: siempre usamos el endpoint productivo
+        live_mode = bool(body.get("live_mode", True))  # (si lo querés para logs)
+        base_api  = "https://api.mercadopago.com"
 
         app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
 
