@@ -303,69 +303,110 @@ def crear_preferencia():
 @app.post("/api/mp/webhook")
 def mp_webhook():
     try:
-        # MP envía ?type=payment&id=... o JSON con data.id
-        payment_id = request.args.get("id")
+        # --- leer datos que pueden venir por query o por body ---
+        args = request.args or {}
+        body = request.get_json(silent=True) or {}
+
+        # MP puede mandar: ?type=payment&id=...  ó  ?topic=merchant_order&id=...
+        topic = (args.get("topic") or args.get("type") or body.get("type") or "").lower()
+        payment_id = args.get("id")  # si topic/type = payment
+        merchant_order_id = args.get("id") if topic == "merchant_order" else None
+
+        # live_mode (True = producción, False = sandbox)
+        live_mode = bool(body.get("live_mode", True))
+        base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+
+        app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
+
+        # Si vino merchant_order, obtener el/los payments primero
+        if topic == "merchant_order" and merchant_order_id:
+            r_mo = requests.get(
+                f"{base_api}/merchant_orders/{merchant_order_id}",
+                headers=mp_headers(),
+                timeout=15,
+            )
+            r_mo.raise_for_status()
+            mo = r_mo.json()
+            pays = mo.get("payments") or []
+            if not pays:
+                app.logger.warning(f"[MP] merchant_order {merchant_order_id} sin payments")
+                return "ok", 200
+            payment_id = str(pays[0].get("id"))
+
+        # Si aún no tenemos payment_id, intentar desde body.data.id
         if not payment_id:
-            body = request.get_json(silent=True) or {}
-            payment_id = (body.get("data") or {}).get("id")
+            data = body.get("data") or {}
+            payment_id = data.get("id")
         if not payment_id:
+            app.logger.warning("[MP] webhook sin payment_id/merchant_order_id")
             return "ok", 200
 
-        # consulta detalle de pago
-        pr = requests.get(
-            f"https://api.mercadopago.com/v1/payments/{payment_id}",
-            headers=mp_headers(), timeout=15
+        # --- buscar el pago en el API correcto ---
+        app.logger.info(f"[MP] consultando payment_id={payment_id} api={base_api}")
+        r = requests.get(
+            f"{base_api}/v1/payments/{payment_id}",
+            headers=mp_headers(),
+            timeout=15,
         )
-        pr.raise_for_status()
-        pago_mp = pr.json()
-        status = pago_mp.get("status")
+        r.raise_for_status()
+        pago_mp = r.json()
+        status = (pago_mp.get("status") or "").lower()
         if status != "approved":
+            app.logger.info(f"[MP] payment {payment_id} status={status} (no se procesa)")
             return "ok", 200
 
-        # idempotencia
+        # --- idempotencia por mp_payment_id ---
         ya = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
         if ya:
             return "ok", 200
 
-        # datos de producto/slot/litros
-        ext = pago_mp.get("external_reference", "0:0")
+        # product_id / slot_id: primero external_reference "prod:slot",
+        # fallback a metadata {product_id, slot_id}
+        ext = pago_mp.get("external_reference") or ""
         try:
             product_id, slot_id = [int(x) for x in ext.split(":")]
         except Exception:
             md = pago_mp.get("metadata") or {}
             product_id = int(md.get("product_id", 0))
-            slot_id    = int(md.get("slot_id", 0))
-
-        md = pago_mp.get("metadata") or {}
-        litros = float(md.get("litros", 1))  # <- litros por operación
+            slot_id = int(md.get("slot_id", 0))
 
         prod = Producto.query.get(product_id)
-        monto_ars = float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))
+        monto = float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))
 
         # registrar pago
         reg = Pago(
             mp_payment_id=str(payment_id),
             product_id=product_id,
             slot_id=slot_id,
-            monto=monto_ars,
+            monto=monto,
             estado="approved",
             procesado=False,
         )
         db.session.add(reg)
 
-        # descontar stock en litros
+        # descontar 1L (ajusta a tu lógica si vendés por otra unidad)
         if prod and prod.cantidad > 0:
-            prod.cantidad = max(0.0, float(prod.cantidad) - float(litros))
+            prod.cantidad = max(0.0, float(prod.cantidad) - 1.0)
 
         db.session.commit()
 
-        # publicar orden para el ESP con litros
-        publicar_orden_mqtt(order_id=reg.id, slot=slot_id, product_id=product_id, amount=litros)
+        # publicar orden al ESP por MQTT (si está configurado)
+        publicar_orden_mqtt(
+            order_id=reg.id,
+            slot=slot_id,
+            product_id=product_id,
+            amount=monto,
+        )
 
         return "ok", 200
 
     except requests.HTTPError as e:
-        app.logger.error(f"[MP] HTTPError: {e} - {getattr(e, 'response', None)}")
+        # Log con URL para diagnosticar 404 de ambiente/token
+        try:
+            url = e.request.url  # puede no existir
+        except Exception:
+            url = "?"
+        app.logger.error(f"[MP] HTTPError: {e} url={url}")
         return "ok", 200
     except Exception as e:
         app.logger.exception(f"[MP] Error webhook: {e}")
