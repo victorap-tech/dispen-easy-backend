@@ -8,6 +8,7 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.sql import func
 import requests
+import sqlalchemy import text
 
 # MQTT (opcional)
 import paho.mqtt.client as mqtt
@@ -312,21 +313,21 @@ def crear_preferencia():
 @app.post("/api/mp/webhook")
 def mp_webhook():
     try:
-        args  = request.args or {}
-        body  = request.get_json(silent=True) or {}
-        topic = args.get("topic") or body.get("type") or ""  # payment | merchant_order
+        # MP puede mandar ?type=payment&id=... OR ?topic=merchant_order&id=...
+        args = request.args or {}
+        body = request.get_json(silent=True) or {}
 
-        # ids posibles
+        topic = args.get("topic") or args.get("type")
         payment_id = args.get("id") if topic == "payment" else None
         merchant_order_id = args.get("id") if topic == "merchant_order" else None
 
-        # Sandbox o Producción según live_mode en el POST de MP
+        # live_mode True=producción False=sandbox
         live_mode = bool(body.get("live_mode", True))
-        base_api  = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+        base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
         app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
 
-        # Si enviaron merchant_order, obtengo el/los payments y me quedo con el primero
+        # Si vino merchant_order, primero obtener el/los payments
         if topic == "merchant_order" and merchant_order_id:
             r_mo = requests.get(
                 f"{base_api}/merchant_orders/{merchant_order_id}",
@@ -341,15 +342,20 @@ def mp_webhook():
                 return "ok", 200
             payment_id = str(pays[0].get("id"))
 
-        # Si no tengo payment_id hasta acá, intento extraerlo del body.data.id
         if not payment_id:
-            data_obj = (body.get("data") or {})
-            payment_id = data_obj.get("id")
-        if not payment_id:
-            # Nada que hacer
+            # si no hay payment_id, nada que hacer
             return "ok", 200
 
-        # Buscar info del pago
+        # --- IDEMPOTENCIA (evita el LIMIT %(param_1)s de SQLAlchemy) ---
+        # usamos SQL crudo para chequear si ya registramos ese pago
+        already = db.session.execute(
+            text("SELECT 1 FROM pago WHERE mp_payment_id = :mpid LIMIT 1"),
+            {"mpid": str(payment_id)},
+        ).first()
+        if already:
+            return "ok", 200
+
+        # Traer datos del pago
         r = requests.get(
             f"{base_api}/v1/payments/{payment_id}",
             headers=mp_headers(),
@@ -357,54 +363,54 @@ def mp_webhook():
         )
         r.raise_for_status()
         pago_mp = r.json()
-
         status = pago_mp.get("status")
+
+        # Solo seguimos con approved
         if status != "approved":
-            app.logger.info(f"[MP] payment {payment_id} con estado {status}, se ignora.")
+            app.logger.info(f"[MP] payment {payment_id} status={status}")
             return "ok", 200
 
-        # Idempotencia: ¿ya lo guardé?
-        try:
-            ya = db.session.query(Pago).filter(Pago.mp_payment_id == str(payment_id)).first()
-            if ya:
-                return "ok", 200
-        except Exception as e:
-            app.logger.exception(f"[DB] Error buscando pago {payment_id}: {e}")
-            return "ok", 200
-
-        # Obtengo product_id y slot_id del external_reference o del metadata
+        # product/slot desde external_reference o metadata
         ext = pago_mp.get("external_reference", "0:0")
         try:
             product_id, slot_id = [int(x) for x in ext.split(":")]
         except Exception:
             md = pago_mp.get("metadata") or {}
             product_id = int(md.get("product_id", 0))
-            slot_id    = int(md.get("slot_id", 0))
+            slot_id = int(md.get("slot_id", 0))
 
-        prod  = Producto.query.get(product_id)
-        monto = int(round(float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))))
+        prod = Producto.query.get(product_id)
+        monto = float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))
 
         # Registrar pago
         reg = Pago(
             mp_payment_id=str(payment_id),
-            estado="approved",
-            producto=prod.nombre if prod else None,
-            procesado=False,
+            product_id=product_id,
             slot_id=slot_id,
             monto=monto,
-            raw=pago_mp,
-            product_id=product_id,
+            estado="approved",
+            procesado=False,
+            raw=pago_mp,  # opcional: guardamos JSON completo
         )
         db.session.add(reg)
 
-        # descontar stock (1 litro por defecto)
+        # Descontar 1 unidad (en litros/unidades según tu modelo)
         if prod and prod.cantidad > 0:
             prod.cantidad = max(0.0, float(prod.cantidad) - 1.0)
 
         db.session.commit()
 
-        # Publicar orden para el ESP
-        publicar_orden_mqtt(order_id=reg.id, slot=slot_id, product_id=product_id, amount=monto)
+        # Publicar orden para el ESP (MQTT)
+        try:
+            publicar_orden_mqtt(
+                order_id=reg.id,
+                slot=slot_id,
+                product_id=product_id,
+                amount=monto,
+            )
+        except Exception as _:
+            # no frenamos el webhook si MQTT falla
+            app.logger.warning("[MQTT] no publicado (ignorado en webhook)")
 
         return "ok", 200
 
