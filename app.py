@@ -7,8 +7,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.sql import func
+from sqlalchemy import text
 import requests
-import sqlalchemy import text
+
 
 # MQTT (opcional)
 import paho.mqtt.client as mqtt
