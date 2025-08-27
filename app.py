@@ -20,7 +20,11 @@ ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")           # token de PROD (o el 
 MP_WEBHOOK_URL = os.getenv("MP_WEBHOOK_URL", "")          # https://.../api/mp/webhook
 MQTT_ENABLED = bool(os.getenv("MQTT_ENABLED", "0") == "1") # opcional
 
+from flask_cors import CORS
+
 app = Flask(__name__)
+CORS(app)
+
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
