@@ -365,7 +365,7 @@ def mp_webhook():
 
         # Idempotencia: ¿ya lo guardé?
         try:
-            ya = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+            ya = db.session.query(Pago).filter(Pago.mp_payment_id == str(payment_id)).first()
             if ya:
                 return "ok", 200
         except Exception as e:
