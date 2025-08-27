@@ -192,198 +192,139 @@ def productos_reset(pid):
 # ----------------------- MercadoPago: crear preferencia -------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
+    data = request.get_json(force=True, silent=True) or {}
+    product_id = int(data.get("product_id") or 0)
+    prod = Producto.query.get(product_id)
+    if not prod or not prod.habilitado:
+        return jsonify({"error": "producto no disponible"}), 400
+
+    body = {
+        "items": [{
+            "title": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(prod.precio),
+        }],
+        "metadata": {
+            "slot_id": prod.slot_id,
+            "product_id": prod.id,
+            "producto": prod.nombre,
+        },
+        # IMPORTANTE: auto_return + back_urls + notification_url
+        "auto_return": "approved",
+        "back_urls": {
+            "success": os.getenv("WEB_URL", "https://google.com"),
+            "failure": os.getenv("WEB_URL", "https://google.com"),
+            "pending": os.getenv("WEB_URL", "https://google.com"),
+        },
+        "notification_url": f"{request.url_root.rstrip('/')}/api/mp/webhook",
+        "statement_descriptor": "DISPEN-EASY",
+    }
+
+    app.logger.info(f"[MP] preferencia req → {body}")
+    r = requests.post(
+        "https://api.mercadopago.com/checkout/preferences",
+        headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                 "Content-Type": "application/json"},
+        json=body, timeout=20
+    )
     try:
-        data = request.get_json(force=True)
-        # Permitimos dos variantes desde el front:
-        # a) { product_id }  → buscamos el producto
-        # b) { producto, precio, slot_id }  → usamos lo enviado
-        product_id = data.get("product_id")
-        if product_id:
-            p = Producto.query.get_or_404(int(product_id))
-            title = p.nombre
-            unit_price = float(p.precio)
-            slot_id = p.slot_id
-            product_id_num = p.id
-        else:
-            title = str(data.get("producto", "Producto")).strip() or "Producto"
-            unit_price = float(data.get("precio", 0))
-            slot_id = int(data.get("slot_id", 0)) or None
-            product_id_num = int(data.get("product_id", 0)) or None
-
-        if unit_price <= 0:
-            return json_error("Precio inválido")
-
-        base_body = {
-            "items": [
-                {
-                    "title": title,
-                    "quantity": 1,
-                    "currency_id": "ARS",
-                    "unit_price": unit_price
-                }
-            ],
-            "statement_descriptor": "DISPEN-EASY",
-            "auto_return": "approved",
-        }
-
-        # metadata útil: slot/producto
-        base_body["metadata"] = {
-            "slot_id": slot_id,
-            "product_id": product_id_num,
-            "producto": title
-        }
-
-        # (opcional) back_urls (no rompemos si el front no las necesita)
-        base_body["back_urls"] = {
-            "success": "https://dispen-easy-web-production.up.railway.app/",
-            "failure": "https://dispen-easy-web-production.up.railway.app/",
-            "pending": "https://dispen-easy-web-production.up.railway.app/"
-        }
-
-        r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers=mp_headers(),
-            json=base_body,
-            timeout=25
-        )
-        app.logger.info(f"[MP] preferencia req → {base_body}")
         r.raise_for_status()
-        pref = r.json()
+    except Exception:
+        app.logger.exception("[MP] error al crear preferencia: %s %s",
+                             r.status_code, r.text[:400])
+        return jsonify({"error": "mp_preference_failed", "status": r.status_code, "body": r.text}), 500
 
-        # Devolvemos ambos links si están
-        link = pref.get("init_point") or pref.get("sandbox_init_point")
-        return jsonify({
-            "ok": True,
-            "preference_id": pref.get("id"),
-            "init_point": pref.get("init_point"),
-            "sandbox_init_point": pref.get("sandbox_init_point"),
-            "link": link
-        })
-    except requests.HTTPError as e:
-        try:
-            detail = e.response.json()
-        except Exception:
-            detail = e.response.text if e.response is not None else str(e)
-        app.logger.exception(f"[MP] Error creando preferencia: {detail}")
-        return json_error("MercadoPago rechazó la preferencia", 502, {"detail": detail})
-    except Exception as e:
-        app.logger.exception("[MP] Error inesperado en preferencia")
-        return json_error("Error interno creando preferencia", 500, {"detail": str(e)})
-
+    pref = r.json() or {}
+    # Siempre usá init_point; sandbox_init_point existe sólo con token TEST
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    return jsonify({"ok": True, "link": link, "raw": pref})
 # ----------------------- Webhook MP --------------------------------
 @app.post("/api/mp/webhook")
-@app.post("/webhook")  # alias por si tenés esta URL cargada en MP
 def mp_webhook():
-    """
-    Soporta notificaciones con:
-    - query params: ?topic=payment&type=payment&id=123...
-    - body con resource / merchant_order
-    Maneja live_mode para elegir api.mercadopago.com vs api.sandbox.mercadopago.com
-    """
-    try:
-        args = request.args or {}
-        body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {}
+    args = request.args or {}
+    topic = args.get("topic") or body.get("type")  # payment / merchant_order
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-        topic = args.get("topic") or args.get("type") or body.get("type")
-        payment_id = str(args.get("id") or "")
-        merchant_order_id = None
+    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
+    app.logger.info(f"[MP] raw body={body}")
 
-        # live_mode (True=prod, False=sandbox)
-        live_mode = bool(body.get("live_mode", True))
-        base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+    payment_id = None
+    merchant_order_id = None
 
-        # A veces MP manda un body con 'resource' apuntando a merchant_order
-        if body.get("resource") and "merchant_orders" in body.get("resource", ""):
-            topic = "merchant_order"
-            merchant_order_id = body["resource"].rstrip("/").split("/")[-1]
-
-        app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
-        app.logger.info(f"[MP] raw body={body}")
-
-        # Si topic==merchant_order buscamos el/los payments y tomamos el primero
-        if topic == "merchant_order" and not payment_id:
+    # 1) caso payment: puede venir resource ó id en data.id
+    if topic == "payment":
+        if "resource" in body:  # formato viejo
             try:
-                r_mo = requests.get(
-                    f"{base_api}/merchant_orders/{merchant_order_id}",
-                    headers=mp_headers(),
-                    timeout=15
-                )
-                r_mo.raise_for_status()
-                mo = r_mo.json()
-                pays = mo.get("payments") or []
-                if not pays:
-                    app.logger.warning(f"[MP] merchant_order {merchant_order_id} sin payments")
-                    return "ok", 200
-                payment_id = str(pays[0].get("id"))
-            except Exception as e:
-                app.logger.exception("[MP] fallo consultando merchant_order")
-                return "ok", 200
-
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                pass
         if not payment_id:
-            app.logger.warning("[MP] No se encontró payment_id en la notificación")
-            return "ok", 200
+            payment_id = (body.get("data") or {}).get("id") or args.get("id")
 
-        # Consultar el detalle del pago
-        try:
-            r_pay = requests.get(
-                f"{base_api}/v1/payments/{payment_id}",
-                headers=mp_headers(),
-                timeout=20
-            )
-            r_pay.raise_for_status()
-            pay = r_pay.json()
-        except requests.HTTPError as e:
-            app.logger.exception(f"[MP] HTTPError obteniendo pago {payment_id}")
-            return "ok", 200
-        except Exception:
-            app.logger.exception(f"[MP] Error obteniendo pago {payment_id}")
-            return "ok", 200
+    # 2) caso merchant_order
+    if topic == "merchant_order":
+        merchant_order_id = args.get("id") or (body.get("data") or {}).get("id")
 
-        status = str(pay.get("status", ""))
-        description = (pay.get("description") or "")  # a veces lo usamos para producto
-        metadata = pay.get("metadata") or {}
-        slot_id = metadata.get("slot_id") or None
-        product_id = metadata.get("product_id") or None
-        total_paid = pay.get("transaction_details", {}).get("total_paid_amount")
+    app.logger.info(f"[MP] parsed payment_id={payment_id} merchant_order_id={merchant_order_id}")
 
-        # Si no vino metadata, tratamos de inferir
-        if not product_id and description:
-            # En tu flujo podés setear 'description' con el nombre del producto
-            prod = Producto.query.filter(Producto.nombre.ilike(description)).first()
-            if prod:
-                product_id = prod.id
-                slot_id = slot_id or prod.slot_id
-
-        # Upsert pago
-        pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-        if not pago:
-            pago = Pago(
-                mp_payment_id=str(payment_id),
-                estado=status,
-                producto=description or (metadata.get("producto") or "Producto"),
-                dispensado=False,
-                slot_id=slot_id,
-                monto=int(total_paid) if total_paid is not None else None,
-                product_id=product_id,
-                raw=pay
-            )
-            db.session.add(pago)
+    # Si vino merchant_order, buscar el/los payments
+    if topic == "merchant_order" and merchant_order_id:
+        r_mo = requests.get(f"{base_api}/merchant_orders/{merchant_order_id}",
+                            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+        if r_mo.ok:
+            pays = (r_mo.json() or {}).get("payments") or []
+            if pays:
+                payment_id = str(pays[0].get("id"))
+            else:
+                app.logger.warning(f"[MP] merchant_order {merchant_order_id} sin payments")
         else:
-            pago.estado = status
-            pago.monto = int(total_paid) if total_paid is not None else pago.monto
-            pago.slot_id = slot_id or pago.slot_id
-            pago.producto = description or pago.producto
-            pago.product_id = product_id or pago.product_id
-            pago.raw = pay
+            app.logger.error(f"[MP] MO {merchant_order_id} error {r_mo.status_code}: {r_mo.text[:300]}")
 
-        db.session.commit()
-        app.logger.info(f"[MP] guardado pago {payment_id} estado={status}")
+    if not payment_id:
+        app.logger.warning("[MP] No se encontró payment_id en la notificación")
         return "ok", 200
 
-    except Exception as e:
+    # Traer el pago
+    r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
+                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+    try:
+        r_pay.raise_for_status()
+    except Exception:
+        app.logger.exception("[MP] HTTPError: %s %s", r_pay.status_code, r_pay.text[:400])
+        return "ok", 200
+
+    pay = r_pay.json() or {}
+    app.logger.info(f"[MP] payment {payment_id} status={pay.get('status')} amount={pay.get('transaction_amount')}")
+
+    # Guardar/actualizar en DB
+    p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+    if not p:
+        p = Pago(
+            mp_payment_id=str(payment_id),
+            estado=pay.get("status") or "pending",
+            producto=(pay.get("description") or (pay.get("additional_info", {}).get("items") or [{}])[0].get("title") or ""),
+            dispensado=False,
+            slot_id=int((pay.get("metadata") or {}).get("slot_id") or 0),
+            monto=int(round(float(pay.get("transaction_amount") or 0))),
+            product_id=int((pay.get("metadata") or {}).get("product_id") or 0),
+            raw=pay,
+        )
+        db.session.add(p)
+    else:
+        p.estado = pay.get("status") or p.estado
+        p.monto = int(round(float(pay.get("transaction_amount") or p.monto)))
+        p.raw = pay
+
+    try:
+        db.session.commit()
+    except Exception:
         db.session.rollback()
-        app.logger.exception("[MP] Error procesando webhook")
-        return "ok", 200  # MP reintentará; no queremos 500
+        app.logger.exception("[DB] error guardando pago %s", payment_id)
+
+    return "ok", 200
 
 # -------------------------------------------------------------------
 # Run (local)
