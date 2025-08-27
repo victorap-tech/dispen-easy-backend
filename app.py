@@ -119,16 +119,16 @@ class Producto(db.Model):
 class Pago(db.Model):
     __tablename__ = "pago"
 
-    id            = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), unique=True, nullable=False)
-    estado        = db.Column(db.String(80),  nullable=False)        # approved/pending/rejected/...
-    producto      = db.Column(db.String(120))                         # nombre del producto (opcional)
-    procesado     = db.Column(db.Boolean, default=False, nullable=False)
-    slot_id       = db.Column(db.Integer)
-    monto         = db.Column(db.Integer)                             # entero para ARS (opcional)
-    raw           = db.Column(db.JSON)                                # JSON completo del pago
-    created_at    = db.Column(db.DateTime(timezone=True), server_default=func.now())
-    product_id    = db.Column(db.Integer)
+    estado = db.Column(db.String(80), nullable=False)
+    producto = db.Column(db.String(120), nullable=False)
+    dispensado = db.Column(db.Boolean, default=False, nullable=False)  # 👈 AÑADIR
+    slot_id = db.Column(db.Integer, nullable=True)
+    monto = db.Column(db.Float, nullable=True)
+    raw = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now())
+    product_id = db.Column(db.Integer, db.ForeignKey("producto.id"), nullable=True)
 
     def to_dict(self):
         return {
