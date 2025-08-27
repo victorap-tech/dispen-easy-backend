@@ -300,117 +300,58 @@ def crear_preferencia():
 # - descuenta stock (litros)
 # - publica orden MQTT (slot)
 # --------------------------------
-@app.post("/api/mp/webhook")
+@app.route("/api/mp/webhook", methods=["POST"])
 def mp_webhook():
-    try:
-        # --- leer datos que pueden venir por query o por body ---
-        args = request.args or {}
-        body = request.get_json(silent=True) or {}
+    args = request.args
+    body = request.get_json(silent=True) or {}
 
-        # MP puede mandar: ?type=payment&id=...  ó  ?topic=merchant_order&id=...
-        topic = (args.get("topic") or args.get("type") or body.get("type") or "").lower()
-        payment_id = args.get("id")  # si topic/type = payment
-        merchant_order_id = args.get("id") if topic == "merchant_order" else None
+    # Detectar tipo de evento
+    topic = args.get("topic") or body.get("type")
+    payment_id = args.get("id") or (body.get("data") or {}).get("id")
 
-        # ignoramos live_mode: siempre usamos el endpoint productivo
-        live_mode = bool(body.get("live_mode", True))  # (si lo querés para logs)
-        base_api  = "https://api.mercadopago.com"
+    if not payment_id:
+        app.logger.warning(f"[MP] Webhook sin payment_id válido: {body}")
+        return "ok", 200
 
-        app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
+    # Live o sandbox
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-        # Si vino merchant_order, obtener el/los payments primero
-        if topic == "merchant_order" and merchant_order_id:
-            r_mo = requests.get(
-                f"{base_api}/merchant_orders/{merchant_order_id}",
+    app.logger.info(f"[MP] webhook recibido topic={topic}, payment_id={payment_id}, live_mode={live_mode}")
+
+    # Reintentar consulta a MP (máx 3 intentos)
+    pago_mp = None
+    for intento in range(3):
+        try:
+            r = requests.get(
+                f"{base_api}/v1/payments/{payment_id}",
                 headers=mp_headers(),
-                timeout=15,
+                timeout=15
             )
-            r_mo.raise_for_status()
-            mo = r_mo.json()
-            pays = mo.get("payments") or []
-            if not pays:
-                app.logger.warning(f"[MP] merchant_order {merchant_order_id} sin payments")
-                return "ok", 200
-            payment_id = str(pays[0].get("id"))
+            if r.status_code == 200:
+                pago_mp = r.json()
+                break
+            else:
+                app.logger.warning(f"[MP] intento {intento+1}: {r.status_code} para payment_id={payment_id}")
+        except Exception as e:
+            app.logger.error(f"[MP] Error consultando pago {payment_id}: {e}")
+        time.sleep(2)  # esperar 2 segundos antes de reintentar
 
-        # Si aún no tenemos payment_id, intentar desde body.data.id
-        if not payment_id:
-            data = body.get("data") or {}
-            payment_id = data.get("id")
-        if not payment_id:
-            app.logger.warning("[MP] webhook sin payment_id/merchant_order_id")
-            return "ok", 200
-
-        # --- buscar el pago en el API correcto ---
-        app.logger.info(f"[MP] consultando payment_id={payment_id} api={base_api}")
-        r = requests.get(
-            f"{base_api}/v1/payments/{payment_id}",
-            headers=mp_headers(),
-            timeout=15,
-        )
-        r.raise_for_status()
-        pago_mp = r.json()
-        status = (pago_mp.get("status") or "").lower()
-        if status != "approved":
-            app.logger.info(f"[MP] payment {payment_id} status={status} (no se procesa)")
-            return "ok", 200
-
-        # --- idempotencia por mp_payment_id ---
-        ya = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-        if ya:
-            return "ok", 200
-
-        # product_id / slot_id: primero external_reference "prod:slot",
-        # fallback a metadata {product_id, slot_id}
-        ext = pago_mp.get("external_reference") or ""
-        try:
-            product_id, slot_id = [int(x) for x in ext.split(":")]
-        except Exception:
-            md = pago_mp.get("metadata") or {}
-            product_id = int(md.get("product_id", 0))
-            slot_id = int(md.get("slot_id", 0))
-
-        prod = Producto.query.get(product_id)
-        monto = float(pago_mp.get("transaction_amount", prod.precio if prod else 0.0))
-
-        # registrar pago
-        reg = Pago(
-            mp_payment_id=str(payment_id),
-            product_id=product_id,
-            slot_id=slot_id,
-            monto=monto,
-            estado="approved",
-            procesado=False,
-        )
-        db.session.add(reg)
-
-        # descontar 1L (ajusta a tu lógica si vendés por otra unidad)
-        if prod and prod.cantidad > 0:
-            prod.cantidad = max(0.0, float(prod.cantidad) - 1.0)
-
-        db.session.commit()
-
-        # publicar orden al ESP por MQTT (si está configurado)
-        publicar_orden_mqtt(
-            order_id=reg.id,
-            slot=slot_id,
-            product_id=product_id,
-            amount=monto,
-        )
-
+    if not pago_mp:
+        app.logger.error(f"[MP] No se pudo obtener pago {payment_id} después de reintentos")
         return "ok", 200
 
-    except requests.HTTPError as e:
-        # Log con URL para diagnosticar 404 de ambiente/token
-        try:
-            url = e.request.url  # puede no existir
-        except Exception:
-            url = "?"
-        app.logger.error(f"[MP] HTTPError: {e} url={url}")
-        return "ok", 200
-    except Exception as e:
-        app.logger.exception(f"[MP] Error webhook: {e}")
-        return "ok", 200
+    # Guardar en base de datos
+    db.session.add(Pago(
+        mp_payment_id=str(payment_id),
+        estado=pago_mp.get("status"),
+        monto=pago_mp.get("transaction_amount"),
+        procesado=False
+    ))
+    db.session.commit()
+
+    app.logger.info(f"[MP] Pago {payment_id} registrado en base con estado={pago_mp.get('status')}")
+    return "ok", 200
 
 
 # --------------------------------
