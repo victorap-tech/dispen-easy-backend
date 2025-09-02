@@ -247,21 +247,36 @@ def crear_preferencia():
     return jsonify({"ok": True, "link": link, "raw": pref})
 
 # ----------------------- Webhook MP ---------------------------
+# ----------------------- Webhook MP (robusto) ---------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
-    if not require_token():
+    if not ACCESS_TOKEN:
+        # No rompas la simulación si falta token
+        app.logger.error("[MP] MP_ACCESS_TOKEN no configurado")
         return "ok", 200
 
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")
+    topic = args.get("topic") or body.get("type")  # "payment" o "merchant_order"
     live_mode = bool(body.get("live_mode", True))
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-    # obtener payment_id
+    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)} body={body}")
+
     payment_id = None
+
+    # 1) topic=payment (formatos nuevo/viejo)
     if topic == "payment":
-        payment_id = (body.get("data") or {}).get("id") or args.get("id")
+        # formato viejo: resource = ".../payments/<id>"
+        if "resource" in body and isinstance(body["resource"], str):
+            try:
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                payment_id = None
+        # formato nuevo: data.id o query ?id=
+        payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
+
+    # 2) topic=merchant_order -> obtener payment desde MO
     elif topic == "merchant_order":
         mo_id = args.get("id") or (body.get("data") or {}).get("id")
         if mo_id:
@@ -272,17 +287,16 @@ def mp_webhook():
                 if pays:
                     payment_id = str(pays[0].get("id"))
 
+    # Si no hay payment_id -> no romper (simulaciones suelen venir así)
     if not payment_id:
-        app.logger.warning("[MP] webhook sin payment_id")
+        app.logger.warning("[MP] webhook sin payment_id, se ignora")
         return "ok", 200
 
-    # Traer pago real
+    # Traer el pago real. En simulaciones MP usa ids inventados -> 404.
     r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
                          headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
-    try:
-        r_pay.raise_for_status()
-    except Exception:
-        app.logger.exception("[MP] HTTPError get payment: %s %s", r_pay.status_code, r_pay.text[:400])
+    if not r_pay.ok:
+        app.logger.warning(f"[MP] payment {payment_id} no encontrado (status {r_pay.status_code}). Ignorar.")
         return "ok", 200
 
     pay = r_pay.json() or {}
@@ -290,8 +304,6 @@ def mp_webhook():
 
     estado = pay.get("status") or "pending"
     monto = int(round(float(pay.get("transaction_amount") or 0)))
-
-    # nombre del producto: description / items[0].title / metadata.producto
     producto_txt = (
         pay.get("description")
         or ((pay.get("additional_info") or {}).get("items") or [{}])[0].get("title")
@@ -302,18 +314,18 @@ def mp_webhook():
     litros = int(meta.get("litros") or 1)
     product_id = int(meta.get("product_id") or 0)
 
-    # Upsert por mp_payment_id
+    # UPSERT por mp_payment_id
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
         p = Pago(
             mp_payment_id=str(payment_id),
             estado=estado,
-            producto=producto_txt,   # OBLIGATORIO
+            producto=producto_txt,
             dispensado=False,
             slot_id=slot_id,
             monto=monto,
             raw=pay,
-            product_id=product_id,   # nombre correcto
+            product_id=product_id,
             litros=litros,
         )
         db.session.add(p)
@@ -333,6 +345,11 @@ def mp_webhook():
         app.logger.exception("[DB] error guardando pago %s", payment_id)
 
     return "ok", 200
+
+# Alias por compatibilidad (si MP pega en /webhook)
+@app.post("/webhook")
+def mp_webhook_alias():
+    return mp_webhook()
 
 # -------------------------------------------------------------
 # Run local
