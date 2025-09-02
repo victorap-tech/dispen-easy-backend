@@ -191,64 +191,92 @@ def productos_reset(pid):
 # ------------------- MercadoPago: preferencia -----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = int(data.get("product_id") or 0)
-    litros = int(data.get("litros") or 1)
-
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return jsonify({"error": "producto no disponible"}), 400
-
-    if not BACKEND_BASE_URL:
-        return jsonify({"error": "BACKEND_BASE_URL no configurado"}), 500
-
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "category_id": str(prod.slot_id),
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
-        "metadata": {
-            "slot_id": prod.slot_id,
-            "product_id": prod.id,
-            "producto": prod.nombre,
-            "litros": litros,
-        },
-        "external_reference": f"{prod.id}|{prod.slot_id}|{litros}",
-        "auto_return": "approved",
-        "back_urls": {
-            "success": os.getenv("WEB_URL", "https://example.com"),
-            "failure": os.getenv("WEB_URL", "https://example.com"),
-            "pending": os.getenv("WEB_URL", "https://example.com"),
-        },
-        # 👇 clave: forzar https del backend público
-        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
-    }
-
-    app.logger.info(
-        f"[MP] creando preferencia → notification_url={body['notification_url']} "
-        f"meta={{'product_id': {prod.id}, 'slot_id': {prod.slot_id}, 'litros': {litros}}}"
-    )
-
-    r = requests.post(
-        "https://api.mercadopago.com/checkout/preferences",
-        headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
-        json=body, timeout=20
-    )
     try:
-        r.raise_for_status()
-    except Exception:
-        app.logger.exception("[MP] error al crear preferencia: %s %s", r.status_code, r.text[:400])
-        return jsonify({"error": "mp_preference_failed", "status": r.status_code, "body": r.text}), 500
+        data = request.get_json(force=True, silent=True) or {}
+        app.logger.info(f"[MP] preferencia input={data}")
 
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    return jsonify({"ok": True, "link": link, "raw": pref})
+        # --------- VALIDACIONES DE ENTORNO ---------
+        if not os.getenv("MP_ACCESS_TOKEN", "").strip():
+            app.logger.error("[MP] MP_ACCESS_TOKEN faltante")
+            return jsonify({"error": "MP_ACCESS_TOKEN faltante"}), 500
 
+        BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
+        if not BACKEND_BASE_URL:
+            app.logger.error("[MP] BACKEND_BASE_URL no configurado")
+            return jsonify({"error": "BACKEND_BASE_URL no configurado"}), 500
+
+        # --------- ENTRADA DESDE EL ADMIN ---------
+        product_id = int(data.get("product_id") or 0)
+        litros = int(data.get("litros") or 1)
+
+        prod = Producto.query.get(product_id)
+        if not prod:
+            app.logger.warning(f"[MP] producto_id inválido: {product_id}")
+            return jsonify({"error": "producto no encontrado"}), 400
+        if not prod.habilitado:
+            return jsonify({"error": "producto no disponible"}), 400
+
+        body = {
+            "items": [{
+                "id": str(prod.id),                 # respaldo de product_id
+                "title": prod.nombre,
+                "category_id": str(prod.slot_id),   # respaldo de slot_id
+                "quantity": 1,
+                "currency_id": "ARS",
+                "unit_price": float(prod.precio),
+            }],
+            "metadata": {
+                "slot_id": prod.slot_id,
+                "product_id": prod.id,
+                "producto": prod.nombre,
+                "litros": litros,
+            },
+            "external_reference": f"{prod.id}|{prod.slot_id}|{litros}",
+
+            "auto_return": "approved",
+            "back_urls": {
+                "success": os.getenv("WEB_URL", "https://example.com"),
+                "failure": os.getenv("WEB_URL", "https://example.com"),
+                "pending": os.getenv("WEB_URL", "https://example.com"),
+            },
+            # **clave**: siempre https público
+            "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
+            "statement_descriptor": "DISPEN-EASY",
+        }
+
+        app.logger.info(
+            f"[MP] creando preferencia → notification_url={body['notification_url']} "
+            f"meta={{'product_id': {prod.id}, 'slot_id': {prod.slot_id}, 'litros': {litros}}}"
+        )
+
+        r = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {os.getenv('MP_ACCESS_TOKEN').strip()}",
+                "Content-Type": "application/json"
+            },
+            json=body, timeout=20
+        )
+
+        # Si falla el HTTP, devolvemos JSON con detalle
+        try:
+            r.raise_for_status()
+        except Exception:
+            app.logger.exception("[MP] error al crear preferencia: %s %s", r.status_code, r.text[:400])
+            return jsonify({"error": "mp_preference_failed", "status": r.status_code, "body": r.text}), 502
+
+        pref = r.json() or {}
+        link = pref.get("init_point") or pref.get("sandbox_init_point")
+        if not link:
+            app.logger.error("[MP] respuesta sin init_point: %s", pref)
+            return jsonify({"error": "mp_response_without_link", "body": pref}), 502
+
+        return jsonify({"ok": True, "link": link, "raw": pref}), 200
+
+    except Exception as e:
+        # Captura de cualquier excepción no prevista → siempre JSON (no HTML)
+        app.logger.exception("[MP] preferencia exception")
+        return jsonify({"error": "internal", "detail": str(e)}), 500
 
 # ----------------------- Webhook MP (robusto) ---------------------------
 @app.post("/api/mp/webhook")
