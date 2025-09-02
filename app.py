@@ -310,116 +310,84 @@ def _to_int(x, default=0):
 
 @app.post("/api/mp/webhook")
 def mp_webhook():
-    try:
-        if not MP_ACCESS_TOKEN:
-            app.logger.error("[MP] MP_ACCESS_TOKEN no configurado")
-            return "ok", 200
+    body = request.get_json(silent=True) or {}
+    args = request.args or {}
+    topic = args.get("topic") or body.get("type")  # 'payment' | 'merchant_order'
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-        body = request.get_json(silent=True) or {}
-        args = request.args or {}
-        topic = args.get("topic") or body.get("type")  # 'payment' o 'merchant_order'
-        base_api = "https://api.mercadopago.com"
+    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)} body={body}")
 
-        app.logger.info(f"[MP] webhook topic={topic} args={dict(args)} body={body}")
-
-        payment_id = None
-
-        # topic=payment (formato nuevo/viejo)
-        if topic == "payment":
-            if "resource" in body and isinstance(body["resource"], str):
-                try:
-                    payment_id = body["resource"].rstrip("/").split("/")[-1]
-                except Exception:
-                    payment_id = None
-            payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
-
-        # topic=merchant_order → buscar payments
-        if topic == "merchant_order" and not payment_id:
-            mo_id = args.get("id") or (body.get("data") or {}).get("id")
-            if mo_id:
-                r_mo = requests.get(f"{base_api}/merchant_orders/{mo_id}",
-                                    headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=15)
-                if r_mo.ok:
-                    pays = (r_mo.json() or {}).get("payments") or []
-                    if pays:
-                        payment_id = str(pays[0].get("id"))
-
+    payment_id = None
+    if topic == "payment":
+        if "resource" in body:
+            try:
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                pass
         if not payment_id:
-            app.logger.warning("[MP] webhook sin payment_id → ignorar")
+            payment_id = (body.get("data") or {}).get("id") or args.get("id")
+
+    if topic == "merchant_order":
+        merchant_order_id = args.get("id") or (body.get("data") or {}).get("id")
+        if merchant_order_id:
+            r_mo = requests.get(f"{base_api}/merchant_orders/{merchant_order_id}",
+                                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+            if r_mo.ok:
+                pays = (r_mo.json() or {}).get("payments") or []
+                if pays:
+                    payment_id = str(pays[0].get("id"))
+
+    if not payment_id:
+        app.logger.warning("[MP] sin payment_id")
+        return "ok", 200
+
+    r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
+                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+    if not r_pay.ok:
+        app.logger.error(f"[MP] error payment {payment_id}: {r_pay.status_code} {r_pay.text[:300]}")
+        return "ok", 200
+
+    pay = r_pay.json() or {}
+    estado = (pay.get("status") or "").lower()  # approved/rejected/pending…
+    md = pay.get("metadata") or {}
+    product_id = int(md.get("product_id") or 0)
+    slot_id    = int(md.get("slot_id") or 0)
+    litros     = int(md.get("litros") or 1)
+
+    # UPSERT por mp_payment_id (idempotente)
+    p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+    if p:
+        if p.estado == estado:
+            app.logger.info(f"[MP] dup notif payment={payment_id} estado={estado} (sin cambios)")
             return "ok", 200
+        p.estado = estado
+        p.product_id = p.product_id or product_id
+        p.slot_id = p.slot_id or slot_id
+        p.litros = p.litros or litros
+        p.monto = int(round(float(pay.get("transaction_amount") or p.monto or 0)))
+        p.raw = pay
+    else:
+        p = Pago(
+            mp_payment_id=str(payment_id),
+            estado=estado,
+            product_id=product_id,
+            slot_id=slot_id,
+            litros=litros,
+            monto=int(round(float(pay.get("transaction_amount") or 0))),
+            dispensado=False,
+            raw=pay,
+        )
+        db.session.add(p)
 
-        # Traer pago real
-        r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                             headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=15)
-        if not r_pay.ok:
-            app.logger.warning(f"[MP] payment {payment_id} no encontrado (status {r_pay.status_code}) → ignorar")
-            return "ok", 200
-
-        pay = r_pay.json() or {}
-        meta = pay.get("metadata") or {}
-        addi = pay.get("additional_info") or {}
-        items = addi.get("items") or []
-        it0 = items[0] if items else {}
-        ext = (pay.get("external_reference") or "").split("|")
-
-        estado = pay.get("status") or "pending"
-        monto = _to_int(pay.get("transaction_amount") or 0)
-        producto_txt = (
-            meta.get("producto")
-            or it0.get("title")
-            or pay.get("description")
-            or ""
-        )[:120]
-
-        product_id = _to_int(meta.get("product_id") or it0.get("id") or (ext[0] if len(ext) > 0 else 0))
-        slot_id    = _to_int(meta.get("slot_id")    or it0.get("category_id") or (ext[1] if len(ext) > 1 else 0))
-        litros     = _to_int(meta.get("litros")     or (ext[2] if len(ext) > 2 else 0))
-
-        # Upsert por mp_payment_id
-        p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-        if not p:
-            p = Pago(
-                mp_payment_id=str(payment_id),
-                estado=estado,
-                producto=producto_txt,
-                dispensado=False,
-                slot_id=slot_id,
-                litros=litros,
-                monto=monto,
-                product_id=product_id,
-                raw=pay,
-            )
-            db.session.add(p)
-        else:
-            p.estado = estado
-            p.producto = producto_txt or p.producto
-            p.slot_id = slot_id or p.slot_id
-            p.product_id = product_id or p.product_id
-            p.litros = litros or p.litros
-            p.monto = monto or p.monto
-            p.raw = pay
-
-        # (Opcional) Descontar stock al aprobar
-        # Comentá este bloque si preferís descontar recién cuando el ESP32 confirme la dispensación real.
-        if estado == "approved" and product_id:
-            prod = Producto.query.get(product_id)
-            if prod:
-                try:
-                    prod.cantidad = max(0, int(prod.cantidad) - int(litros or 1))
-                except Exception:
-                    pass
-
+    try:
         db.session.commit()
-        return "ok", 200
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("[DB] error upsert pago %s", payment_id)
 
-    except IntegrityError as ie:
-        db.session.rollback()
-        app.logger.warning(f"[DB] IntegrityError (probable duplicado): {ie}")
-        return "ok", 200
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception(f"[MP] excepción en webhook: {e}")
-        return "ok", 200
+    # IMPORTANTE: acá NO se descuenta stock
+    return "ok", 200
 
 # Aliases por compatibilidad de rutas
 @app.post("/webhook")
