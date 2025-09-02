@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from flask_migrate import Migrate
+from sqlalchemy.dialects.postgresql import JSONB
 
 # -------------------------------------------------------------------
 # Config
@@ -46,17 +47,22 @@ class Producto(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
 
+
+
 class Pago(db.Model):
     __tablename__ = "pago"
     id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
-    estado = db.Column(db.String(120), nullable=False)        # pending/approved/rejected
-    producto_id = db.Column(db.Integer, nullable=False)
-    slot_id = db.Column(db.Integer, nullable=False, default=0)   # nuevo
-    litros = db.Column(db.Integer, nullable=False, default=1)    # nuevo
-    monto = db.Column(db.Integer, nullable=False)
+    estado = db.Column(db.String(80), nullable=False)
+    producto = db.Column(db.String(120), nullable=False)      # <-- TEXTO (NOT NULL)
     dispensado = db.Column(db.Boolean, nullable=False, default=False)
+    slot_id = db.Column(db.Integer, nullable=True)
+    monto = db.Column(db.Integer, nullable=True)
+    raw = db.Column(JSONB, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+    product_id = db.Column(db.Integer, nullable=True)         # <-- NOMBRE CORRECTO
+    procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+    litros = db.Column(db.Integer, nullable=True)             # ya existe en tu DB
 
 # -------------------------------------------------------------------
 # Helpers
@@ -244,45 +250,82 @@ def crear_preferencia():
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")  # payment / merchant_order
+    topic = args.get("topic") or body.get("type")
     live_mode = bool(body.get("live_mode", True))
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
     payment_id = None
     if topic == "payment":
         payment_id = (body.get("data") or {}).get("id") or args.get("id")
+    elif topic == "merchant_order":
+        mo_id = args.get("id") or (body.get("data") or {}).get("id")
+        if mo_id:
+            r_mo = requests.get(f"{base_api}/merchant_orders/{mo_id}",
+                                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+            if r_mo.ok:
+                pays = (r_mo.json() or {}).get("payments") or []
+                if pays:
+                    payment_id = str(pays[0].get("id"))
 
     if not payment_id:
+        app.logger.warning("[MP] webhook sin payment_id")
         return "ok", 200
 
-    # Traer el pago real de MP
     r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                         headers=mp_auth_headers(), timeout=15)
+                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
     try:
         r_pay.raise_for_status()
     except Exception:
+        app.logger.exception("[MP] HTTPError get payment: %s %s", r_pay.status_code, r_pay.text[:400])
         return "ok", 200
 
     pay = r_pay.json() or {}
+    meta = pay.get("metadata") or {}
+    estado = pay.get("status") or "pending"
+    monto = int(round(float(pay.get("transaction_amount") or 0)))
 
+    # nombre del producto (puede venir en description o items[0].title)
+    producto_txt = (
+        pay.get("description")
+        or ((pay.get("additional_info") or {}).get("items") or [{}])[0].get("title")
+        or str(meta.get("producto") or "")
+    )[:120]
+
+    # valores de metadata
+    slot_id = int(meta.get("slot_id") or 0)
+    litros = int(meta.get("litros") or 1)
+    product_id = int(meta.get("product_id") or 0)
+
+    # UPSERT por mp_payment_id
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
         p = Pago(
             mp_payment_id=str(payment_id),
-            estado=pay.get("status") or "pending",
-            producto_id=int((pay.get("metadata") or {}).get("product_id") or 0),
-            slot_id=int((pay.get("metadata") or {}).get("slot_id") or 0),
-            litros=int((pay.get("metadata") or {}).get("litros") or 1),
-            monto=int(round(float(pay.get("transaction_amount") or 0))),
+            estado=estado,
+            producto=producto_txt,     # <-- OBLIGATORIO (NOT NULL)
             dispensado=False,
+            slot_id=slot_id,
+            monto=monto,
+            raw=pay,
+            product_id=product_id,     # <-- nombre correcto
+            litros=litros,
         )
         db.session.add(p)
     else:
-        p.estado = pay.get("status") or p.estado
-        p.monto = int(round(float(pay.get("transaction_amount") or p.monto)))
-        p.litros = int((pay.get("metadata") or {}).get("litros") or p.litros)
+        p.estado = estado
+        p.monto = monto
+        p.producto = producto_txt
+        p.slot_id = slot_id
+        p.product_id = product_id
+        p.litros = litros
+        p.raw = pay
 
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("[DB] error guardando pago %s", payment_id)
+
     return "ok", 200
 
 # -------------------------------------------------------------------
