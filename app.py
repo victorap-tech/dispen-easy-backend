@@ -343,7 +343,7 @@ def mp_webhook():
         return "ok", 200
 
     r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
+                         headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=15)
     if not r_pay.ok:
         app.logger.error(f"[MP] error payment {payment_id}: {r_pay.status_code} {r_pay.text[:300]}")
         return "ok", 200
