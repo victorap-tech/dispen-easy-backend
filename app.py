@@ -191,27 +191,24 @@ def productos_reset(pid):
 # ------------------- MercadoPago: preferencia -----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
-    if not require_token():
-        return jsonify({"error": "MP_ACCESS_TOKEN_not_set"}), 500
-
     data = request.get_json(force=True, silent=True) or {}
     product_id = int(data.get("product_id") or 0)
-    litros = max(1, int(data.get("litros") or 1))
+    litros = int(data.get("litros") or 1)
 
     prod = Producto.query.get(product_id)
-    if not prod:
-        return jsonify({"error": "producto_no_encontrado"}), 400
-    if not bool(prod.habilitado):
-        return jsonify({"error": "producto_no_habilitado"}), 400
+    if not prod or not prod.habilitado:
+        return jsonify({"error": "producto no disponible"}), 400
 
-    total = float(prod.precio) * litros
+    BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
+    if not BACKEND_BASE_URL:
+        return jsonify({"error": "BACKEND_BASE_URL no configurado"}), 500
 
     body = {
         "items": [{
-            "title": f"{prod.nombre} ({litros}L)",
+            "title": f"{prod.nombre} ({litros} L)",
             "quantity": 1,
             "currency_id": "ARS",
-            "unit_price": total,
+            "unit_price": float(prod.precio) * litros,
         }],
         "metadata": {
             "slot_id": prod.slot_id,
@@ -220,30 +217,39 @@ def crear_preferencia():
             "litros": litros,
         },
         "auto_return": "approved",
-        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
-        "notification_url": f"{request.url_root.rstrip('/')}/api/mp/webhook",
+        "back_urls": {
+            "success": os.getenv("WEB_URL", "https://example.com"),
+            "failure": os.getenv("WEB_URL", "https://example.com"),
+            "pending": os.getenv("WEB_URL", "https://example.com"),
+        },
+        # 👇 acá usamos siempre https desde BACKEND_BASE_URL
+        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
 
     app.logger.info(f"[MP] preferencia req → {body}")
-
     r = requests.post(
         "https://api.mercadopago.com/checkout/preferences",
-        headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        },
         json=body,
-        timeout=20,
+        timeout=20
     )
-
-    if not r.ok:
-        app.logger.error("[MP] crear preferencia %s: %s", r.status_code, r.text[:400])
-        return jsonify({"error": "mp_preference_failed", "status": r.status_code, "body": r.text}), 502
+    try:
+        r.raise_for_status()
+    except Exception:
+        app.logger.exception("[MP] error al crear preferencia: %s %s",
+                             r.status_code, r.text[:400])
+        return jsonify({
+            "error": "mp_preference_failed",
+            "status": r.status_code,
+            "body": r.text
+        }), 500
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link:
-        app.logger.error("[MP] preferencia sin init_point: %s", pref)
-        return jsonify({"error": "mp_no_init_point", "raw": pref}), 502
-
     return jsonify({"ok": True, "link": link, "raw": pref})
 
 
