@@ -231,71 +231,84 @@ def pagos_list():
 # -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
+    """
+    Crea la preferencia de MP con redundancia para slot/product_id/litros:
+    - metadata: { slot_id, product_id, litros, producto }
+    - external_reference: "pid=<id>;slot=<slot>;litros=<n>"
+    - items[0].id = product_id (fallback extra)
+    """
+    data = request.get_json(force=True, silent=True) or {}
+
+    # Producto y litros solicitados
+    product_id = int(data.get("product_id") or 0)
+    litros_req = int(data.get("litros") or 0)
+
+    prod = Producto.query.get(product_id)
+    if not prod or not prod.habilitado:
+        return jsonify({"error": "producto no disponible"}), 400
+
+    # Porción por defecto = porcion_litros del producto, o 1
+    litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
+
+    # Base URL del backend para armar notification_url (Railway, etc.)
+    backend_base = os.getenv("BACKEND_BASE_URL") or request.url_root.rstrip("/")
+    if not backend_base:
+        return jsonify({"error": "BACKEND_BASE_URL no configurado"}), 500
+
+    # Redundancia: external_reference para reconstruir si metadata no llega
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
+
+    body = {
+        "items": [{
+            "id": str(prod.id),              # fallback por si falta metadata
+            "title": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(prod.precio),
+        }],
+        "metadata": {
+            "slot_id": int(prod.slot_id),
+            "product_id": int(prod.id),
+            "producto": prod.nombre,
+            "litros": int(litros),
+        },
+        "external_reference": external_ref,  # fallback adicional
+        "auto_return": "approved",
+        "back_urls": {
+            "success": os.getenv("WEB_URL", "https://example.com"),
+            "failure": os.getenv("WEB_URL", "https://example.com"),
+            "pending": os.getenv("WEB_URL", "https://example.com"),
+        },
+        "notification_url": f"{backend_base}/api/mp/webhook",
+        "statement_descriptor": "DISPEN-EASY",
+    }
+
+    app.logger.info(f"[MP] preferencia req → {body}")
+
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        product_id = int(data.get("product_id") or 0)
-        litros = int(data.get("litros") or 0)  # si no llega, usamos porción configurada
-        if not MP_ACCESS_TOKEN:
-            return err_json("MP_ACCESS_TOKEN faltante", 500)
-        if not BACKEND_BASE_URL:
-            return err_json("BACKEND_BASE_URL no configurado", 500)
-
-        prod = Producto.query.get(product_id)
-        if not prod or not prod.habilitado:
-            return err_json("producto no disponible", 400)
-
-        if litros <= 0:
-            litros = int(prod.porcion_litros)
-
-        total = float(prod.precio) * litros
-
-        body = {
-            "items": [{
-                "id": str(prod.id),                        # respaldo de product_id
-                "title": f"{prod.nombre} ({litros}L)",
-                "category_id": str(prod.slot_id),          # respaldo de slot_id
-                "quantity": 1,
-                "currency_id": "ARS",
-                "unit_price": total,                       # total (1 ítem)
-            }],
-            "metadata": {
-                "slot_id": prod.slot_id,
-                "product_id": prod.id,
-                "producto": prod.nombre,
-                "litros": litros,
-            },
-            "external_reference": f"{prod.id}|{prod.slot_id}|{litros}",
-            "auto_return": "approved",
-            "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
-            "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
-            "statement_descriptor": "DISPEN-EASY",
-        }
-
-        app.logger.info(
-            f"[MP] creando preferencia → notification_url={body['notification_url']} "
-            f"meta={{product_id:{prod.id}, slot_id:{prod.slot_id}, litros:{litros}}}"
-        )
-
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}", "Content-Type": "application/json"},
-            json=body, timeout=20
+            headers={
+                "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=20,
         )
-        try:
-            r.raise_for_status()
-        except Exception:
-            app.logger.exception("[MP] error al crear preferencia: %s %s", r.status_code, r.text[:400])
-            return err_json("mp_preference_failed", 502, r.text)
-
-        pref = r.json() or {}
-        link = pref.get("init_point") or pref.get("sandbox_init_point")
-        if not link:
-            return err_json("mp_response_without_link", 502, pref)
-        return ok_json({"ok": True, "link": link, "raw": pref})
+        r.raise_for_status()
     except Exception as e:
-        app.logger.exception("[MP] preferencia exception")
-        return err_json("internal", 500, str(e))
+        status = getattr(r, "status_code", 0)
+        text = getattr(r, "text", "")
+        app.logger.exception("[MP] error al crear preferencia: %s %s", status, text[:400])
+        return jsonify({"error": "mp_preference_failed", "status": status, "detail": str(e), "body": text}), 500
 
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    if not link:
+        app.logger.error("[MP] preferencia creada sin init_point: %s", pref)
+        return jsonify({"error": "preferencia_sin_link", "raw": pref}), 500
+
+    return jsonify({"ok": True, "link": link, "raw": pref})
 # -------------------------------------------------------------
 # Mercado Pago: Webhook (robusto + fallbacks)
 # -------------------------------------------------------------
