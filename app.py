@@ -351,6 +351,52 @@ def mp_webhook():
 def mp_webhook_alias():
     return mp_webhook()
 
+#---------------Endpoint-------------------
+# ----------------------- Pagos: listado ---------------------------
+@app.get("/api/pagos")
+def pagos_list():
+    """
+    Lista de pagos más recientes.
+    Query params:
+      - limit: cantidad a devolver (default 50, máx 200)
+      - estado: filtrar por estado (ej: approved, pending, rejected)
+      - q: búsqueda parcial por mp_payment_id
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+        limit = max(1, min(limit, 200))
+    except Exception:
+        limit = 50
+
+    estado = (request.args.get("estado") or "").strip()
+    q_search = (request.args.get("q") or "").strip()
+
+    q = Pago.query
+    if estado:
+        q = q.filter(Pago.estado == estado)
+    if q_search:
+        # búsqueda simple por mp_payment_id contiene
+        q = q.filter(Pago.mp_payment_id.ilike(f"%{q_search}%"))
+
+    pagos = q.order_by(Pago.id.desc()).limit(limit).all()
+
+    return jsonify([
+        {
+            "id": p.id,
+            "mp_payment_id": p.mp_payment_id,
+            "estado": p.estado,
+            "producto": p.producto,
+            "product_id": p.product_id,
+            "slot_id": p.slot_id,
+            "litros": p.litros,
+            "monto": p.monto,
+            "dispensado": bool(p.dispensado),
+            "procesado": bool(p.procesado),
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in pagos
+    ])
+
 # -------------------------------------------------------------
 # Run local
 # -------------------------------------------------------------
