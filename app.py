@@ -324,48 +324,82 @@ def _to_int(x, default=0):
 @app.post("/api/mp/webhook")
 def mp_webhook():
     """
-    Webhook de MercadoPago:
-    - Recibe notificación (topic=payment o merchant_order).
-    - Pide al API oficial los detalles.
-    - Guarda/actualiza pago en DB con product_id, slot_id y litros.
-    - Evita duplicados con mp_payment_id único.
+    Webhook Mercado Pago:
+    - Lee payment_id de la notificación (payment o merchant_order).
+    - Consulta /v1/payments/{id} para obtener metadata confiable.
+    - Guarda/actualiza en tabla 'pago' (incluye product_id, slot_id, litros).
+    - No modifica stock aquí; eso sucede al marcar 'dispensado'.
     """
-    data = request.get_json(force=True, silent=True) or {}
-    app.logger.info(f"[MP] webhook body={data}")
+    body = request.get_json(silent=True) or {}
+    args = request.args or {}
+    topic = args.get("topic") or body.get("type")  # 'payment' o 'merchant_order'
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-    # Extraer payment_id (según tipo de notificación)
+    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
+    app.logger.info(f"[MP] raw body={body}")
+
     payment_id = None
-    if "data" in data and isinstance(data["data"], dict):
-        payment_id = data["data"].get("id")
-    if not payment_id and "id" in data:
-        payment_id = data.get("id")
-    if not payment_id:
-        app.logger.warning("[MP] webhook sin payment_id válido")
-        return "no payment_id", 200
 
-    # Confirmar datos desde MP
+    # 1) Notificación tipo payment
+    if topic == "payment":
+        # formato viejo con 'resource'
+        if "resource" in body and isinstance(body["resource"], str):
+            try:
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                pass
+        # formato nuevo con data.id o query param
+        if not payment_id:
+            payment_id = (body.get("data") or {}).get("id") or args.get("id")
+
+    # 2) Notificación tipo merchant_order -> buscar payments asociados
+    if topic == "merchant_order":
+        merchant_order_id = args.get("id") or (body.get("data") or {}).get("id")
+        if merchant_order_id:
+            try:
+                r_mo = requests.get(
+                    f"{base_api}/merchant_orders/{merchant_order_id}",
+                    headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                    timeout=15,
+                )
+                if r_mo.ok:
+                    pays = (r_mo.json() or {}).get("payments") or []
+                    if pays:
+                        payment_id = str(pays[0].get("id"))
+                    else:
+                        app.logger.warning(f"[MP] merchant_order {merchant_order_id} sin payments")
+                else:
+                    app.logger.error(f"[MP] MO {merchant_order_id} error {r_mo.status_code}: {r_mo.text[:300]}")
+            except Exception:
+                app.logger.exception(f"[MP] error consultando merchant_order {merchant_order_id}")
+
+    if not payment_id:
+        app.logger.warning("[MP] sin payment_id")
+        return "ok", 200
+
+    # 3) Traer el pago desde la API oficial
     try:
         r_pay = requests.get(
             f"{base_api}/v1/payments/{payment_id}",
-            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
             timeout=15,
         )
         r_pay.raise_for_status()
-    except Exception as e:
-        app.logger.exception(f"[MP] error consultando payment {payment_id}: {e}")
-        return "mp error", 200
+    except Exception:
+        app.logger.exception(f"[MP] error HTTP payments/{payment_id}: {getattr(r_pay,'status_code',None)} {getattr(r_pay,'text','')[:400]}")
+        return "ok", 200
 
     pay = r_pay.json() or {}
-    estado = (pay.get("status") or "").lower()  # approved / rejected / pending
-    raw_md = pay.get("metadata") or {}
+    estado = (pay.get("status") or "").lower()        # approved / rejected / pending
+    md = pay.get("metadata") or {}
+    product_id = int(md.get("product_id") or 0)
+    slot_id = int(md.get("slot_id") or 0)
+    litros = int(md.get("litros") or 0)
+    monto = float(pay.get("transaction_amount") or 0)
 
-    # --- Extraer metadata redundante ---
-    product_id = int(raw_md.get("product_id") or 0)
-    slot_id = int(raw_md.get("slot_id") or 0)
-    litros = int(raw_md.get("litros") or 0)
-
-    # Si no vino metadata, usar external_reference
-    if (not product_id or not slot_id) and pay.get("external_reference"):
+    # Fallback: intentar external_reference si falta metadata
+    if (not product_id or not slot_id or not litros) and pay.get("external_reference"):
         try:
             parts = {
                 kv.split("=")[0]: kv.split("=")[1]
@@ -378,12 +412,10 @@ def mp_webhook():
         except Exception:
             app.logger.warning(f"[MP] external_reference malformado: {pay['external_reference']}")
 
-    monto = float(pay.get("transaction_amount") or 0)
-
-    # --- Guardar en DB ---
-    pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-    if not pago:
-        pago = Pago(
+    # 4) Insertar/actualizar en DB (mp_payment_id es UNIQUE)
+    p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+    if not p:
+        p = Pago(
             mp_payment_id=str(payment_id),
             estado=estado,
             product_id=product_id,
@@ -393,25 +425,23 @@ def mp_webhook():
             dispensado=False,
             raw=pay,
         )
-        db.session.add(pago)
+        db.session.add(p)
     else:
-        pago.estado = estado
-        pago.product_id = product_id or pago.product_id
-        pago.slot_id = slot_id or pago.slot_id
-        pago.litros = litros or pago.litros
-        pago.monto = monto or pago.monto
-        pago.raw = pay
+        p.estado = estado
+        p.product_id = product_id or p.product_id
+        p.slot_id = slot_id or p.slot_id
+        p.litros = litros or p.litros
+        p.monto = monto or p.monto
+        p.raw = pay
 
     try:
         db.session.commit()
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        app.logger.exception(f"[MP] error guardando pago {payment_id}: {e}")
-        return "db error", 500
+        app.logger.exception(f"[DB] error guardando pago {payment_id}")
 
-    app.logger.info(f"[MP] pago {payment_id} → estado={estado}, pid={product_id}, slot={slot_id}, litros={litros}")
+    app.logger.info(f"[MP] payment {payment_id} estado={estado} pid={product_id} slot={slot_id} litros={litros}")
     return "ok", 200
-
 # Aliases por compatibilidad de rutas
 @app.post("/webhook")
 def mp_webhook_alias_root():
