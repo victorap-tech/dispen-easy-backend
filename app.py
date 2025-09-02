@@ -360,7 +360,7 @@ def mp_webhook():
             try:
                 r_mo = requests.get(
                     f"{base_api}/merchant_orders/{merchant_order_id}",
-                    headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                    headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
                     timeout=15,
                 )
                 if r_mo.ok:
@@ -382,7 +382,7 @@ def mp_webhook():
     try:
         r_pay = requests.get(
             f"{base_api}/v1/payments/{payment_id}",
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
             timeout=15,
         )
         r_pay.raise_for_status()
