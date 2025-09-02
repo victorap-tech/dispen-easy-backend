@@ -21,6 +21,7 @@ ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 WEB_URL = os.getenv("WEB_URL", "https://dispen-easy.com")  # <--- Cambiá por tu front en producción
 
 app = Flask(__name__)
+CORS(app)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
