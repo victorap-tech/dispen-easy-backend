@@ -407,6 +407,25 @@ def pagos_list():
         for p in pagos
     ])
 
+#---------Ver Pagos--------
+
+@app.get("/api/pagos")
+def listar_pagos():
+    pagos = Pago.query.order_by(Pago.id.desc()).limit(20).all()
+    return jsonify([
+        {
+            "id": p.id,
+            "mp_payment_id": p.mp_payment_id,
+            "estado": p.estado,
+            "litros": p.litros,
+            "monto": p.monto,
+            "slot_id": p.slot_id,
+            "product_id": p.product_id,
+            "created_at": p.created_at.isoformat() if p.created_at else None
+        }
+        for p in pagos
+    ])
+
 # -------------------------------------------------------------
 # Run local
 # -------------------------------------------------------------
