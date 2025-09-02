@@ -379,7 +379,7 @@ def mp_webhook():
         p = Pago(
             mp_payment_id=str(payment_id),
             estado=estado,
-            producto_id=product_id,
+            product_id=product_id,
             slot_id=slot_id,
             litros=litros,
             monto=monto,
@@ -389,7 +389,7 @@ def mp_webhook():
         db.session.add(p)
     else:
         p.estado = estado
-        p.producto_id = product_id
+        p.product_id = product_id
         p.slot_id = slot_id
         p.litros = litros
         p.monto = monto
