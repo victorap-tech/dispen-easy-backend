@@ -192,7 +192,6 @@ def productos_reset(pid):
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
     data = request.get_json(force=True, silent=True) or {}
-
     product_id = int(data.get("product_id") or 0)
     litros = int(data.get("litros") or 1)
 
@@ -200,12 +199,14 @@ def crear_preferencia():
     if not prod or not prod.habilitado:
         return jsonify({"error": "producto no disponible"}), 400
 
-    # 3 respaldos: metadata + item.id/category_id + external_reference
+    if not BACKEND_BASE_URL:
+        return jsonify({"error": "BACKEND_BASE_URL no configurado"}), 500
+
     body = {
         "items": [{
-            "id": str(prod.id),                # respaldo de product_id
+            "id": str(prod.id),
             "title": prod.nombre,
-            "category_id": str(prod.slot_id),  # respaldo de slot_id
+            "category_id": str(prod.slot_id),
             "quantity": 1,
             "currency_id": "ARS",
             "unit_price": float(prod.precio),
@@ -217,24 +218,26 @@ def crear_preferencia():
             "litros": litros,
         },
         "external_reference": f"{prod.id}|{prod.slot_id}|{litros}",
-
         "auto_return": "approved",
         "back_urls": {
             "success": os.getenv("WEB_URL", "https://example.com"),
             "failure": os.getenv("WEB_URL", "https://example.com"),
             "pending": os.getenv("WEB_URL", "https://example.com"),
         },
-        "notification_url": f"{request.url_root.rstrip('/')}/api/mp/webhook",
+        # 👇 clave: forzar https del backend público
+        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
 
-    app.logger.info(f"[MP] preferencia req → {body}")
+    app.logger.info(
+        f"[MP] creando preferencia → notification_url={body['notification_url']} "
+        f"meta={{'product_id': {prod.id}, 'slot_id': {prod.slot_id}, 'litros': {litros}}}"
+    )
 
     r = requests.post(
         "https://api.mercadopago.com/checkout/preferences",
         headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
-        json=body,
-        timeout=20
+        json=body, timeout=20
     )
     try:
         r.raise_for_status()
@@ -243,9 +246,8 @@ def crear_preferencia():
         return jsonify({"error": "mp_preference_failed", "status": r.status_code, "body": r.text}), 500
 
     pref = r.json() or {}
-    # Devolvemos ambos por compatibilidad con tu Admin
-    init_point = pref.get("init_point") or pref.get("sandbox_init_point")
-    return jsonify({"ok": True, "link": init_point, "init_point": init_point, **pref})
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    return jsonify({"ok": True, "link": link, "raw": pref})
 
 
 # ----------------------- Webhook MP (robusto) ---------------------------
