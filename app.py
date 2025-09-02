@@ -323,73 +323,67 @@ def _to_int(x, default=0):
 
 @app.post("/api/mp/webhook")
 def mp_webhook():
-    body = request.get_json(silent=True) or {}
-    args = request.args or {}
+    """
+    Webhook de MercadoPago:
+    - Recibe notificación (topic=payment o merchant_order).
+    - Pide al API oficial los detalles.
+    - Guarda/actualiza pago en DB con product_id, slot_id y litros.
+    - Evita duplicados con mp_payment_id único.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    app.logger.info(f"[MP] webhook body={data}")
 
-    topic = args.get("topic") or body.get("type")           # "payment" | "merchant_order"
-    live_mode = bool(body.get("live_mode", True))
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-
-    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
-    app.logger.info(f"[MP] raw body={body}")
-
+    # Extraer payment_id (según tipo de notificación)
     payment_id = None
-    merchant_order_id = None
-
-    # --- 1) Notificación de payment
-    if topic == "payment":
-        if "resource" in body:  # formato viejo
-            try:
-                payment_id = (body["resource"].rstrip("/").split("/")[-1])
-            except Exception:
-                pass
-        if not payment_id:
-            payment_id = (body.get("data") or {}).get("id") or args.get("id")
-
-    # --- 2) Notificación de merchant_order
-    if topic == "merchant_order":
-        merchant_order_id = args.get("id") or (body.get("data") or {}).get("id")
-
-    # Si vino merchant_order, obtengo el/los payments asociados
-    if topic == "merchant_order" and merchant_order_id:
-        r_mo = requests.get(
-            f"{base_api}/merchant_orders/{merchant_order_id}",
-            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
-            timeout=15
-        )
-        if r_mo.ok:
-            pays = (r_mo.json() or {}).get("payments") or []
-            if pays:
-                payment_id = str(pays[0].get("id"))
-        else:
-            app.logger.error(f"[MP] MO {merchant_order_id} error {r_mo.status_code}: {r_mo.text[:300]}")
-
+    if "data" in data and isinstance(data["data"], dict):
+        payment_id = data["data"].get("id")
+    if not payment_id and "id" in data:
+        payment_id = data.get("id")
     if not payment_id:
-        app.logger.warning("[MP] sin payment_id")
-        return "ok", 200
+        app.logger.warning("[MP] webhook sin payment_id válido")
+        return "no payment_id", 200
 
-    # --- Traer el pago (ojo: siempre usar MP_ACCESS_TOKEN)
-    r_pay = requests.get(
-        f"{base_api}/v1/payments/{payment_id}",
-        headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
-        timeout=15
-    )
-    if not r_pay.ok:
-        app.logger.error(f"[MP] error payment {payment_id}: {r_pay.status_code} {r_pay.text[:300]}")
-        return "ok", 200
+    # Confirmar datos desde MP
+    try:
+        r_pay = requests.get(
+            f"{base_api}/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+            timeout=15,
+        )
+        r_pay.raise_for_status()
+    except Exception as e:
+        app.logger.exception(f"[MP] error consultando payment {payment_id}: {e}")
+        return "mp error", 200
 
     pay = r_pay.json() or {}
-    estado = (pay.get("status") or "").lower()  # approved/rejected/pending/…
-    md = pay.get("metadata") or {}
-    product_id = int(md.get("product_id") or 0)
-    slot_id = int(md.get("slot_id") or 0)
-    litros = int(md.get("litros") or 1)
-    monto = int(round(float(pay.get("transaction_amount") or 0)))
+    estado = (pay.get("status") or "").lower()  # approved / rejected / pending
+    raw_md = pay.get("metadata") or {}
 
-    # --- UPSERT idempotente por mp_payment_id
-    p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-    if not p:
-        p = Pago(
+    # --- Extraer metadata redundante ---
+    product_id = int(raw_md.get("product_id") or 0)
+    slot_id = int(raw_md.get("slot_id") or 0)
+    litros = int(raw_md.get("litros") or 0)
+
+    # Si no vino metadata, usar external_reference
+    if (not product_id or not slot_id) and pay.get("external_reference"):
+        try:
+            parts = {
+                kv.split("=")[0]: kv.split("=")[1]
+                for kv in pay["external_reference"].split(";")
+                if "=" in kv
+            }
+            product_id = int(parts.get("pid") or product_id or 0)
+            slot_id = int(parts.get("slot") or slot_id or 0)
+            litros = int(parts.get("litros") or litros or 0)
+        except Exception:
+            app.logger.warning(f"[MP] external_reference malformado: {pay['external_reference']}")
+
+    monto = float(pay.get("transaction_amount") or 0)
+
+    # --- Guardar en DB ---
+    pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+    if not pago:
+        pago = Pago(
             mp_payment_id=str(payment_id),
             estado=estado,
             product_id=product_id,
@@ -397,23 +391,25 @@ def mp_webhook():
             litros=litros,
             monto=monto,
             dispensado=False,
-            raw=pay
+            raw=pay,
         )
-        db.session.add(p)
+        db.session.add(pago)
     else:
-        p.estado = estado
-        p.product_id = product_id
-        p.slot_id = slot_id
-        p.litros = litros
-        p.monto = monto
-        p.raw = pay
+        pago.estado = estado
+        pago.product_id = product_id or pago.product_id
+        pago.slot_id = slot_id or pago.slot_id
+        pago.litros = litros or pago.litros
+        pago.monto = monto or pago.monto
+        pago.raw = pay
 
     try:
         db.session.commit()
-    except Exception:
+    except Exception as e:
         db.session.rollback()
-        app.logger.exception("[DB] error guardando pago %s", payment_id)
+        app.logger.exception(f"[MP] error guardando pago {payment_id}: {e}")
+        return "db error", 500
 
+    app.logger.info(f"[MP] pago {payment_id} → estado={estado}, pid={product_id}, slot={slot_id}, litros={litros}")
     return "ok", 200
 
 # Aliases por compatibilidad de rutas
