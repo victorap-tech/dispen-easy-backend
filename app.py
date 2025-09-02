@@ -430,6 +430,95 @@ def mp_webhook_alias_root():
 def mp_webhook_alias_mp():
     return mp_webhook()
 
+# ----------------------- ESP32: pagos pendientes / confirmación -----
+
+def _pago_to_dict(p):
+    return {
+        "id": p.id,
+        "mp_payment_id": p.mp_payment_id,
+        "estado": p.estado,
+        "litros": int(p.litros or 0),
+        "slot_id": int(p.slot_id or 0),
+        "product_id": int(p.product_id or 0),
+        "producto": getattr(p, "producto", None),   # por compat con versiones viejas
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+@app.get("/api/pagos/pendiente")
+def pagos_pendiente():
+    """
+    Devuelve el primer pago APROBADO que todavía no fue procesado ni dispensado.
+    Sirve para que el ESP32 sepa qué y cuánto debe dispensar.
+    """
+    # Sólo pagos aprobados y todavía no tomados/dispensados
+    p = (Pago.query
+            .filter(Pago.estado.in_(["approved", "approved_partial"]),
+                    (getattr(Pago, "procesado", False) == False) if hasattr(Pago, "procesado") else True,
+                    Pago.dispensado == False)
+            .order_by(Pago.created_at.asc())
+            .first())
+
+    if not p:
+        return jsonify({"ok": True, "pago": None})
+
+    # (opcional) marcar como "procesado" para que no lo tomen dos ESP a la vez
+    if hasattr(p, "procesado"):
+        p.procesado = True
+        db.session.commit()
+
+    # Traer datos del producto por si el firmware los necesita
+    prod = Producto.query.get(p.product_id) if p.product_id else None
+    data = _pago_to_dict(p)
+    if prod:
+        data["producto_nombre"] = prod.nombre
+        data["porcion_litros"] = int(getattr(prod, "porcion_litros", 1))
+        data["stock_litros"] = int(prod.cantidad)
+
+    return jsonify({"ok": True, "pago": data})
+
+
+@app.post("/api/pagos/<int:pid>/dispensado")
+def pagos_dispensado(pid):
+    """
+    Lo llama el ESP32 cuando terminó de dispensar OK.
+    Marca el pago como 'dispensado' y descuenta stock.
+    """
+    p = Pago.query.get_or_404(pid)
+    if p.dispensado:
+        return jsonify({"ok": True, "msg": "Ya estaba confirmado", "pago": _pago_to_dict(p)})
+
+    # buscar producto y restar los litros efectivamente dispensados
+    litros = int(p.litros or 0)
+    prod = Producto.query.get(p.product_id) if p.product_id else None
+
+    if prod and litros > 0:
+        prod.cantidad = max(0, int(prod.cantidad) - litros)
+
+    p.dispensado = True
+    # si existe la columna 'procesado', mantenla en True
+    if hasattr(p, "procesado"):
+        p.procesado = True
+
+    db.session.commit()
+    resp = _pago_to_dict(p)
+    if prod:
+        resp["stock_restante"] = int(prod.cantidad)
+        resp["producto_nombre"] = prod.nombre
+    return jsonify({"ok": True, "msg": "Dispensado confirmado", "pago": resp})
+
+
+@app.post("/api/pagos/<int:pid>/fallo")
+def pagos_fallo(pid):
+    """
+    (Opcional, pero recomendado)
+    Si el ESP32 intentó dispensar y falló (corte, sensor), libera el pago
+    para reintento manual o para revisión.
+    """
+    p = Pago.query.get_or_404(pid)
+    if hasattr(p, "procesado"):
+        p.procesado = False   # lo volvemos a dejar disponible
+    db.session.commit()
+    return jsonify({"ok": True, "msg": "Pago liberado", "pago": _pago_to_dict(p)})
 # -------------------------------------------------------------
 # Run local
 # -------------------------------------------------------------
