@@ -312,81 +312,95 @@ def _to_int(x, default=0):
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")  # 'payment' | 'merchant_order'
+
+    topic = args.get("topic") or body.get("type")           # "payment" | "merchant_order"
     live_mode = bool(body.get("live_mode", True))
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
 
-    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)} body={body}")
+    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)}")
+    app.logger.info(f"[MP] raw body={body}")
 
     payment_id = None
+    merchant_order_id = None
+
+    # --- 1) Notificación de payment
     if topic == "payment":
-        if "resource" in body:
+        if "resource" in body:  # formato viejo
             try:
-                payment_id = body["resource"].rstrip("/").split("/")[-1]
+                payment_id = (body["resource"].rstrip("/").split("/")[-1])
             except Exception:
                 pass
         if not payment_id:
             payment_id = (body.get("data") or {}).get("id") or args.get("id")
 
+    # --- 2) Notificación de merchant_order
     if topic == "merchant_order":
         merchant_order_id = args.get("id") or (body.get("data") or {}).get("id")
-        if merchant_order_id:
-            r_mo = requests.get(f"{base_api}/merchant_orders/{merchant_order_id}",
-                                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, timeout=15)
-            if r_mo.ok:
-                pays = (r_mo.json() or {}).get("payments") or []
-                if pays:
-                    payment_id = str(pays[0].get("id"))
+
+    # Si vino merchant_order, obtengo el/los payments asociados
+    if topic == "merchant_order" and merchant_order_id:
+        r_mo = requests.get(
+            f"{base_api}/merchant_orders/{merchant_order_id}",
+            headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+            timeout=15
+        )
+        if r_mo.ok:
+            pays = (r_mo.json() or {}).get("payments") or []
+            if pays:
+                payment_id = str(pays[0].get("id"))
+        else:
+            app.logger.error(f"[MP] MO {merchant_order_id} error {r_mo.status_code}: {r_mo.text[:300]}")
 
     if not payment_id:
         app.logger.warning("[MP] sin payment_id")
         return "ok", 200
 
-    r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                         headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=15)
+    # --- Traer el pago (ojo: siempre usar MP_ACCESS_TOKEN)
+    r_pay = requests.get(
+        f"{base_api}/v1/payments/{payment_id}",
+        headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+        timeout=15
+    )
     if not r_pay.ok:
         app.logger.error(f"[MP] error payment {payment_id}: {r_pay.status_code} {r_pay.text[:300]}")
         return "ok", 200
 
     pay = r_pay.json() or {}
-    estado = (pay.get("status") or "").lower()  # approved/rejected/pending…
+    estado = (pay.get("status") or "").lower()  # approved/rejected/pending/…
     md = pay.get("metadata") or {}
     product_id = int(md.get("product_id") or 0)
-    slot_id    = int(md.get("slot_id") or 0)
-    litros     = int(md.get("litros") or 1)
+    slot_id = int(md.get("slot_id") or 0)
+    litros = int(md.get("litros") or 1)
+    monto = int(round(float(pay.get("transaction_amount") or 0)))
 
-    # UPSERT por mp_payment_id (idempotente)
+    # --- UPSERT idempotente por mp_payment_id
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-    if p:
-        if p.estado == estado:
-            app.logger.info(f"[MP] dup notif payment={payment_id} estado={estado} (sin cambios)")
-            return "ok", 200
-        p.estado = estado
-        p.product_id = p.product_id or product_id
-        p.slot_id = p.slot_id or slot_id
-        p.litros = p.litros or litros
-        p.monto = int(round(float(pay.get("transaction_amount") or p.monto or 0)))
-        p.raw = pay
-    else:
+    if not p:
         p = Pago(
             mp_payment_id=str(payment_id),
             estado=estado,
-            product_id=product_id,
+            producto_id=product_id,
             slot_id=slot_id,
             litros=litros,
-            monto=int(round(float(pay.get("transaction_amount") or 0))),
+            monto=monto,
             dispensado=False,
-            raw=pay,
+            raw=pay
         )
         db.session.add(p)
+    else:
+        p.estado = estado
+        p.producto_id = product_id
+        p.slot_id = slot_id
+        p.litros = litros
+        p.monto = monto
+        p.raw = pay
 
     try:
         db.session.commit()
     except Exception:
         db.session.rollback()
-        app.logger.exception("[DB] error upsert pago %s", payment_id)
+        app.logger.exception("[DB] error guardando pago %s", payment_id)
 
-    # IMPORTANTE: acá NO se descuenta stock
     return "ok", 200
 
 # Aliases por compatibilidad de rutas
