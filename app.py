@@ -97,12 +97,14 @@ def _to_int(x, default=0):
 # -------------------------------------------------------------
 MQTT_TOPIC_CMD   = f"dispen/{DEVICE_ID}/cmd/dispense"
 MQTT_TOPIC_STATE = f"dispen/{DEVICE_ID}/state/dispense"
+MQTT_TOPIC_STATUS = f"dispen/{DEVICE_ID}/status"
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {MQTT_TOPIC_STATE}")
+    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {MQTT_TOPIC_STATE} y {MQTT_TOPIC_STATUS}")
     client.subscribe(MQTT_TOPIC_STATE, qos=1)
+    client.subscribe(MQTT_TOPIC_STATUS, qos=1)
 
 def _mqtt_on_message(client, userdata, msg):
     try:
