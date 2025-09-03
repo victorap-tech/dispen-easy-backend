@@ -415,6 +415,32 @@ def pagos_fallo(pid):
     p = Pago.query.get_or_404(pid)
     return jsonify({"ok": True, "msg": "Registrado fallo", "pago": {"id": p.id}})
 
+@app.post("/api/pagos/<int:pid>/reenviar")
+def pagos_reenviar(pid):
+    """
+    Reenvía el comando MQTT al ESP32 para un pago aprobado y NO dispensado.
+    No descuenta stock; solo publica la orden de dispensado de nuevo.
+    """
+    p = Pago.query.get_or_404(pid)
+
+    # Validaciones básicas
+    if p.dispensado:
+        return jsonify({"ok": False, "msg": "El pago ya está marcado como dispensado"})
+    if p.estado != "approved":
+        return jsonify({"ok": False, "msg": f"Estado no válido para reintento: {p.estado}"})
+    if not p.slot_id or not p.litros:
+        return jsonify({"ok": False, "msg": "Pago sin slot/litros válidos"})
+
+    litros = int(p.litros or 1)
+    ok = send_dispense_cmd(p.mp_payment_id, p.slot_id, litros, timeout_s=max(30, litros * 5))
+
+    return jsonify({
+        "ok": ok,
+        "msg": "Comando reenviado" if ok else "No se pudo publicar a MQTT",
+        "pago": {
+            "id": p.id, "mp_payment_id": p.mp_payment_id, "slot_id": p.slot_id, "litros": litros
+        }
+    })
 # -------------------------------------------------------------
 # Mercado Pago: crear preferencia
 # -------------------------------------------------------------
