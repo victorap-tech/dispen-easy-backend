@@ -107,18 +107,44 @@ def _mqtt_on_connect(client, userdata, flags, rc, props=None):
     client.subscribe(MQTT_TOPIC_STATUS, qos=1)
 
 def _mqtt_on_message(client, userdata, msg):
+    # Logueo fuerte para ver TODO lo que llega
     try:
-        payload = msg.payload.decode("utf-8", "ignore")
-        data = _json.loads(payload or "{}")
+        raw = msg.payload.decode("utf-8", "ignore")
     except Exception:
-        app.logger.exception("[MQTT] payload inválido")
+        raw = "<binario>"
+    app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
+
+    # Parse tolerante
+    try:
+        data = _json.loads(raw or "{}")
+    except Exception:
+        app.logger.exception("[MQTT] payload inválido (no JSON)")
         return
 
-    payment_id = str(data.get("payment_id") or "").strip()
-    status = str(data.get("status") or "").lower()        # started|done|error|timeout
-    slot_id = _to_int(data.get("slot_id") or 0)
+    # Campos tolerantes a nombres/formatos
+    payment_id = str(
+        data.get("payment_id")
+        or data.get("paymentId")
+        or data.get("id")
+        or ""
+    ).strip()
 
-    app.logger.info(f"[MQTT] state payment_id={payment_id} status={status} slot={slot_id}")
+    status = str(
+        data.get("status")
+        or data.get("state")
+        or ""
+    ).lower()
+
+    slot_id = _to_int(data.get("slot_id") or data.get("slot") or 0)
+    litros  = _to_int(data.get("litros") or data.get("liters") or 0)
+
+    # Normalizar status (aceptar 'done', 'ok', 'finished')
+    if status in ("ok", "finish", "finished", "success"):
+        status = "done"
+
+    app.logger.info(f"[MQTT] parsed payment_id={payment_id} status={status} slot={slot_id} litros={litros}")
+
+    # Solo actuamos cuando termina el dispense
     if not payment_id or status not in ("done", "error", "timeout"):
         return
 
@@ -128,19 +154,19 @@ def _mqtt_on_message(client, userdata, msg):
             app.logger.warning(f"[MQTT] pago {payment_id} no encontrado")
             return
 
+        # Solo si terminó bien y aún no estaba marcado
         if status == "done" and not p.dispensado:
             try:
-                litros = int(p.litros or 0) or 1
+                litros_desc = int(p.litros or 0) or (litros or 1)
                 prod = Producto.query.get(p.product_id) if p.product_id else None
                 if prod:
-                    prod.cantidad = max(0, int(prod.cantidad or 0) - litros)
+                    prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
                 p.dispensado = True
-                p.procesado = True  # estado final coherente
                 db.session.commit()
-                app.logger.info(f"[MQTT] pago {payment_id} DISPENSADO; stock descontado {litros}L")
+                app.logger.info(f"[MQTT] pago {payment_id} DISPENSADO; stock -{litros_desc}L (prod_id={p.product_id})")
             except Exception:
                 db.session.rollback()
-                app.logger.exception("[MQTT] error al marcar dispensado")
+                app.logger.exception("[MQTT] error al marcar dispensado/stock")
         else:
             app.logger.info(f"[MQTT] pago {payment_id} status={status} (sin cambios)")
 
