@@ -60,6 +60,7 @@ class Pago(db.Model):
     estado = db.Column(db.String(80), nullable=False)           # approved/pending/rejected
     producto = db.Column(db.String(120), nullable=False, default="")
     dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+    procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))  # idempotencia
     slot_id = db.Column(db.Integer, nullable=False, default=0)
     litros = db.Column(db.Integer, nullable=False, default=1)
     monto = db.Column(db.Integer, nullable=False, default=0)    # ARS entero
@@ -83,10 +84,13 @@ def json_error(msg, status=400, extra=None):
     return jsonify(payload), status
 
 def _to_int(x, default=0):
-    try: return int(x)
+    try:
+        return int(x)
     except Exception:
-        try: return int(float(x))
-        except Exception: return default
+        try:
+            return int(float(x))
+        except Exception:
+            return default
 
 # -------------------------------------------------------------
 # MQTT (publicar orden y procesar confirmación del ESP)
@@ -129,6 +133,7 @@ def _mqtt_on_message(client, userdata, msg):
                 if prod:
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros)
                 p.dispensado = True
+                p.procesado = True  # estado final coherente
                 db.session.commit()
                 app.logger.info(f"[MQTT] pago {payment_id} DISPENSADO; stock descontado {litros}L")
             except Exception:
@@ -144,9 +149,18 @@ def start_mqtt_background():
 
     def _run():
         global _mqtt_client
-        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{DEVICE_ID}-backend")
+        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                   client_id=f"{DEVICE_ID}-backend")
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+        # TLS automático si el puerto es 8883 (HiveMQ Cloud)
+        if int(MQTT_PORT) == 8883:
+            try:
+                _mqtt_client.tls_set()  # usa CA del sistema
+            except Exception as e:
+                app.logger.error(f"[MQTT] No se pudo habilitar TLS: {e}")
+
         _mqtt_client.on_connect = _mqtt_on_connect
         _mqtt_client.on_message = _mqtt_on_message
         _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
@@ -359,6 +373,7 @@ def pagos_dispensado(pid):
     litros_desc = int(p.litros or 0) or 1
     prod.cantidad = max(0, int(prod.cantidad) - litros_desc)
     p.dispensado = True
+    p.procesado = True
     db.session.commit()
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
@@ -370,7 +385,6 @@ def pagos_fallo(pid):
     Si el ESP falló la entrega; no descuenta stock.
     """
     p = Pago.query.get_or_404(pid)
-    # Podrías registrar motivo en raw; por ahora solo confirmamos
     return jsonify({"ok": True, "msg": "Registrado fallo", "pago": {"id": p.id}})
 
 # -------------------------------------------------------------
@@ -394,7 +408,7 @@ def crear_preferencia():
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
         "items": [{
-            "id": str(prod.id),              # fallback
+            "id": str(prod.id),
             "title": prod.nombre,
             "quantity": 1,
             "currency_id": "ARS",
@@ -449,8 +463,10 @@ def mp_webhook():
     # topic=payment
     if topic == "payment":
         if "resource" in body and isinstance(body["resource"], str):
-            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception: payment_id = None
+            try:
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                payment_id = None
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
 
     # topic=merchant_order
@@ -462,7 +478,8 @@ def mp_webhook():
                                     headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=15)
                 if r_mo.ok:
                     pays = (r_mo.json() or {}).get("payments") or []
-                    if pays: payment_id = str(pays[0].get("id"))
+                    if pays:
+                        payment_id = str(pays[0].get("id"))
             except Exception:
                 app.logger.exception("[MP] error consultando merchant_order")
 
@@ -512,6 +529,7 @@ def mp_webhook():
             estado=estado or "pending",
             producto=producto_txt,
             dispensado=False,
+            procesado=False,   # arranca no procesado
             slot_id=slot_id,
             litros=litros if litros > 0 else 1,
             monto=monto,
@@ -535,10 +553,16 @@ def mp_webhook():
         app.logger.exception("[DB] error guardando pago")
         return "ok", 200
 
-    # (Opcional) publicar orden al aprobar
+    # Publicar orden SOLO una vez por pago approved
     try:
-        if p.estado == "approved" and not p.dispensado and p.slot_id and p.litros:
-            send_dispense_cmd(p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros*5))
+        if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
+            published = send_dispense_cmd(p.mp_payment_id, p.slot_id, p.litros,
+                                          timeout_s=max(30, p.litros * 5))
+            if published:
+                p.procesado = True
+                db.session.commit()
+            else:
+                app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; se reintentará con próximo webhook")
     except Exception:
         app.logger.exception("[MQTT] no se pudo publicar orden tras approval")
 
