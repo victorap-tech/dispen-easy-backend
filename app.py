@@ -292,7 +292,8 @@ def productos_update(pid):
         if "precio" in data: p.precio = float(data["precio"])
         if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
         if "porcion_litros" in data:
-            val = int(data["porcion_litros"]); if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
+            val = int(data["porcion_litros"]); if val < 1: 
+                return json_error("porcion_litros debe ser ≥ 1", 400)
             p.porcion_litros = val
         if "slot" in data:
             new_slot = int(data["slot"])
