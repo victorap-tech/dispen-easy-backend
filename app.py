@@ -152,6 +152,10 @@ def get_mp_token_and_base() -> tuple[str, str]:
 
 @app.before_request
 def _auth_guard():
+    # ✅ Dejar pasar preflight de CORS
+    if request.method == "OPTIONS":
+        return ("", 200)
+
     resp = require_admin()
     if resp is not None:
         return resp
