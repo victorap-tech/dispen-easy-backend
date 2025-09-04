@@ -10,7 +10,6 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
-from flask import redirect
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
