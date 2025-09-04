@@ -29,14 +29,54 @@ MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 
+# 🔐 Admin secret para proteger /api/*
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
+
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# CORS: permitir el header X-Admin-Secret en /api/*
+CORS(app, resources={r"/api/*": {
+    "origins": "*",
+    "allow_headers": ["Content-Type", "X-Admin-Secret"],
+    "expose_headers": ["X-Admin-Secret"]
+}})
 
 db = SQLAlchemy(app)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
+
+# -------------------------------------------------------------
+# Auth (middleware simple por header)
+# -------------------------------------------------------------
+# Rutas públicas que NO requieren clave
+_PUBLIC_PATHS = {
+    "/", "/webhook", "/mp/webhook", "/api/mp/webhook",
+}
+
+@app.before_request
+def _require_admin_secret():
+    # Permitir preflight
+    if request.method == "OPTIONS":
+        return
+
+    path = request.path or ""
+    # Público y estáticos
+    if path in _PUBLIC_PATHS or path.startswith("/static/"):
+        return
+
+    # Proteger todo /api/*
+    if path.startswith("/api/"):
+        if not ADMIN_SECRET:
+            # Si no está seteado, no bloqueamos (útil en desarrollo)
+            app.logger.warning("[AUTH] ADMIN_SECRET no configurado; acceso permitido")
+            return
+        given = (request.headers.get("X-Admin-Secret") or "").strip()
+        if given == ADMIN_SECRET:
+            return
+        app.logger.warning(f"[AUTH] acceso denegado path={path}")
+        return jsonify({"error": "unauthorized"}), 401
 
 # -------------------------------------------------------------
 # Modelos
@@ -438,35 +478,35 @@ def crear_preferencia():
 
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
-    "items": [{
-        "id": str(prod.id),
-        "title": prod.nombre,           # nombre visible
-        "description": prod.nombre,     # redundante
-        "quantity": 1,
-        "currency_id": "ARS",
-        "unit_price": float(prod.precio),
-    }],
-    "description": prod.nombre,          # redundante a nivel preferencia
-    "additional_info": {
         "items": [{
             "id": str(prod.id),
-            "title": prod.nombre,
+            "title": prod.nombre,           # nombre visible
+            "description": prod.nombre,     # redundante
             "quantity": 1,
-            "unit_price": float(prod.precio)
-        }]
-    },
-    "metadata": {
-        "slot_id": int(prod.slot_id),
-        "product_id": int(prod.id),
-        "producto": prod.nombre,
-        "litros": int(litros),
-    },
-    "external_reference": f"pid={prod.id};slot={prod.slot_id};litros={litros}",
-    "auto_return": "approved",
-    "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
-    "notification_url": f"{backend_base}/api/mp/webhook",
-    "statement_descriptor": "DISPEN-EASY",
-}
+            "currency_id": "ARS",
+            "unit_price": float(prod.precio),
+        }],
+        "description": prod.nombre,          # redundante a nivel preferencia
+        "additional_info": {
+            "items": [{
+                "id": str(prod.id),
+                "title": prod.nombre,
+                "quantity": 1,
+                "unit_price": float(prod.precio)
+            }]
+        },
+        "metadata": {
+            "slot_id": int(prod.slot_id),
+            "product_id": int(prod.id),
+            "producto": prod.nombre,
+            "litros": int(litros),
+        },
+        "external_reference": f"pid={prod.id};slot={prod.slot_id};litros={litros}",
+        "auto_return": "approved",
+        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
+        "notification_url": f"{backend_base}/api/mp/webhook",
+        "statement_descriptor": "DISPEN-EASY",
+    }
 
     app.logger.info(f"[MP] preferencia req → {body}")
     try:
