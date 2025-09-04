@@ -438,25 +438,35 @@ def crear_preferencia():
 
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
+    "items": [{
+        "id": str(prod.id),
+        "title": prod.nombre,           # nombre visible
+        "description": prod.nombre,     # redundante
+        "quantity": 1,
+        "currency_id": "ARS",
+        "unit_price": float(prod.precio),
+    }],
+    "description": prod.nombre,          # redundante a nivel preferencia
+    "additional_info": {
         "items": [{
             "id": str(prod.id),
             "title": prod.nombre,
             "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
-        "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
-            "producto": prod.nombre,
-            "litros": int(litros),
-        },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
-    }
+            "unit_price": float(prod.precio)
+        }]
+    },
+    "metadata": {
+        "slot_id": int(prod.slot_id),
+        "product_id": int(prod.id),
+        "producto": prod.nombre,
+        "litros": int(litros),
+    },
+    "external_reference": f"pid={prod.id};slot={prod.slot_id};litros={litros}",
+    "auto_return": "approved",
+    "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
+    "notification_url": f"{backend_base}/api/mp/webhook",
+    "statement_descriptor": "DISPEN-EASY",
+}
 
     app.logger.info(f"[MP] preferencia req → {body}")
     try:
