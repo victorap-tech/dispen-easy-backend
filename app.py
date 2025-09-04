@@ -9,6 +9,7 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
+from flask_cors import CORS
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
@@ -40,7 +41,12 @@ PUBLIC_PATHS = {
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "x-admin-secret"],
+    expose_headers=["Content-Type"],
+)
 
 db = SQLAlchemy(app)
 logging.basicConfig(level=logging.INFO)
