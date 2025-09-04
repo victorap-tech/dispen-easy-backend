@@ -627,7 +627,7 @@ def api_dispense_orden():
         litros = 1
     ok = send_dispense_cmd(payment_id, slot_id, litros, timeout_s=max(30, litros*5))
     return jsonify({"ok": ok})
-----------------------------------------------------------------------------
+#----------------------------------------------------------------------------
 
 @app.get("/pay/q")
 def pay_q():
