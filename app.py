@@ -136,18 +136,19 @@ def require_admin():
         return json_error("unauthorized", 401)
 
 def get_mp_mode() -> str:
-    kv = KV.query.get("mp_mode")
-    return (kv.value if kv else "test").lower() in ("live", "prod", "production") and "live" or "test"
+    # lee de la DB o default "test"
+    from sqlalchemy import text
+    row = db.session.execute(text("SELECT value FROM kv WHERE key='mp_mode' LIMIT 1")).fetchone()
+    return (row[0] if row else "test").lower()
 
 def get_mp_token_and_base() -> tuple[str, str]:
     mode = get_mp_mode()
     if mode == "live":
-        token = MP_ACCESS_TOKEN_LIVE
+        token = os.getenv("MP_ACCESS_TOKEN_LIVE", "").strip()
         base_api = "https://api.mercadopago.com"
     else:
-        # aunque usemos preferencia LIVE, podés forzar sandbox con token test
-        token = MP_ACCESS_TOKEN_TEST or MP_ACCESS_TOKEN_LIVE
-        base_api = "https://api.mercadopago.com"  # Payments v1 responde igual; live_mode vendrá en body
+        token = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
+        base_api = "https://api.sandbox.mercadopago.com"
     return token, base_api
 
 @app.before_request
