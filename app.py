@@ -36,10 +36,13 @@ DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 # Seguridad Admin
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
-# Telegram (alertas)
+# Umbrales de stock
+UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)  # notifica si stock ≤ umbral
+STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)  # bloquea QR si stock ≤ reserva
+
+# Telegram (opcional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # -------------------------------------------------------------
 # App / DB / CORS
@@ -96,6 +99,7 @@ class Pago(db.Model):
 
 with app.app_context():
     db.create_all()
+    # valor por defecto del modo de pagos (si no existe)
     if not KV.query.get("mp_mode"):
         db.session.add(KV(key="mp_mode", value="test"))
         db.session.commit()
@@ -121,7 +125,7 @@ def _to_int(x, default=0):
         except Exception:
             return default
 
-def serialize_producto(p: "Producto") -> dict:
+def serialize_producto(p: Producto) -> dict:
     return {
         "id": p.id,
         "nombre": p.nombre,
@@ -134,47 +138,57 @@ def serialize_producto(p: "Producto") -> dict:
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
-# ---------------- Telegram helpers ----------------
-def tg_enabled() -> bool:
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+def get_thresholds():
+    """
+    Devuelve (umbral_alerta, reserva_critica) garantizando umbral > reserva.
+    """
+    reserva = max(0, int(STOCK_RESERVA_LTS))
+    umbral_cfg = max(0, int(UMBRAL_ALERTA_LTS))
+    umbral = umbral_cfg if umbral_cfg > reserva else (reserva + 1)
+    return umbral, reserva
 
-def tg_send(text: str) -> bool:
-    if not tg_enabled():
-        app.logger.debug("[TG] deshabilitado (faltan variables)")
-        return False
+def tg_notify(text: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
     try:
-        r = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10
         )
-        if not r.ok:
-            app.logger.warning(f"[TG] error {r.status_code}: {r.text[:200]}")
-        return r.ok
     except Exception:
-        app.logger.exception("[TG] excepción enviando mensaje")
-        return False
+        app.logger.exception("[TG] Error enviando notificación")
 
-def maybe_notify_low_stock(prod: "Producto"):
+def _post_stock_change_hook(prod: "Producto", motivo: str):
     """
-    Dispara alerta si el stock quedó en o por debajo del umbral.
-    Umbral = max(porcion_litros del producto, STOCK_RESERVA_LTS global).
+    Reglas tras cambiar stock:
+    - Si stock <= umbral_alerta: notifica a Telegram.
+    - Si stock <= reserva_critica: deshabilita el producto.
+    - Si stock > reserva_critica: re-habilita el producto (si estaba deshabilitado).
     """
-    try:
-        umbral = max(int(getattr(prod, "porcion_litros", 1) or 1), int(STOCK_RESERVA_LTS))
-        stock = int(prod.cantidad or 0)
-        if stock <= umbral:
-            link_admin = os.getenv("WEB_URL", "") or ""
-            msg = (
-                f"⚠️ <b>Bajo stock</b>\n"
-                f"• Producto: <b>{prod.nombre}</b>\n"
-                f"• Stock: <b>{stock} L</b>\n"
-                f"• Umbral: <b>{umbral} L</b>\n"
-                + (f"\nPanel: {link_admin}" if link_admin else "")
+    umbral, reserva = get_thresholds()
+    stock = int(prod.cantidad or 0)
+
+    # Notificación (stock bajo)
+    if stock <= umbral:
+        try:
+            tg_notify(
+                f"⚠️ Bajo stock en '{prod.nombre}' (slot {prod.slot_id}): {stock} L "
+                f"(umbral={umbral}, reserva={reserva}) – Motivo: {motivo}"
             )
-            tg_send(msg)
-    except Exception:
-        app.logger.exception("[TG] error evaluando bajo stock")
+        except Exception:
+            pass
+
+    # Deshabilitar si está en reserva o por debajo
+    if stock <= reserva:
+        if prod.habilitado:
+            prod.habilitado = False
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' (slot {prod.slot_id}) por reserva: stock={stock} ≤ {reserva}")
+    else:
+        # Si supera la reserva, re-habilitar
+        if not prod.habilitado:
+            prod.habilitado = True
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}) – stock={stock} > {reserva}")
 
 # -------------------------------------------------------------
 # Autenticación simple por header
@@ -184,17 +198,19 @@ PUBLIC_PATHS = {
     "/api/mp/webhook",          # Webhook de MP
     "/api/pagos/preferencia",   # generar link/QR
     "/api/pagos/pendiente",     # consulta del ESP32
-    "/api/config",              # lee modo mp
-    "/api/test/telegram",       # test telegram
+    "/api/config",              # lee modo y umbrales para UI
 }
 
 @app.before_request
 def _auth_guard():
+    # CORS preflight
     if request.method == "OPTIONS":
         return "", 200
+    # pública
     p = request.path.rstrip("/")
     if p in PUBLIC_PATHS:
         return None
+    # admin
     if not ADMIN_SECRET:
         return None
     if request.headers.get("x-admin-secret") != ADMIN_SECRET:
@@ -267,11 +283,9 @@ def _mqtt_on_message(client, userdata, msg):
                 prod = Producto.query.get(p.product_id) if p.product_id else None
                 if prod:
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
+                    _post_stock_change_hook(prod, motivo="dispensado (ESP done)")
                 p.dispensado = True
                 db.session.commit()
-
-                if prod:
-                    maybe_notify_low_stock(prod)
             except Exception:
                 db.session.rollback()
                 app.logger.exception("[MQTT] error al marcar dispensado/stock")
@@ -326,18 +340,19 @@ def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, timeout_s: int
 def health():
     return ok_json({"status": "ok", "message": "Backend Dispen-Easy operativo"})
 
-# Test telegram
-@app.get("/api/test/telegram")
-def test_telegram():
-    ok = tg_send("✅ Test de Telegram desde Dispen-Easy")
-    return ok_json({"ok": ok})
-
 # -------------------------------------------------------------
-# Config (modo de pago)
+# Config (modo de pago + umbrales)
 # -------------------------------------------------------------
 @app.get("/api/config")
 def api_get_config():
-    return ok_json({"mp_mode": get_mp_mode()})
+    umbral, reserva = get_thresholds()
+    return ok_json({
+        "mp_mode": get_mp_mode(),
+        "stock": {
+            "umbral_alerta_lts": umbral,
+            "reserva_critica_lts": reserva,
+        }
+    })
 
 @app.post("/api/mp/mode")
 def api_set_mode():
@@ -346,7 +361,9 @@ def api_set_mode():
     if mode not in ("test", "live"):
         return json_error("modo inválido (test|live)", 400)
     kv = KV.query.get("mp_mode")
-    if not kv: kv = KV(key="mp_mode", value=mode); db.session.add(kv)
+    if not kv:
+        kv = KV(key="mp_mode", value=mode)
+        db.session.add(kv)
     kv.value = mode
     db.session.commit()
     return ok_json({"ok": True, "mp_mode": mode})
@@ -376,8 +393,8 @@ def productos_create():
         if Producto.query.filter(Producto.slot_id == p.slot_id).first():
             return json_error("Slot ya asignado a otro producto", 409)
         db.session.add(p)
+        _post_stock_change_hook(p, motivo="create")  # por si arranca bajo
         db.session.commit()
-        maybe_notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
     except Exception as e:
         db.session.rollback()
@@ -389,6 +406,8 @@ def productos_update(pid):
     data = request.get_json(force=True)
     p = Producto.query.get_or_404(pid)
     try:
+        before = int(p.cantidad or 0)
+
         if "nombre" in data: p.nombre = str(data["nombre"]).strip()
         if "precio" in data: p.precio = float(data["precio"])
         if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
@@ -403,8 +422,12 @@ def productos_update(pid):
                 return json_error("Slot ya asignado a otro producto", 409)
             p.slot_id = new_slot
         if "habilitado" in data: p.habilitado = bool(data["habilitado"])
+
+        after = int(p.cantidad or 0)
+        if after != before:
+            _post_stock_change_hook(p, motivo="update cantidad")
+
         db.session.commit()
-        maybe_notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -431,8 +454,8 @@ def productos_reponer(pid):
         return json_error("Litros inválidos", 400)
     try:
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
+        _post_stock_change_hook(p, motivo="reponer")
         db.session.commit()
-        maybe_notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -447,8 +470,8 @@ def productos_reset(pid):
         return json_error("Litros inválidos", 400)
     try:
         p.cantidad = int(litros)
+        _post_stock_change_hook(p, motivo="reset_stock")
         db.session.commit()
-        maybe_notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -523,10 +546,10 @@ def pagos_dispensado(pid):
         return json_error("Producto no encontrado para este pago", 404)
     litros_desc = int(p.litros or 0) or 1
     prod.cantidad = max(0, int(prod.cantidad) - litros_desc)
+    _post_stock_change_hook(prod, motivo="dispensado (manual)")
     p.dispensado = True
     p.procesado = True
     db.session.commit()
-    maybe_notify_low_stock(prod)
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
                     "producto": {"id": prod.id, "stock": prod.cantidad}})
@@ -554,7 +577,7 @@ def pagos_reenviar(pid):
     })
 
 # -------------------------------------------------------------
-# Mercado Pago: crear preferencia (elige token por modo)
+# Mercado Pago: crear preferencia (elige token por modo) + bloqueo por reserva
 # -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
@@ -562,6 +585,7 @@ def crear_preferencia():
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
+    # token según modo (usa MP_ACCESS_TOKEN_TEST o MP_ACCESS_TOKEN_LIVE)
     token, _base_api = get_mp_token_and_base()
     if not token:
         return json_error("MP token no configurado (TEST/LIVE)", 500)
@@ -572,6 +596,15 @@ def crear_preferencia():
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+
+    # Bloqueo por reserva crítica
+    umbral, reserva = get_thresholds()
+    if (int(prod.cantidad) - litros) <= reserva:
+        return json_error(
+            f"Stock insuficiente: operación dejaría stock ≤ reserva ({reserva} L). "
+            f"Stock actual: {prod.cantidad} L, requerido: {litros} L.",
+            409
+        )
 
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
@@ -629,7 +662,7 @@ def crear_preferencia():
     return ok_json({"ok": True, "link": link, "raw": pref})
 
 # -------------------------------------------------------------
-# Webhook de Mercado Pago
+# Mercado Pago: Webhook idempotente (no descuenta stock)
 # -------------------------------------------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
@@ -747,7 +780,7 @@ def mp_webhook():
 
     return "ok", 200
 
-# Aliases
+# Aliases por compat
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
