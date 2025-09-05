@@ -36,6 +36,11 @@ DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 # Seguridad Admin
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
+# Telegram (notificaciones bajo stock)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5") or 5)
+
 # -------------------------------------------------------------
 # App / DB / CORS
 # -------------------------------------------------------------
@@ -129,6 +134,29 @@ def serialize_producto(p: Producto) -> dict:
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
+
+# -------------------------------------------------------------
+# Telegram helpers
+# -------------------------------------------------------------
+def send_telegram(msg: str):
+    """Envía un mensaje a Telegram si hay token/chat configurados."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        app.logger.warning(f"[TELEGRAM] error enviando: {e}")
+
+def notify_low_stock(prod: Producto):
+    """Notifica si el stock quedó ≤ umbral."""
+    try:
+        stock_l = int(getattr(prod, "cantidad", 0) or 0)
+        if stock_l <= LOW_STOCK_THRESHOLD:
+            send_telegram(f"⚠️ Bajo stock: {prod.nombre} (slot {prod.slot_id}) → {stock_l} L restantes")
+    except Exception as e:
+        app.logger.warning(f"[TELEGRAM] error low-stock: {e}")
 
 # -------------------------------------------------------------
 # Autenticación simple por header
@@ -225,6 +253,9 @@ def _mqtt_on_message(client, userdata, msg):
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
                 p.dispensado = True
                 db.session.commit()
+                # 🔔 Aviso bajo stock (si corresponde)
+                if prod:
+                    notify_low_stock(prod)
             except Exception:
                 db.session.rollback()
                 app.logger.exception("[MQTT] error al marcar dispensado/stock")
@@ -377,6 +408,8 @@ def productos_reponer(pid):
     try:
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
         db.session.commit()
+        # 🔔 Aviso bajo stock luego de reponer (por si sigue en umbral)
+        notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -392,6 +425,8 @@ def productos_reset(pid):
     try:
         p.cantidad = int(litros)
         db.session.commit()
+        # 🔔 Aviso bajo stock tras reset (si quedó bajo)
+        notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -469,6 +504,8 @@ def pagos_dispensado(pid):
     p.dispensado = True
     p.procesado = True
     db.session.commit()
+    # 🔔 Aviso bajo stock (si corresponde)
+    notify_low_stock(prod)
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
                     "producto": {"id": prod.id, "stock": prod.cantidad}})
@@ -495,8 +532,6 @@ def pagos_reenviar(pid):
         "pago": {"id": p.id, "mp_payment_id": p.mp_payment_id, "slot_id": p.slot_id, "litros": litros}
     })
 
-# -------------------------------------------------------------
-# Mercado Pago: crear preferencia (elige token por modo)
 # -------------------------------------------------------------
 # Mercado Pago: crear preferencia (elige token por modo)
 # -------------------------------------------------------------
@@ -575,6 +610,9 @@ def crear_preferencia():
         return json_error("preferencia_sin_link", 502, pref)
     return ok_json({"ok": True, "link": link, "raw": pref})
 
+# -------------------------------------------------------------
+# Mercado Pago: Webhook idempotente (no descuenta stock)
+# -------------------------------------------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
