@@ -503,16 +503,16 @@ def crear_preferencia():
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    token, base_api = get_mp_token_and_base()  # usa modo test/live
+    token, _ = get_mp_token_and_base()   # token según modo test/live
     prod = Producto.query.get(product_id)
-
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
-
     if litros_req < 1:
         return json_error("litros debe ser >= 1", 400)
 
-    # referencia externa con nombre del producto y litros
+    # URL correcta de tu backend para recibir el webhook
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+
     external_ref = f"{prod.nombre} - {litros_req}L"
 
     body = {
@@ -537,7 +537,8 @@ def crear_preferencia():
             "failure": WEB_URL,
             "pending": WEB_URL,
         },
-        "notification_url": f"{base_api}/api/mp/webhook",
+        # 👇 ESTA es la línea clave
+        "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
 
@@ -557,13 +558,13 @@ def crear_preferencia():
         r.raise_for_status()
     except Exception as e:
         app.logger.exception("[MP] error al crear preferencia (modo %s)", get_mp_mode())
-        resp_txt = ""
+        txt = ""
         try:
             if r is not None:
-                resp_txt = r.text[:400]
+                txt = r.text[:400]
         except Exception:
             pass
-        return json_error("mp_preference_failed", 502, f"{type(e).__name__}: {e} {resp_txt}")
+        return json_error("mp_preference_failed", 502, f"{type(e).__name__}: {e} {txt}")
 
     return ok_json(r.json())
 
