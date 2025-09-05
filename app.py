@@ -504,10 +504,8 @@ def crear_preferencia():
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    # token según modo (usa MP_ACCESS_TOKEN_TEST o MP_ACCESS_TOKEN_LIVE)
-    token, _base_api = get_mp_token_and_base()
-    if not token:
-        return json_error("MP token no configurado (TEST/LIVE)", 500)
+    # token + base según modo (test/live)
+    token, base_api = get_mp_token_and_base()
 
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
@@ -516,31 +514,36 @@ def crear_preferencia():
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
-    external_ref = f"{prod.nombre} - {litros}L",
+    # *** REFERENCIA MIXTA: legible + fallback técnico ***
+    # (si no llegan metadata en el webhook, parseamos lo que va después del "|")
+    external_ref = f"{prod.nombre}-{litros}L | pid={prod.id};slot={prod.slot_id};litros={litros}"
+
     body = {
         "items": [{
             "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
+            "title": prod.nombre,           # nombre visible
+            "description": prod.nombre,     # redundante
             "quantity": 1,
             "currency_id": "ARS",
             "unit_price": float(prod.precio),
         }],
-        "description": prod.nombre,
+        "description": prod.nombre,          # redundante a nivel preferencia
         "additional_info": {
             "items": [{
                 "id": str(prod.id),
                 "title": prod.nombre,
                 "quantity": 1,
-                "unit_price": float(prod.precio),
+                "unit_price": float(prod.precio)
             }]
         },
+        # Metadata técnica (camino principal)
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
             "producto": prod.nombre,
             "litros": int(litros),
         },
+        # Fallback técnico embebido en texto legible:
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
@@ -551,28 +554,20 @@ def crear_preferencia():
     app.logger.info(f"[MP] preferencia req → {body}")
     try:
         r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            f"{base_api}/checkout/preferences",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=body, timeout=20
         )
-        # Log fuerte para ver errores crudos en Railway
-        app.logger.info("[MP] pref resp %s %s", r.status_code, r.text[:500])
         r.raise_for_status()
     except Exception as e:
         app.logger.exception("[MP] error al crear preferencia")
-        # devolvemos el texto de MP para diagnosticar
-        detail = getattr(r, "text", str(e))[:600]
-        return json_error("mp_preference_failed", 502, detail)
+        return json_error("mp_preference_failed", 502, getattr(r, "text", str(e))[:400])
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
     if not link:
         return json_error("preferencia_sin_link", 502, pref)
     return ok_json({"ok": True, "link": link, "raw": pref})
-
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
