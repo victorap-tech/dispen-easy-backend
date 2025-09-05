@@ -496,21 +496,18 @@ def pagos_reenviar(pid):
     })
 
 # -------------------------------------------------------------
-# Mercado Pago
+# Mercado Pago: crear preferencia (elige token por modo)
 # -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
-    """
-    Crea la preferencia de pago con nombre correcto de producto.
-    Usa el modo actual (test/live) para el token.
-    """
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    token, base_api = get_mp_token_and_base()
+    # token según modo (usa MP_ACCESS_TOKEN_TEST o MP_ACCESS_TOKEN_LIVE)
+    token, _base_api = get_mp_token_and_base()
     if not token:
-        return json_error("MP_ACCESS_TOKEN faltante para el modo actual", 500)
+        return json_error("MP token no configurado (TEST/LIVE)", 500)
 
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
@@ -519,6 +516,7 @@ def crear_preferencia():
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
         "items": [{
             "id": str(prod.id),
@@ -534,7 +532,7 @@ def crear_preferencia():
                 "id": str(prod.id),
                 "title": prod.nombre,
                 "quantity": 1,
-                "unit_price": float(prod.precio)
+                "unit_price": float(prod.precio),
             }]
         },
         "metadata": {
@@ -543,7 +541,7 @@ def crear_preferencia():
             "producto": prod.nombre,
             "litros": int(litros),
         },
-        "external_reference": f"pid={prod.id};slot={prod.slot_id};litros={litros}",
+        "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
         "notification_url": f"{backend_base}/api/mp/webhook",
@@ -553,14 +551,21 @@ def crear_preferencia():
     app.logger.info(f"[MP] preferencia req → {body}")
     try:
         r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
             json=body, timeout=20
         )
+        # Log fuerte para ver errores crudos en Railway
+        app.logger.info("[MP] pref resp %s %s", r.status_code, r.text[:500])
         r.raise_for_status()
     except Exception as e:
         app.logger.exception("[MP] error al crear preferencia")
-        return json_error("mp_preference_failed", 502, getattr(r, "text", str(e))[:400])
+        # devolvemos el texto de MP para diagnosticar
+        detail = getattr(r, "text", str(e))[:600]
+        return json_error("mp_preference_failed", 502, detail)
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
