@@ -9,6 +9,7 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import text
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
@@ -36,10 +37,9 @@ DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 # Seguridad Admin
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
-# Telegram (notificaciones bajo stock)
+# Telegram (opcional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5") or 5)
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # -------------------------------------------------------------
 # App / DB / CORS
@@ -75,6 +75,8 @@ class Producto(db.Model):
     cantidad = db.Column(db.Integer, nullable=False)            # stock disponible (L)
     slot_id = db.Column(db.Integer, nullable=False, unique=True, index=True)
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
+    # NUEVO: colchón para mangueras, etc.
+    reserva_litros = db.Column(db.Integer, nullable=False, server_default="1")
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
@@ -100,6 +102,14 @@ with app.app_context():
     if not KV.query.get("mp_mode"):
         db.session.add(KV(key="mp_mode", value="test"))
         db.session.commit()
+    # --- Auto-migración suave: agregar reserva_litros si falta ---
+    try:
+        # funciona en Postgres; ignora error si ya existe
+        db.session.execute(text("ALTER TABLE producto ADD COLUMN IF NOT EXISTS reserva_litros INTEGER NOT NULL DEFAULT 1"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("[DB] No se pudo auto-agregar columna reserva_litros (ignorable si ya existe)")
 
 # -------------------------------------------------------------
 # Helpers
@@ -130,33 +140,23 @@ def serialize_producto(p: Producto) -> dict:
         "cantidad": int(p.cantidad),
         "slot": int(p.slot_id),
         "porcion_litros": int(getattr(p, "porcion_litros", 1) or 1),
+        "reserva_litros": int(getattr(p, "reserva_litros", 1) or 1),
         "habilitado": bool(p.habilitado),
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
-# -------------------------------------------------------------
-# Telegram helpers
-# -------------------------------------------------------------
 def send_telegram(msg: str):
-    """Envía un mensaje a Telegram si hay token/chat configurados."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        app.logger.warning(f"[TELEGRAM] error enviando: {e}")
-
-def notify_low_stock(prod: Producto):
-    """Notifica si el stock quedó ≤ umbral."""
-    try:
-        stock_l = int(getattr(prod, "cantidad", 0) or 0)
-        if stock_l <= LOW_STOCK_THRESHOLD:
-            send_telegram(f"⚠️ Bajo stock: {prod.nombre} (slot {prod.slot_id}) → {stock_l} L restantes")
-    except Exception as e:
-        app.logger.warning(f"[TELEGRAM] error low-stock: {e}")
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=8
+        )
+    except Exception:
+        app.logger.exception("[TG] error enviando telegram")
 
 # -------------------------------------------------------------
 # Autenticación simple por header
@@ -164,21 +164,18 @@ def notify_low_stock(prod: Producto):
 PUBLIC_PATHS = {
     "/",                        # health
     "/api/mp/webhook",          # Webhook de MP
-    "/api/pagos/preferencia",   # generar link/QR (desde el admin, pero puede usarse sin header)
+    "/api/pagos/preferencia",   # generar link/QR
     "/api/pagos/pendiente",     # consulta del ESP32
     "/api/config",              # lee modo mp para pintar UI
 }
 
 @app.before_request
 def _auth_guard():
-    # CORS preflight
     if request.method == "OPTIONS":
         return "", 200
-    # pública
     p = request.path.rstrip("/")
     if p in PUBLIC_PATHS:
         return None
-    # admin
     if not ADMIN_SECRET:
         return None
     if request.headers.get("x-admin-secret") != ADMIN_SECRET:
@@ -251,11 +248,13 @@ def _mqtt_on_message(client, userdata, msg):
                 prod = Producto.query.get(p.product_id) if p.product_id else None
                 if prod:
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
+                    # Si llegó a la reserva, auto-deshabilitar y notificar
+                    if prod.cantidad <= int(getattr(prod, "reserva_litros", 1) or 1):
+                        if prod.habilitado:
+                            prod.habilitado = False
+                        send_telegram(f"⚠️ Bajo stock en slot {prod.slot_id} ({prod.nombre}). Stock: {prod.cantidad}L")
                 p.dispensado = True
                 db.session.commit()
-                # 🔔 Aviso bajo stock (si corresponde)
-                if prod:
-                    notify_low_stock(prod)
             except Exception:
                 db.session.rollback()
                 app.logger.exception("[MQTT] error al marcar dispensado/stock")
@@ -324,7 +323,9 @@ def api_set_mode():
     if mode not in ("test", "live"):
         return json_error("modo inválido (test|live)", 400)
     kv = KV.query.get("mp_mode")
-    if not kv: kv = KV(key="mp_mode", value=mode); db.session.add(kv)
+    if not kv: 
+        kv = KV(key="mp_mode", value=mode)
+        db.session.add(kv)
     kv.value = mode
     db.session.commit()
     return ok_json({"ok": True, "mp_mode": mode})
@@ -347,9 +348,10 @@ def productos_create():
             cantidad=int(float(data.get("cantidad", 0))),
             slot_id=int(data.get("slot", 1)),
             porcion_litros=int(data.get("porcion_litros", 1)),
+            reserva_litros=int(data.get("reserva_litros", 1)),
             habilitado=bool(data.get("habilitado", False)),
         )
-        if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1:
+        if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1 or p.reserva_litros < 0:
             return json_error("Valores inválidos", 400)
         if Producto.query.filter(Producto.slot_id == p.slot_id).first():
             return json_error("Slot ya asignado a otro producto", 409)
@@ -373,6 +375,10 @@ def productos_update(pid):
             val = int(data["porcion_litros"])
             if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
             p.porcion_litros = val
+        if "reserva_litros" in data:
+            rv = int(data["reserva_litros"])
+            if rv < 0: return json_error("reserva_litros debe ser ≥ 0", 400)
+            p.reserva_litros = rv
         if "slot" in data:
             new_slot = int(data["slot"])
             if new_slot != p.slot_id and \
@@ -407,9 +413,10 @@ def productos_reponer(pid):
         return json_error("Litros inválidos", 400)
     try:
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
+        # si sube por encima de reserva, se puede re-habilitar (opcional)
+        if p.cantidad > int(getattr(p, "reserva_litros", 1) or 1):
+            p.habilitado = True
         db.session.commit()
-        # 🔔 Aviso bajo stock luego de reponer (por si sigue en umbral)
-        notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -424,9 +431,9 @@ def productos_reset(pid):
         return json_error("Litros inválidos", 400)
     try:
         p.cantidad = int(litros)
+        if p.cantidad > int(getattr(p, "reserva_litros", 1) or 1):
+            p.habilitado = True
         db.session.commit()
-        # 🔔 Aviso bajo stock tras reset (si quedó bajo)
-        notify_low_stock(p)
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -434,7 +441,7 @@ def productos_reset(pid):
         return json_error("Error reseteando stock", 500, str(e))
 
 # -------------------------------------------------------------
-# Pagos: listado y pendiente/confirmación
+# Pagos
 # -------------------------------------------------------------
 @app.get("/api/pagos")
 def pagos_list():
@@ -489,6 +496,7 @@ def pagos_pendiente():
         data["producto_nombre"] = prod.nombre
         data["porcion_litros"] = int(getattr(prod, "porcion_litros", 1))
         data["stock_litros"] = int(prod.cantidad)
+        data["reserva_litros"] = int(getattr(prod, "reserva_litros", 1))
     return jsonify({"ok": True, "pago": data})
 
 @app.post("/api/pagos/<int:pid>/dispensado")
@@ -501,11 +509,13 @@ def pagos_dispensado(pid):
         return json_error("Producto no encontrado para este pago", 404)
     litros_desc = int(p.litros or 0) or 1
     prod.cantidad = max(0, int(prod.cantidad) - litros_desc)
+    if prod.cantidad <= int(getattr(prod, "reserva_litros", 1) or 1):
+        if prod.habilitado:
+            prod.habilitado = False
+        send_telegram(f"⚠️ Bajo stock en slot {prod.slot_id} ({prod.nombre}). Stock: {prod.cantidad}L")
     p.dispensado = True
     p.procesado = True
     db.session.commit()
-    # 🔔 Aviso bajo stock (si corresponde)
-    notify_low_stock(prod)
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
                     "producto": {"id": prod.id, "stock": prod.cantidad}})
@@ -533,7 +543,7 @@ def pagos_reenviar(pid):
     })
 
 # -------------------------------------------------------------
-# Mercado Pago: crear preferencia (elige token por modo)
+# Mercado Pago: crear preferencia (con bloqueo por reserva)
 # -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
@@ -541,7 +551,6 @@ def crear_preferencia():
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    # token según modo (usa MP_ACCESS_TOKEN_TEST o MP_ACCESS_TOKEN_LIVE)
     token, _base_api = get_mp_token_and_base()
     if not token:
         return json_error("MP token no configurado (TEST/LIVE)", 500)
@@ -551,8 +560,17 @@ def crear_preferencia():
         return json_error("producto no disponible", 400)
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
+    # BLOQUEO: debe quedar por lo menos reserva_litros luego de la venta
+    reserva = int(getattr(prod, "reserva_litros", 1) or 1)
+    if int(prod.cantidad) - litros < reserva:
+        return json_error("sin_stock_suficiente_reserva", 409, {
+            "stock": int(prod.cantidad),
+            "solicitado": litros,
+            "reserva": reserva
+        })
+
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
         "items": [{
@@ -595,12 +613,10 @@ def crear_preferencia():
             },
             json=body, timeout=20
         )
-        # Log fuerte para ver errores crudos en Railway
         app.logger.info("[MP] pref resp %s %s", r.status_code, r.text[:500])
         r.raise_for_status()
     except Exception as e:
         app.logger.exception("[MP] error al crear preferencia")
-        # devolvemos el texto de MP para diagnosticar
         detail = getattr(r, "text", str(e))[:600]
         return json_error("mp_preference_failed", 502, detail)
 
@@ -611,7 +627,7 @@ def crear_preferencia():
     return ok_json({"ok": True, "link": link, "raw": pref})
 
 # -------------------------------------------------------------
-# Mercado Pago: Webhook idempotente (no descuenta stock)
+# Webhook MP (idempotente)
 # -------------------------------------------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
@@ -620,7 +636,6 @@ def mp_webhook():
     topic = args.get("topic") or body.get("type")  # payment | merchant_order
     live_mode = bool(body.get("live_mode", True))
 
-    # ATENCIÓN: Payments v1 responde igual para sandbox/live; elegimos base por live_mode.
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
     token, _ = get_mp_token_and_base()
 
