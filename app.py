@@ -516,7 +516,7 @@ def crear_preferencia():
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
+    external_ref = f"{producto.nombre} - {litros}L",
     body = {
         "items": [{
             "id": str(prod.id),
