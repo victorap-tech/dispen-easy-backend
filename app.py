@@ -503,18 +503,16 @@ def crear_preferencia():
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    token, _ = get_mp_token_and_base()   # token según modo test/live
+    token, base_api = get_mp_token_and_base()
+
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
-    if litros_req < 1:
-        return json_error("litros debe ser >= 1", 400)
 
-    # URL correcta de tu backend para recibir el webhook
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
-    # texto legible + clave-valor para que el webhook pueda recuperar datos si falta metadata
-external_ref = f"{prod.nombre} - {litros_req}L | pid={prod.id};slot={prod.slot_id};litros={litros_req}"
+    # external_ref combina legible + clave/valor para fallback
+    external_ref = f"{prod.nombre} - {litros_req}L | pid={prod.id};slot={prod.slot_id};litros={litros_req}"
 
     body = {
         "items": [{
@@ -525,6 +523,7 @@ external_ref = f"{prod.nombre} - {litros_req}L | pid={prod.id};slot={prod.slot_i
             "currency_id": "ARS",
             "unit_price": float(prod.precio),
         }],
+        "description": prod.nombre,
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
@@ -538,36 +537,22 @@ external_ref = f"{prod.nombre} - {litros_req}L | pid={prod.id};slot={prod.slot_i
             "failure": WEB_URL,
             "pending": WEB_URL,
         },
-        # 👇 ESTA es la línea clave
         "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
+        "statement_descriptor": "DISPEN-EASY"
     }
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-    r = None
     try:
         r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers=headers,
+            f"{base_api}/checkout/preferences",
+            headers={"Authorization": f"Bearer {token}"},
             json=body,
-            timeout=20,
+            timeout=10,
         )
         r.raise_for_status()
+        return ok_json(r.json())
     except Exception as e:
-        app.logger.exception("[MP] error al crear preferencia (modo %s)", get_mp_mode())
-        txt = ""
-        try:
-            if r is not None:
-                txt = r.text[:400]
-        except Exception:
-            pass
-        return json_error("mp_preference_failed", 502, f"{type(e).__name__}: {e} {txt}")
-
-    return ok_json(r.json())
+        app.logger.error(f"mp_preference_failed {str(e)}")
+        return json_error("mp_preference_failed", 502, str(e))
 
 @app.post("/api/mp/webhook")
 def mp_webhook():
