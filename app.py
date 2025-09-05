@@ -514,8 +514,7 @@ def crear_preferencia():
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
     # texto legible + clave-valor para que el webhook pueda recuperar datos si falta metadata
-external_ref = f"{prod.nombre} - {litros_req}L | 
-pid={prod.id};slot={prod.slot_id};litros={litros_req}"
+external_ref = f"{prod.nombre} - {litros_req}L | pid={prod.id};slot={prod.slot_id};litros={litros_req}"
 
     body = {
         "items": [{
