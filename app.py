@@ -497,77 +497,76 @@ def pagos_reenviar(pid):
 
 # -------------------------------------------------------------
 # Mercado Pago: crear preferencia (elige token por modo)
-# -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia():
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
 
-    # token + base según modo (test/live)
-    token, base_api = get_mp_token_and_base()
-
+    token, base_api = get_mp_token_and_base()  # usa modo test/live
     prod = Producto.query.get(product_id)
+
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
 
-    litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    if litros_req < 1:
+        return json_error("litros debe ser >= 1", 400)
 
-    # *** REFERENCIA MIXTA: legible + fallback técnico ***
-    # (si no llegan metadata en el webhook, parseamos lo que va después del "|")
-    external_ref = f"{prod.nombre}-{litros}L | pid={prod.id};slot={prod.slot_id};litros={litros}"
+    # referencia externa con nombre del producto y litros
+    external_ref = f"{prod.nombre} - {litros_req}L"
 
     body = {
         "items": [{
             "id": str(prod.id),
-            "title": prod.nombre,           # nombre visible
-            "description": prod.nombre,     # redundante
+            "title": prod.nombre,
+            "description": prod.nombre,
             "quantity": 1,
             "currency_id": "ARS",
             "unit_price": float(prod.precio),
         }],
-        "description": prod.nombre,          # redundante a nivel preferencia
-        "additional_info": {
-            "items": [{
-                "id": str(prod.id),
-                "title": prod.nombre,
-                "quantity": 1,
-                "unit_price": float(prod.precio)
-            }]
-        },
-        # Metadata técnica (camino principal)
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
             "producto": prod.nombre,
-            "litros": int(litros),
+            "litros": int(litros_req),
         },
-        # Fallback técnico embebido en texto legible:
         "external_reference": external_ref,
         "auto_return": "approved",
-        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
-        "notification_url": f"{backend_base}/api/mp/webhook",
+        "back_urls": {
+            "success": WEB_URL,
+            "failure": WEB_URL,
+            "pending": WEB_URL,
+        },
+        "notification_url": f"{base_api}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
 
-    app.logger.info(f"[MP] preferencia req → {body}")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    r = None
     try:
         r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
+            "https://api.mercadopago.com/checkout/preferences",
+            headers=headers,
+            json=body,
+            timeout=20,
         )
         r.raise_for_status()
     except Exception as e:
-        app.logger.exception("[MP] error al crear preferencia")
-        return json_error("mp_preference_failed", 502, getattr(r, "text", str(e))[:400])
+        app.logger.exception("[MP] error al crear preferencia (modo %s)", get_mp_mode())
+        resp_txt = ""
+        try:
+            if r is not None:
+                resp_txt = r.text[:400]
+        except Exception:
+            pass
+        return json_error("mp_preference_failed", 502, f"{type(e).__name__}: {e} {resp_txt}")
 
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-    return ok_json({"ok": True, "link": link, "raw": pref})
+    return ok_json(r.json())
+
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
