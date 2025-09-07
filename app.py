@@ -620,7 +620,10 @@ def crear_preferencia_api():
         },
         "external_reference": external_ref,
         "auto_return": "approved",
-        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
+        "back_urls": {
+            "success": f"{WEB_URL}/gracias?status=success",
+            "failure": f"{WEB_URL}/gracias?status=failure",
+            "pending": f"{WEB_URL}/gracias?status=pending",
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
