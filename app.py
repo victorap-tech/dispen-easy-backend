@@ -5,7 +5,7 @@ import threading
 import requests
 import json as _json
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
@@ -20,7 +20,7 @@ if DATABASE_URL.startswith("postgres://"):
 
 # URLs
 BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL", "") or "").rstrip("/")
-WEB_URL = os.getenv("WEB_URL", "https://example.com").strip()
+WEB_URL = os.getenv("WEB_URL", "https://example.com").strip().rstrip("/")
 
 # Modo MP (test/live) y tokens
 MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
@@ -37,8 +37,8 @@ DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 # Umbrales de stock
-UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)  # notifica si stock ≤ umbral
-STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)  # bloquea QR si stock ≤ reserva
+UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)   # notifica si stock ≤ umbral
+STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)   # bloquea venta si dejaría stock ≤ reserva
 
 # Telegram (opcional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -86,7 +86,7 @@ class Pago(db.Model):
     __tablename__ = "pago"
     id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
-    estado = db.Column(db.String(80), nullable=False)           # approved/pending/rejected/refunded/cancelled
+    estado = db.Column(db.String(80), nullable=False)           # approved/pending/rejected
     producto = db.Column(db.String(120), nullable=False, default="")
     dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))  # idempotencia
@@ -190,19 +190,22 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
 PUBLIC_PATHS = {
     "/",                        # health
     "/api/mp/webhook",          # Webhook de MP
-    "/api/pagos/preferencia",   # generar link/QR
+    "/api/pagos/preferencia",   # generar link/QR (admin o herramientas)
     "/api/pagos/pendiente",     # consulta del ESP32
-    "/api/config",              # lee modo y umbrales para UI
-    "/api/pagos/estado",        # consulta pública por payment_id desde p_result.html
+    "/api/config",              # lee modo/umbrales para UI
+    "/go",                      # QR dinámico
 }
 
 @app.before_request
 def _auth_guard():
+    # CORS preflight
     if request.method == "OPTIONS":
         return "", 200
+    # Pública
     p = request.path.rstrip("/")
     if p in PUBLIC_PATHS:
         return None
+    # Admin
     if not ADMIN_SECRET:
         return None
     if request.headers.get("x-admin-secret") != ADMIN_SECRET:
@@ -225,20 +228,6 @@ def get_mp_token_and_base() -> tuple[str, str]:
         token = MP_ACCESS_TOKEN_TEST
         base_api = "https://api.sandbox.mercadopago.com"
     return token, base_api
-
-# Refund helper
-def mp_refund(payment_id: str, token: str) -> bool:
-    try:
-        r = requests.post(
-            f"https://api.mercadopago.com/v1/payments/{payment_id}/refunds",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={}, timeout=20
-        )
-        app.logger.info(f"[MP] refund {payment_id} → {r.status_code} {r.text[:300]}")
-        return r.ok
-    except Exception:
-        app.logger.exception("[MP] refund error")
-        return False
 
 # -------------------------------------------------------------
 # MQTT
@@ -354,10 +343,8 @@ def api_get_config():
     umbral, reserva = get_thresholds()
     return ok_json({
         "mp_mode": get_mp_mode(),
-        "stock": {
-            "umbral_alerta_lts": umbral,
-            "reserva_critica_lts": reserva,
-        }
+        "umbral_alerta_lts": umbral,
+        "stock_reserva_lts": reserva,
     })
 
 @app.post("/api/mp/mode")
@@ -582,33 +569,11 @@ def pagos_reenviar(pid):
         "pago": {"id": p.id, "mp_payment_id": p.mp_payment_id, "slot_id": p.slot_id, "litros": litros}
     })
 
-# Consulta pública por estado (para p_result.html)
-@app.get("/api/pagos/estado")
-def pagos_estado():
-    payment_id = str(request.args.get("payment_id") or "").strip()
-    if not payment_id:
-        return json_error("falta payment_id", 400)
-    p = Pago.query.filter_by(mp_payment_id=payment_id).first()
-    if not p:
-        return json_error("not_found", 404)
-    out_of_stock = bool((p.raw or {}).get("out_of_stock"))
-    return jsonify({
-        "ok": True,
-        "payment_id": p.mp_payment_id,
-        "estado": p.estado,
-        "dispensado": bool(p.dispensado),
-        "slot_id": p.slot_id,
-        "litros": p.litros,
-        "product_id": p.product_id,
-        "out_of_stock": out_of_stock,
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-    })
-
 # -------------------------------------------------------------
-# Mercado Pago: crear preferencia (elige token por modo) + bloqueo por reserva
+# Mercado Pago: crear preferencia (API) con bloqueo por reserva
 # -------------------------------------------------------------
 @app.post("/api/pagos/preferencia")
-def crear_preferencia():
+def crear_preferencia_api():
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
     litros_req = _to_int(data.get("litros") or 0)
@@ -624,13 +589,9 @@ def crear_preferencia():
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
-    umbral, reserva = get_thresholds()
+    _, reserva = get_thresholds()
     if (int(prod.cantidad) - litros) <= reserva:
-        return json_error(
-            f"Stock insuficiente: operación dejaría stock ≤ reserva ({reserva} L). "
-            f"Stock actual: {prod.cantidad} L, requerido: {litros} L.",
-            409
-        )
+        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
@@ -659,23 +620,15 @@ def crear_preferencia():
         },
         "external_reference": external_ref,
         "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL.rstrip('/')}/p_result.html",
-            "failure": f"{WEB_URL.rstrip('/')}/p_result.html",
-            "pending": f"{WEB_URL.rstrip('/')}/p_result.html",
-        },
+        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
 
-    app.logger.info(f"[MP] preferencia req → {body}")
     try:
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=body, timeout=20
         )
         app.logger.info("[MP] pref resp %s %s", r.status_code, r.text[:500])
@@ -692,7 +645,81 @@ def crear_preferencia():
     return ok_json({"ok": True, "link": link, "raw": pref})
 
 # -------------------------------------------------------------
-# Mercado Pago: Webhook idempotente (con verificación final de stock y refund)
+# QR DINÁMICO: /go → verifica stock/habilitado y redirige
+# -------------------------------------------------------------
+@app.get("/go")
+def go():
+    """
+    Uso:
+      /go?pid=PRODUCTO_ID
+      /go?pid=PRODUCTO_ID&litros=2   (opcional; si no, usa porcion_litros actual)
+    Comportamiento:
+      - Si producto no existe / deshabilitado / stock insuficiente según reserva ⇒ WEB_URL/sin-stock?pid=...
+      - Si OK ⇒ crea preferencia de MP y redirige (302) al init_point actual (precio/nombre vigentes).
+    """
+    pid = _to_int(request.args.get("pid") or 0)
+    litros_req = _to_int(request.args.get("litros") or 0)
+
+    if not pid:
+        return redirect(f"{WEB_URL}/sin-stock")
+
+    prod = Producto.query.get(pid)
+    if not prod:
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+    if not prod.habilitado:
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+    litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
+    _, reserva = get_thresholds()
+    if (int(prod.cantidad) - litros) <= reserva:
+        # No alcanza respetando reserva → sin stock
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+    # Crear pref igual que en /api/pagos/preferencia pero interno y redirigir
+    token, _ = get_mp_token_and_base()
+    if not token:
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
+    body = {
+        "items": [{
+            "id": str(prod.id),
+            "title": prod.nombre,
+            "description": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(prod.precio),
+        }],
+        "description": prod.nombre,
+        "additional_info": {"items": [{"id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio)}]},
+        "metadata": {"slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre, "litros": int(litros)},
+        "external_reference": external_ref,
+        "auto_return": "approved",
+        "back_urls": {"success": WEB_URL, "failure": WEB_URL, "pending": WEB_URL},
+        "notification_url": f"{backend_base}/api/mp/webhook",
+        "statement_descriptor": "DISPEN-EASY",
+    }
+
+    try:
+        r = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body, timeout=20
+        )
+        r.raise_for_status()
+        pref = r.json() or {}
+        link = pref.get("init_point") or pref.get("sandbox_init_point")
+        if not link:
+            return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+        return redirect(link, code=302)
+    except Exception:
+        app.logger.exception("[MP] error creando preferencia en /go")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+# -------------------------------------------------------------
+# Mercado Pago: Webhook idempotente (no descuenta stock)
 # -------------------------------------------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
@@ -796,32 +823,8 @@ def mp_webhook():
         app.logger.exception("[DB] error guardando pago")
         return "ok", 200
 
-    # Publicación / Refund según stock
     try:
         if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
-
-            # Verificación final de stock antes de enviar a MQTT
-            prod = Producto.query.get(p.product_id) if p.product_id else None
-            umbral, reserva = get_thresholds()
-            falta_stock = (not prod) or (int(prod.cantidad or 0) < int(p.litros or 1)) \
-                           or ((int(prod.cantidad or 0) - int(p.litros or 1)) <= reserva)
-
-            if falta_stock:
-                ok_refund = mp_refund(p.mp_payment_id, token)
-                p.procesado = True
-                raw = p.raw or {}
-                raw["out_of_stock"] = True
-                raw["refund_ok"] = ok_refund
-                p.raw = raw
-                p.estado = "refunded" if ok_refund else "cancelled"
-                db.session.commit()
-                try:
-                    tg_notify(f"❌ Pago {p.mp_payment_id} reembolsado por falta de stock de '{producto_txt}'.")
-                except Exception:
-                    pass
-                return "ok", 200
-
-            # Hay stock → publicar al ESP
             published = send_dispense_cmd(p.mp_payment_id, p.slot_id, p.litros,
                                           timeout_s=max(30, p.litros * 5))
             if published:
