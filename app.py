@@ -623,7 +623,8 @@ def crear_preferencia_api():
         "back_urls": {
             "success": f"{WEB_URL}/gracias?status=success",
             "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending",
+            "pending": f"{WEB_URL}/gracias?status=pending"
+        },
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
