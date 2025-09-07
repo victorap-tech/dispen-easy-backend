@@ -865,6 +865,74 @@ def api_dispense_orden():
     ok = send_dispense_cmd(payment_id, slot_id, litros, timeout_s=max(30, litros*5))
     return jsonify({"ok": ok})
 
+# --- PÁGINAS PÚBLICAS PARA MP Y QR ---
+
+from flask import make_response, request
+
+def _html_page(title: str, subtitle: str = "", extra: str = ""):
+    html = f"""<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+<style>
+  body {{ margin:0; background:#0b1220; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+  .box {{ max-width:680px; margin:14vh auto; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
+         border-radius:18px; padding:28px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
+  h1 {{ margin:0 0 6px; font-size:34px; }}
+  p  {{ margin:6px 0; opacity:.9; }}
+  .ok {{ color:#10b981; font-weight:800; }}
+  .err{{ color:#ef4444; font-weight:800; }}
+  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
+           text-decoration:none; font-weight:700; }}
+</style>
+</head><body>
+  <div class="box">
+    <h1>{title}</h1>
+    <p>{subtitle}</p>
+    {extra}
+  </div>
+</body></html>"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
+@app.get("/gracias")
+def pagina_gracias():
+    """
+    Landing de retorno desde MercadoPago (success/failure/pending).
+    Pública, sin auth.
+    """
+    status = (request.args.get("status") or "").lower()
+    pay_id = request.args.get("payment_id") or request.args.get("collection_id") or ""
+    extref = request.args.get("external_reference") or ""
+
+    if status == "success" or status == "approved":
+        title = "¡Gracias por su compra!"
+        subtitle = '<span class="ok">Pago aprobado.</span> En breve se dispensará el producto.'
+    elif status in ("pending", "in_process"):
+        title = "Pago pendiente"
+        subtitle = "Tu pago está en revisión. Si se aprueba, se dispensará automáticamente."
+    else:
+        title = "Pago no completado"
+        subtitle = '<span class="err">El pago fue cancelado o rechazado.</span>'
+
+    extra = ""
+    if pay_id or extref:
+        extra = f"<p style='opacity:.7;font-size:12px'>Ref: {pay_id or extref}</p>"
+
+    return _html_page(title, subtitle, extra)
+
+
+@app.get("/sin-stock")
+def pagina_sin_stock():
+    """Pantalla pública cuando un QR está bloqueado por reserva crítica."""
+    title = "❌ Producto sin stock"
+    subtitle = "Este producto alcanzó la reserva crítica y no está disponible por ahora. Probá más tarde."
+    extra = '<a class="btn" href="javascript:history.back()">Volver</a>'
+    return _html_page(title, subtitle, extra)
+    
 # -------------------------------------------------------------
 # Inicializar MQTT y Run
 # -------------------------------------------------------------
