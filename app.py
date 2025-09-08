@@ -8,7 +8,8 @@ import json as _json
 from flask import Flask, jsonify, request, redirect, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, INTEGER
+from sqlalchemy import UniqueConstraint
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
@@ -26,20 +27,18 @@ WEB_URL = os.getenv("WEB_URL", "https://example.com").strip().rstrip("/")
 MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
 MP_ACCESS_TOKEN_LIVE = os.getenv("MP_ACCESS_TOKEN_LIVE", "").strip()
 
-# MQTT
+# Broker MQTT (compartido) – se multiplexa por device_id en el tópico
 MQTT_HOST = os.getenv("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
-# DEVICE_ID por compat; ahora los productos tienen su propio device_id
-DEFAULT_DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 
 # Seguridad Admin
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 # Umbrales de stock
-UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)   # notifica si stock ≤ umbral
-STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "2") or 2)   # bloquea venta si dejaría stock ≤ reserva
+UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)
+STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)
 
 # Telegram (opcional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -74,37 +73,39 @@ class KV(db.Model):
 class Dispenser(db.Model):
     __tablename__ = "dispenser"
     id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(80), unique=True, nullable=False, index=True)
-    nombre = db.Column(db.String(120), nullable=True, default="")
-    notas = db.Column(db.String(240), nullable=True, default="")
+    device_id = db.Column(db.String(80), nullable=False, unique=True, index=True)
+    nombre = db.Column(db.String(100), nullable=True, default="")
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
-    last_seen = db.Column(db.DateTime(timezone=True), nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 class Producto(db.Model):
     __tablename__ = "producto"
     id = db.Column(db.Integer, primary_key=True)
+    dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="SET NULL"), nullable=True, index=True)
     nombre = db.Column(db.String(100), nullable=False)
-    precio = db.Column(db.Float, nullable=False)                # $ por litro
-    cantidad = db.Column(db.Integer, nullable=False)            # stock disponible (L)
-    slot_id = db.Column(db.Integer, nullable=False, index=True) # OJO: antes era unique=True
+    precio = db.Column(db.Float, nullable=False)                 # $ por litro
+    cantidad = db.Column(db.Integer, nullable=False)             # stock disponible (L)
+    slot_id = db.Column(db.Integer, nullable=False)              # slot físico dentro del dispenser
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
-    device_id = db.Column(db.String(80), nullable=False, server_default="dispen-01")  # <---
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+    __table_args__ = (UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),)
 
 class Pago(db.Model):
     __tablename__ = "pago"
     id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
-    estado = db.Column(db.String(80), nullable=False)           # approved/pending/rejected
+    estado = db.Column(db.String(80), nullable=False)            # approved/pending/rejected
     producto = db.Column(db.String(120), nullable=False, default="")
     dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
-    procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))  # idempotencia
+    procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     slot_id = db.Column(db.Integer, nullable=False, default=0)
     litros = db.Column(db.Integer, nullable=False, default=1)
-    monto = db.Column(db.Integer, nullable=False, default=0)    # ARS entero
+    monto = db.Column(db.Integer, nullable=False, default=0)     # ARS entero
     product_id = db.Column(db.Integer, nullable=False, default=0)
+    dispenser_id = db.Column(db.Integer, nullable=False, default=0)
+    device_id = db.Column(db.String(80), nullable=True, default="")
     raw = db.Column(JSONB, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
@@ -113,44 +114,51 @@ with app.app_context():
     if not KV.query.get("mp_mode"):
         db.session.add(KV(key="mp_mode", value="test"))
         db.session.commit()
+    # Si no hay dispensers, se crea uno por defecto
+    if Dispenser.query.count() == 0:
+        d = Dispenser(device_id="dispen-01", nombre="dispen-01 (por defecto)", activo=True)
+        db.session.add(d)
+        db.session.commit()
 
 # -------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------
-def ok_json(data, status=200):
-    return jsonify(data), status
-
+def ok_json(data, status=200): return jsonify(data), status
 def json_error(msg, status=400, extra=None):
-    payload = {"error": msg}
-    if extra is not None:
-        payload["detail"] = extra
-    return jsonify(payload), status
+    p = {"error": msg}
+    if extra is not None: p["detail"] = extra
+    return jsonify(p), status
 
 def _to_int(x, default=0):
-    try:
-        return int(x)
+    try: return int(x)
     except Exception:
-        try:
-            return int(float(x))
-        except Exception:
-            return default
+        try: return int(float(x))
+        except Exception: return default
 
 def serialize_producto(p: Producto) -> dict:
     return {
         "id": p.id,
+        "dispenser_id": p.dispenser_id,
         "nombre": p.nombre,
         "precio": float(p.precio),
         "cantidad": int(p.cantidad),
         "slot": int(p.slot_id),
         "porcion_litros": int(getattr(p, "porcion_litros", 1) or 1),
-        "device_id": getattr(p, "device_id", DEFAULT_DEVICE_ID),
         "habilitado": bool(p.habilitado),
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
+def serialize_dispenser(d: Dispenser) -> dict:
+    return {
+        "id": d.id,
+        "device_id": d.device_id,
+        "nombre": d.nombre or "",
+        "activo": bool(d.activo),
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+    }
+
 def get_thresholds():
-    """Devuelve (umbral_alerta, reserva_critica) garantizando umbral > reserva."""
     reserva = max(0, int(STOCK_RESERVA_LTS))
     umbral_cfg = max(0, int(UMBRAL_ALERTA_LTS))
     umbral = umbral_cfg if umbral_cfg > reserva else (reserva + 1)
@@ -169,57 +177,42 @@ def tg_notify(text: str):
         app.logger.exception("[TG] Error enviando notificación")
 
 def _post_stock_change_hook(prod: "Producto", motivo: str):
-    """
-    Reglas tras cambiar stock:
-    - Si stock <= umbral_alerta: notifica a Telegram.
-    - Si stock <= reserva_critica: deshabilita el producto.
-    - Si stock > reserva_critica: re-habilita el producto (si estaba deshabilitado).
-    """
     umbral, reserva = get_thresholds()
     stock = int(prod.cantidad or 0)
-
     if stock <= umbral:
         try:
             tg_notify(
-                f"⚠️ Bajo stock en '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}): {stock} L "
-                f"(umbral={umbral}, reserva={reserva}) – Motivo: {motivo}"
+                f"⚠️ Bajo stock en '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
+                f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
             )
         except Exception:
             pass
-
     if stock <= reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}) por reserva: stock={stock} ≤ {reserva}")
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} por reserva (stock={stock} ≤ {reserva})")
     else:
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}) – stock={stock} > {reserva}")
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} > {reserva})")
 
 # -------------------------------------------------------------
-# Autenticación simple por header
+# Auth simple por header
 # -------------------------------------------------------------
 PUBLIC_PATHS = {
-    "/",                        # health
-    "/api/mp/webhook",          # Webhook de MP
-    "/api/pagos/preferencia",   # generar link/QR (admin o herramientas)
-    "/api/pagos/pendiente",     # consulta del ESP32
-    "/api/config",              # lee modo/umbrales para UI
-    "/go",                      # QR dinámico
-    "/gracias",                 # landing MP
-    "/sin-stock",               # pantalla stock crítico
+    "/", "/gracias", "/sin-stock",
+    "/api/mp/webhook", "/webhook", "/mp/webhook",
+    "/api/pagos/preferencia", "/api/pagos/pendiente",
+    "/api/config", "/go",
 }
 
 @app.before_request
 def _auth_guard():
-    # CORS preflight
     if request.method == "OPTIONS":
         return "", 200
-    # Pública
-    p = request.path.rstrip("/")
+    p = request.path
     if p in PUBLIC_PATHS:
         return None
-    # Admin
     if not ADMIN_SECRET:
         return None
     if request.headers.get("x-admin-secret") != ADMIN_SECRET:
@@ -227,7 +220,7 @@ def _auth_guard():
     return None
 
 # -------------------------------------------------------------
-# Modo MP + tokens/base
+# MP modo/tokens
 # -------------------------------------------------------------
 def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
@@ -236,68 +229,45 @@ def get_mp_mode() -> str:
 def get_mp_token_and_base() -> tuple[str, str]:
     mode = get_mp_mode()
     if mode == "live":
-        token = MP_ACCESS_TOKEN_LIVE
-        base_api = "https://api.mercadopago.com"
-    else:
-        token = MP_ACCESS_TOKEN_TEST
-        base_api = "https://api.sandbox.mercadopago.com"
-    return token, base_api
+        return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
+    return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
 
 # -------------------------------------------------------------
-# MQTT
+# MQTT (único cliente, wildcard por device)
 # -------------------------------------------------------------
-# Subscribe a TODOS los dispensers (wildcard)
-MQTT_TOPIC_STATE_WC  = "dispen/+/state/dispense"
-MQTT_TOPIC_STATUS_WC = "dispen/+/status"
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
 
-def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {MQTT_TOPIC_STATE_WC} y {MQTT_TOPIC_STATUS_WC}")
-    client.subscribe(MQTT_TOPIC_STATE_WC, qos=1)
-    client.subscribe(MQTT_TOPIC_STATUS_WC, qos=1)
+def topic_cmd(device_id: str) -> str:
+    return f"dispen/{device_id}/cmd/dispense"
+def topic_state_wild() -> str:
+    return "dispen/+/state/dispense"
+def topic_status_wild() -> str:
+    return "dispen/+/status"
 
-def _extract_device_from_topic(topic: str) -> str:
-    # dispen/<device_id>/state/dispense  o  dispen/<device_id>/status
-    try:
-        parts = topic.split("/")
-        return parts[1] if len(parts) >= 2 else ""
-    except Exception:
-        return ""
+def _mqtt_on_connect(client, userdata, flags, rc, props=None):
+    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {topic_state_wild()} y {topic_status_wild()}")
+    client.subscribe(topic_state_wild(), qos=1)
+    client.subscribe(topic_status_wild(), qos=1)
 
 def _mqtt_on_message(client, userdata, msg):
-    dev_from_topic = _extract_device_from_topic(msg.topic)
     try:
         raw = msg.payload.decode("utf-8", "ignore")
     except Exception:
         raw = "<binario>"
     app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
 
-    # Actualizar last_seen del dispenser si existe
-    if dev_from_topic:
-        try:
-            with app.app_context():
-                d = Dispenser.query.filter_by(device_id=dev_from_topic).first()
-                if d:
-                    d.last_seen = db.func.now()
-                    db.session.commit()
-        except Exception:
-            db.session.rollback()
-
+    # payload esperado desde ESP: {payment_id, slot_id, litros, status:[started|done|timeout|error]}
     try:
         data = _json.loads(raw or "{}")
     except Exception:
         app.logger.exception("[MQTT] payload inválido")
         return
 
-    payment_id = str(data.get("payment_id") or data.get("paymentId") or data.get("id") or "").strip()
-    status = str(data.get("status") or data.get("state") or "").lower()
-    slot_id = _to_int(data.get("slot_id") or data.get("slot") or 0)
-    litros  = _to_int(data.get("litros") or data.get("liters") or 0)
-
+    payment_id = str(data.get("payment_id") or "").strip()
+    status = str(data.get("status") or "").lower()
     if status in ("ok", "finish", "finished", "success"):
         status = "done"
-
     if not payment_id or status not in ("done", "error", "timeout"):
         return
 
@@ -308,11 +278,11 @@ def _mqtt_on_message(client, userdata, msg):
             return
         if status == "done" and not p.dispensado:
             try:
-                litros_desc = int(p.litros or 0) or (litros or 1)
+                litros_desc = int(p.litros or 0) or 1
                 prod = Producto.query.get(p.product_id) if p.product_id else None
                 if prod:
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
-                    _post_stock_change_hook(prod, motivo=f"dispensado (ESP done; dev={dev_from_topic or prod.device_id})")
+                    _post_stock_change_hook(prod, motivo="dispensado (ESP done)")
                 p.dispensado = True
                 db.session.commit()
             except Exception:
@@ -326,7 +296,7 @@ def start_mqtt_background():
 
     def _run():
         global _mqtt_client
-        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="backend-multi")
+        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="dispen-backend")
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
         if int(MQTT_PORT) == 8883:
@@ -334,7 +304,6 @@ def start_mqtt_background():
                 _mqtt_client.tls_set()
             except Exception as e:
                 app.logger.error(f"[MQTT] No se pudo habilitar TLS: {e}")
-
         _mqtt_client.on_connect = _mqtt_on_connect
         _mqtt_client.on_message = _mqtt_on_message
         _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
@@ -343,10 +312,7 @@ def start_mqtt_background():
     t = threading.Thread(target=_run, name="mqtt-thread", daemon=True)
     t.start()
 
-def _topic_cmd(device_id: str) -> str:
-    return f"dispen/{device_id}/cmd/dispense"
-
-def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, device_id: str, timeout_s: int = 30) -> bool:
+def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int, timeout_s: int = 30) -> bool:
     if not MQTT_HOST:
         app.logger.warning("[MQTT] sin host; no se publica")
         return False
@@ -357,14 +323,14 @@ def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, device_id: str
         "timeout_s": int(timeout_s or 30),
     }
     payload = _json.dumps(msg, ensure_ascii=False)
-    topic = _topic_cmd(device_id or DEFAULT_DEVICE_ID)
     with _mqtt_lock:
         if not _mqtt_client:
             app.logger.warning("[MQTT] cliente no inicializado")
             return False
-        info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
-        ok = info.rc == mqtt.MQTT_ERR_SUCCESS
-        app.logger.info(f"[MQTT] publish → {topic} ok={ok} payload={payload}")
+        t = topic_cmd(device_id)
+        info = _mqtt_client.publish(t, payload, qos=1, retain=False)
+        ok = (info.rc == mqtt.MQTT_ERR_SUCCESS)
+        app.logger.info(f"[MQTT] publish {t} ok={ok}")
         return ok
 
 # -------------------------------------------------------------
@@ -401,82 +367,73 @@ def api_set_mode():
     return ok_json({"ok": True, "mp_mode": mode})
 
 # -------------------------------------------------------------
-# Dispensers CRUD (simple)
+# Dispensers
 # -------------------------------------------------------------
 @app.get("/api/dispensers")
-def disp_list():
-    rows = Dispenser.query.order_by(Dispenser.id.asc()).all()
-    return jsonify([
-        {
-            "id": d.id, "device_id": d.device_id, "nombre": d.nombre or d.device_id,
-            "notas": d.notas or "", "activo": bool(d.activo),
-            "last_seen": d.last_seen.isoformat() if d.last_seen else None,
-        } for d in rows
-    ])
+def dispensers_list():
+    ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
+    return jsonify([serialize_dispenser(d) for d in ds])
 
 @app.post("/api/dispensers")
-def disp_create():
-    data = request.get_json(force=True) or {}
-    dev = (data.get("device_id") or "").strip()
-    if not dev:
+def dispensers_create():
+    data = request.get_json(force=True, silent=True) or {}
+    device_id = (data.get("device_id") or "").strip()
+    nombre = (data.get("nombre") or "").strip()
+    activo = bool(data.get("activo", True))
+    if not device_id:
         return json_error("device_id requerido", 400)
-    if Dispenser.query.filter_by(device_id=dev).first():
+    if Dispenser.query.filter_by(device_id=device_id).first():
         return json_error("device_id ya existe", 409)
-    d = Dispenser(
-        device_id=dev,
-        nombre=(data.get("nombre") or "").strip() or dev,
-        notas=(data.get("notas") or "").strip(),
-        activo=bool(data.get("activo", True)),
-    )
+    d = Dispenser(device_id=device_id, nombre=nombre, activo=activo)
     db.session.add(d); db.session.commit()
-    return ok_json({"ok": True, "id": d.id, "device_id": d.device_id}, 201)
+    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)}, 201)
 
 @app.put("/api/dispensers/<int:did>")
-def disp_update(did):
+def dispensers_update(did):
     d = Dispenser.query.get_or_404(did)
-    data = request.get_json(force=True) or {}
-    if "nombre" in data: d.nombre = (data["nombre"] or "").strip()
-    if "notas" in data: d.notas = (data["notas"] or "").strip()
+    data = request.get_json(force=True, silent=True) or {}
+    if "nombre" in data: d.nombre = str(data["nombre"]).strip()
     if "activo" in data: d.activo = bool(data["activo"])
+    if "device_id" in data:
+        nid = str(data["device_id"]).strip()
+        if nid and nid != d.device_id:
+            if Dispenser.query.filter(Dispenser.device_id == nid, Dispenser.id != d.id).first():
+                return json_error("device_id ya usado", 409)
+            d.device_id = nid
     db.session.commit()
-    return ok_json({"ok": True})
+    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)})
 
 # -------------------------------------------------------------
-# Productos CRUD (multi-dispenser)
+# Productos CRUD
 # -------------------------------------------------------------
 @app.get("/api/productos")
 def productos_list():
-    # Filtro opcional por device_id ?device_id=xxx
-    dev = (request.args.get("device_id") or "").strip()
+    disp_id = _to_int(request.args.get("dispenser_id") or 0)
     q = Producto.query
-    if dev:
-        q = q.filter(Producto.device_id == dev)
-    prods = q.order_by(Producto.device_id.asc(), Producto.slot_id.asc()).all()
+    if disp_id: q = q.filter(Producto.dispenser_id == disp_id)
+    prods = q.order_by(Producto.dispenser_id.asc(), Producto.slot_id.asc()).all()
     return jsonify([serialize_producto(p) for p in prods])
 
 @app.post("/api/productos")
 def productos_create():
     data = request.get_json(force=True)
     try:
-        device_id = str(data.get("device_id") or DEFAULT_DEVICE_ID).strip()
-        slot = int(data.get("slot", 1))
-
-        # Validar que no se repita slot en el mismo device
-        if Producto.query.filter(Producto.device_id == device_id, Producto.slot_id == slot).first():
-            return json_error("Slot ya asignado a otro producto en este device", 409)
-
+        disp_id = _to_int(data.get("dispenser_id") or 0)
+        if not disp_id or not Dispenser.query.get(disp_id):
+            return json_error("dispenser_id inválido", 400)
         p = Producto(
+            dispenser_id=disp_id,
             nombre=str(data.get("nombre", "")).strip(),
             precio=float(data.get("precio", 0)),
             cantidad=int(float(data.get("cantidad", 0))),
-            slot_id=slot,
+            slot_id=int(data.get("slot", 1)),
             porcion_litros=int(data.get("porcion_litros", 1)),
-            device_id=device_id,
             habilitado=bool(data.get("habilitado", False)),
         )
         if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1:
             return json_error("Valores inválidos", 400)
-
+        if Producto.query.filter(Producto.dispenser_id == p.dispenser_id, Producto.slot_id == p.slot_id).first():
+            return json_error("Slot ya asignado a otro producto en este dispenser", 409)
         db.session.add(p)
         _post_stock_change_hook(p, motivo="create")
         db.session.commit()
@@ -493,6 +450,15 @@ def productos_update(pid):
     try:
         before = int(p.cantidad or 0)
 
+        if "dispenser_id" in data:
+            new_d = _to_int(data["dispenser_id"])
+            if new_d and new_d != p.dispenser_id and Dispenser.query.get(new_d):
+                # validamos slot único en el nuevo dispenser
+                if Producto.query.filter(Producto.dispenser_id == new_d,
+                                         Producto.slot_id == p.slot_id).first():
+                    return json_error("Slot ya usado en el nuevo dispenser", 409)
+                p.dispenser_id = new_d
+
         if "nombre" in data: p.nombre = str(data["nombre"]).strip()
         if "precio" in data: p.precio = float(data["precio"])
         if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
@@ -502,21 +468,12 @@ def productos_update(pid):
             p.porcion_litros = val
         if "slot" in data:
             new_slot = int(data["slot"])
-            # Validación por device_id
             if new_slot != p.slot_id and \
-               Producto.query.filter(Producto.device_id == p.device_id,
+               Producto.query.filter(Producto.dispenser_id == p.dispenser_id,
                                      Producto.slot_id == new_slot,
                                      Producto.id != p.id).first():
-                return json_error("Slot ya asignado a otro producto en este device", 409)
+                return json_error("Slot ya asignado a otro producto en este dispenser", 409)
             p.slot_id = new_slot
-        if "device_id" in data:
-            new_dev = str(data["device_id"]).strip() or DEFAULT_DEVICE_ID
-            # Evitar colisión en el nuevo device
-            if Producto.query.filter(Producto.device_id == new_dev,
-                                     Producto.slot_id == p.slot_id,
-                                     Producto.id != p.id).first():
-                return json_error("Ese slot ya está ocupado en el nuevo device", 409)
-            p.device_id = new_dev
         if "habilitado" in data: p.habilitado = bool(data["habilitado"])
 
         after = int(p.cantidad or 0)
@@ -575,7 +532,7 @@ def productos_reset(pid):
         return json_error("Error reseteando stock", 500, str(e))
 
 # -------------------------------------------------------------
-# Pagos: listado y pendiente/confirmación
+# Pagos
 # -------------------------------------------------------------
 @app.get("/api/pagos")
 def pagos_list():
@@ -599,6 +556,8 @@ def pagos_list():
             "estado": p.estado,
             "producto": p.producto,
             "product_id": p.product_id,
+            "dispenser_id": p.dispenser_id,
+            "device_id": p.device_id,
             "slot_id": p.slot_id,
             "litros": p.litros,
             "monto": p.monto,
@@ -623,6 +582,8 @@ def pagos_pendiente():
         "litros": int(p.litros or 0),
         "slot_id": int(p.slot_id or 0),
         "product_id": int(p.product_id or 0),
+        "dispenser_id": int(p.dispenser_id or 0),
+        "device_id": p.device_id or "",
         "producto": p.producto,
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }
@@ -630,7 +591,6 @@ def pagos_pendiente():
         data["producto_nombre"] = prod.nombre
         data["porcion_litros"] = int(getattr(prod, "porcion_litros", 1))
         data["stock_litros"] = int(prod.cantidad)
-        data["device_id"] = getattr(prod, "device_id", DEFAULT_DEVICE_ID)
     return jsonify({"ok": True, "pago": data})
 
 @app.post("/api/pagos/<int:pid>/dispensado")
@@ -665,10 +625,17 @@ def pagos_reenviar(pid):
         return jsonify({"ok": False, "msg": f"Estado no válido para reintento: {p.estado}"})
     if not p.slot_id or not p.litros:
         return jsonify({"ok": False, "msg": "Pago sin slot/litros válidos"})
+    # Dispositivo: del pago o del producto
+    device = p.device_id
+    if not device and p.product_id:
+        pr = Producto.query.get(p.product_id)
+        if pr and pr.dispenser_id:
+            d = Dispenser.query.get(pr.dispenser_id)
+            device = d.device_id if d else ""
+    if not device:
+        return jsonify({"ok": False, "msg": "No se pudo determinar device_id"})
     litros = int(p.litros or 1)
-    prod = Producto.query.get(p.product_id)
-    dev = getattr(prod, "device_id", DEFAULT_DEVICE_ID) if prod else DEFAULT_DEVICE_ID
-    ok = send_dispense_cmd(p.mp_payment_id, p.slot_id, litros, dev, timeout_s=max(30, litros * 5))
+    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, litros, timeout_s=max(30, litros * 5))
     return jsonify({
         "ok": ok,
         "msg": "Comando reenviado" if ok else "No se pudo publicar a MQTT",
@@ -692,6 +659,10 @@ def crear_preferencia_api():
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
 
+    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+    if not disp or not disp.activo:
+        return json_error("dispenser no disponible", 400)
+
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
@@ -699,7 +670,7 @@ def crear_preferencia_api():
     if (int(prod.cantidad) - litros) <= reserva:
         return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};device={prod.device_id}"
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
     body = {
         "items": [{
             "id": str(prod.id),
@@ -710,20 +681,14 @@ def crear_preferencia_api():
             "unit_price": float(prod.precio),
         }],
         "description": prod.nombre,
-        "additional_info": {
-            "items": [{
-                "id": str(prod.id),
-                "title": prod.nombre,
-                "quantity": 1,
-                "unit_price": float(prod.precio),
-            }]
-        },
+        "additional_info": { "items": [{ "id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio) }] },
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
             "producto": prod.nombre,
             "litros": int(litros),
-            "device_id": prod.device_id,
+            "dispenser_id": int(disp.id),
+            "device_id": disp.device_id,
         },
         "external_reference": external_ref,
         "auto_return": "approved",
@@ -756,26 +721,23 @@ def crear_preferencia_api():
     return ok_json({"ok": True, "link": link, "raw": pref})
 
 # -------------------------------------------------------------
-# QR DINÁMICO: /go → verifica stock/habilitado y redirige
+# QR DINÁMICO: /go
 # -------------------------------------------------------------
 @app.get("/go")
 def go():
-    """
-    Uso:
-      /go?pid=PRODUCTO_ID
-      /go?pid=PRODUCTO_ID&litros=2   (opcional; si no, usa porcion_litros actual)
-    Comportamiento:
-      - Si producto no existe / deshabilitado / stock insuficiente según reserva ⇒ WEB_URL/sin-stock?pid=...
-      - Si OK ⇒ crea preferencia de MP y redirige (302) al init_point actual (precio/nombre vigentes).
-    """
     pid = _to_int(request.args.get("pid") or 0)
     litros_req = _to_int(request.args.get("litros") or 0)
-
     if not pid:
         return redirect(f"{WEB_URL}/sin-stock")
 
     prod = Producto.query.get(pid)
-    if not prod or not prod.habilitado:
+    if not prod:
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+    if not prod.habilitado:
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+
+    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+    if not disp or not disp.activo:
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
@@ -788,26 +750,19 @@ def go():
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};device={prod.device_id}"
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
     body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
+        "items": [{ "id": str(prod.id), "title": prod.nombre, "description": prod.nombre, "quantity": 1,
+                    "currency_id": "ARS", "unit_price": float(prod.precio) }],
         "description": prod.nombre,
-        "additional_info": {"items": [{"id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio)}]},
-        "metadata": {"slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre, "litros": int(litros), "device_id": prod.device_id},
+        "additional_info": { "items": [{ "id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio) }] },
+        "metadata": { "slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre,
+                      "litros": int(litros), "dispenser_id": int(disp.id), "device_id": disp.device_id },
         "external_reference": external_ref,
         "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
-        },
+        "back_urls": { "success": f"{WEB_URL}/gracias?status=success",
+                       "failure": f"{WEB_URL}/gracias?status=failure",
+                       "pending": f"{WEB_URL}/gracias?status=pending" },
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
     }
@@ -829,27 +784,25 @@ def go():
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
 # -------------------------------------------------------------
-# Mercado Pago: Webhook idempotente (no descuenta stock)
+# Webhook MP (idempotente)
 # -------------------------------------------------------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")  # payment | merchant_order
+    topic = args.get("topic") or body.get("type")
     live_mode = bool(body.get("live_mode", True))
 
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
     token, _ = get_mp_token_and_base()
 
-    app.logger.info(f"[MP] webhook topic={topic} live_mode={live_mode} args={dict(args)} body={body}")
+    app.logger.info(f"[MP] webhook topic={topic} live={live_mode} args={dict(args)} body={body}")
 
     payment_id = None
     if topic == "payment":
         if "resource" in body and isinstance(body["resource"], str):
-            try:
-                payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception:
-                payment_id = None
+            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception: payment_id = None
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
 
     if topic == "merchant_order" and not payment_id:
@@ -860,8 +813,7 @@ def mp_webhook():
                                     headers={"Authorization": f"Bearer {token}"}, timeout=15)
                 if r_mo.ok:
                     pays = (r_mo.json() or {}).get("payments") or []
-                    if pays:
-                        payment_id = str(pays[0].get("id"))
+                    if pays: payment_id = str(pays[0].get("id"))
             except Exception:
                 app.logger.exception("[MP] error consultando merchant_order")
 
@@ -884,7 +836,8 @@ def mp_webhook():
     product_id = _to_int(md.get("product_id") or 0)
     slot_id = _to_int(md.get("slot_id") or 0)
     litros = _to_int(md.get("litros") or 0)
-    device_md = (md.get("device_id") or "").strip()
+    dispenser_id = _to_int(md.get("dispenser_id") or 0)
+    device_id = str(md.get("device_id") or "")
 
     if (not product_id or not slot_id or not litros) and pay.get("external_reference"):
         try:
@@ -892,7 +845,8 @@ def mp_webhook():
             product_id = product_id or _to_int(parts.get("pid") or 0)
             slot_id = slot_id or _to_int(parts.get("slot") or 0)
             litros = litros or _to_int(parts.get("litros") or 0)
-            device_md = device_md or (parts.get("device") or "")
+            dispenser_id = dispenser_id or _to_int(parts.get("disp") or 0)
+            device_id = device_id or parts.get("dev") or ""
         except Exception:
             app.logger.warning(f"[MP] external_reference malformado: {pay.get('external_reference')}")
 
@@ -916,6 +870,8 @@ def mp_webhook():
             litros=litros if litros > 0 else 1,
             monto=monto,
             product_id=product_id,
+            dispenser_id=dispenser_id,
+            device_id=device_id,
             raw=pay,
         )
         db.session.add(p)
@@ -926,6 +882,8 @@ def mp_webhook():
         p.product_id = p.product_id or product_id
         p.litros = p.litros or (litros if litros > 0 else p.litros)
         p.monto = p.monto or monto
+        p.dispenser_id = p.dispenser_id or dispenser_id
+        p.device_id = p.device_id or device_id
         p.raw = pay
 
     try:
@@ -937,21 +895,28 @@ def mp_webhook():
 
     try:
         if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
-            prod = Producto.query.get(p.product_id) if p.product_id else None
-            dev = (getattr(prod, "device_id", None) or device_md or DEFAULT_DEVICE_ID)
-            published = send_dispense_cmd(p.mp_payment_id, p.slot_id, p.litros,
-                                          dev, timeout_s=max(30, p.litros * 5))
-            if published:
-                p.procesado = True
-                db.session.commit()
+            # determinar device_id confiable
+            dev = p.device_id
+            if not dev and p.product_id:
+                pr = Producto.query.get(p.product_id)
+                if pr and pr.dispenser_id:
+                    d = Dispenser.query.get(pr.dispenser_id)
+                    dev = d.device_id if d else ""
+            if dev:
+                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros,
+                                              timeout_s=max(30, p.litros * 5))
+                if published:
+                    p.procesado = True
+                    db.session.commit()
+                else:
+                    app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; reintenta próximo webhook")
             else:
-                app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; reintenta próximo webhook")
+                app.logger.error(f"[MQTT] no hay device_id para pago {p.id}")
     except Exception:
         app.logger.exception("[MQTT] no se pudo publicar orden tras approval")
 
     return "ok", 200
 
-# Aliases por compat
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
@@ -963,21 +928,20 @@ def mp_webhook_alias2(): return mp_webhook()
 @app.post("/api/dispense/orden")
 def api_dispense_orden():
     data = request.get_json(force=True, silent=True) or {}
+    device_id = str(data.get("device_id") or "").strip()
     payment_id = str(data.get("payment_id") or "").strip()
     slot_id = _to_int(data.get("slot_id") or 0)
     litros = _to_int(data.get("litros") or 0)
-    device_id = str((data.get("device_id") or "").strip() or DEFAULT_DEVICE_ID)
-    if not payment_id:
-        return json_error("Falta payment_id")
-    if slot_id <= 0:
-        return json_error("slot_id inválido")
-    if litros <= 0:
-        litros = 1
-    ok = send_dispense_cmd(payment_id, slot_id, litros, device_id, timeout_s=max(30, litros*5))
+    if not payment_id: return json_error("Falta payment_id")
+    if not device_id: return json_error("Falta device_id")
+    if slot_id <= 0: return json_error("slot_id inválido")
+    if litros <= 0: litros = 1
+    ok = send_dispense_cmd(device_id, payment_id, slot_id, litros, timeout_s=max(30, litros*5))
     return jsonify({"ok": ok})
 
-# --- PÁGINAS PÚBLICAS PARA MP Y QR ---
-
+# -------------------------------------------------------------
+# Páginas públicas para MP y QR
+# -------------------------------------------------------------
 def _html_page(title: str, subtitle: str = "", extra: str = ""):
     html = f"""<!doctype html>
 <html lang="es"><head>
@@ -992,8 +956,6 @@ def _html_page(title: str, subtitle: str = "", extra: str = ""):
   p  {{ margin:6px 0; opacity:.9; }}
   .ok {{ color:#10b981; font-weight:800; }}
   .err{{ color:#ef4444; font-weight:800; }}
-  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
-           text-decoration:none; font-weight:700; }}
 </style>
 </head><body>
   <div class="box">
@@ -1011,8 +973,7 @@ def pagina_gracias():
     status = (request.args.get("status") or "").lower()
     pay_id = request.args.get("payment_id") or request.args.get("collection_id") or ""
     extref = request.args.get("external_reference") or ""
-
-    if status == "success" or status == "approved":
+    if status in ("success", "approved"):
         title = "¡Gracias por su compra!"
         subtitle = '<span class="ok">Pago aprobado.</span> En breve se dispensará el producto.'
     elif status in ("pending", "in_process"):
@@ -1021,18 +982,15 @@ def pagina_gracias():
     else:
         title = "Pago no completado"
         subtitle = '<span class="err">El pago fue cancelado o rechazado.</span>'
-
     extra = ""
     if pay_id or extref:
         extra = f"<p style='opacity:.7;font-size:12px'>Ref: {pay_id or extref}</p>"
-
     return _html_page(title, subtitle, extra)
 
 @app.get("/sin-stock")
 def pagina_sin_stock():
     title = "❌ Producto sin stock"
     subtitle = "Este producto alcanzó la reserva crítica y no está disponible por ahora. Probá más tarde."
-    # sin botón volver (kiosco)
     return _html_page(title, subtitle, "")
 
 # -------------------------------------------------------------
