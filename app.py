@@ -184,6 +184,67 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
             prod.habilitado = True
             app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}) – stock={stock} > {reserva}")
 
+# Páginas HTML embebidas
+def _html_page(title: str, subtitle: str = "", extra: str = ""):
+    html = f"""<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+<style>
+  body {{ margin:0; background:#0b1220; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+  .box {{ max-width:680px; margin:14vh auto; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
+         border-radius:18px; padding:28px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
+  h1 {{ margin:0 0 6px; font-size:34px; }}
+  p  {{ margin:6px 0; opacity:.9; }}
+  .ok {{ color:#10b981; font-weight:800; }}
+  .err{{ color:#ef4444; font-weight:800; }}
+  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
+           text-decoration:none; font-weight:700; }}
+</style>
+</head><body>
+  <div class="box">
+    <h1>{title}</h1>
+    <p>{subtitle}</p>
+    {extra}
+  </div>
+</body></html>"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+def _html_redirect(url: str, title="Redirigiendo a Mercado Pago…", subtitle="Te estamos llevando a Mercado Pago"):
+    safe = url.replace("&", "&amp;").replace("<", "&lt;")
+    html = f"""<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+<meta http-equiv="refresh" content="0;url={safe}">
+<style>
+  body {{ margin:0; background:#0b1220; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+  .box {{ max-width:680px; margin:14vh auto; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
+         border-radius:18px; padding:28px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
+  h1 {{ margin:0 0 6px; font-size:28px; }}
+  p  {{ margin:6px 0; opacity:.9; }}
+  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
+           text-decoration:none; font-weight:700; }}
+</style>
+<script>
+  window.addEventListener('load', function(){{ window.location.replace("{url}"); }});
+</script>
+</head><body>
+  <div class="box">
+    <h1>{title}</h1>
+    <p>{subtitle}</p>
+    <p style="opacity:.8;font-size:12px">Si no te redirige automáticamente, tocá el botón:</p>
+    <a class="btn" href="{safe}">Continuar</a>
+  </div>
+</body></html>"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
 # -------------------------------------------------------------
 # Autenticación simple por header
 # -------------------------------------------------------------
@@ -194,8 +255,8 @@ PUBLIC_PATHS = {
     "/api/pagos/pendiente",     # consulta del ESP32
     "/api/config",              # lee modo/umbrales para UI
     "/go",                      # QR dinámico
-    "/gracias",                 # landing retorno MP
-    "/sin-stock",               # landing sin stock
+    "/gracias",
+    "/sin-stock",
 }
 
 @app.before_request
@@ -623,9 +684,9 @@ def crear_preferencia_api():
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{backend_base}/gracias?status=success",
-            "failure": f"{backend_base}/gracias?status=failure",
-            "pending": f"{backend_base}/gracias?status=pending"
+            "success": f"{WEB_URL}/gracias?status=success",
+            "failure": f"{WEB_URL}/gracias?status=failure",
+            "pending": f"{WEB_URL}/gracias?status=pending"
         },
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
@@ -660,34 +721,32 @@ def go():
       /go?pid=PRODUCTO_ID
       /go?pid=PRODUCTO_ID&litros=2   (opcional; si no, usa porcion_litros actual)
     Comportamiento:
-      - Si producto no existe / deshabilitado / stock insuficiente según reserva ⇒ /sin-stock
-      - Si OK ⇒ crea preferencia de MP y redirige (302) al init_point actual (precio/nombre vigentes).
+      - Si producto no existe / deshabilitado / stock insuficiente según reserva ⇒ WEB_URL/sin-stock?pid=...
+      - Si OK ⇒ crea preferencia de MP y muestra página intermedia "Redirigiendo…" que hace el salto.
     """
     pid = _to_int(request.args.get("pid") or 0)
     litros_req = _to_int(request.args.get("litros") or 0)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
     if not pid:
-        return redirect(f"{backend_base}/sin-stock")
+        return redirect(f"{WEB_URL}/sin-stock")
 
     prod = Producto.query.get(pid)
     if not prod:
-        return redirect(f"{backend_base}/sin-stock?pid={pid}")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     if not prod.habilitado:
-        return redirect(f"{backend_base}/sin-stock?pid={pid}")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     _, reserva = get_thresholds()
     if (int(prod.cantidad) - litros) <= reserva:
-        # No alcanza respetando reserva → sin stock
-        return redirect(f"{backend_base}/sin-stock?pid={pid}")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
-    # Crear pref y redirigir a MP
     token, _ = get_mp_token_and_base()
     if not token:
-        return redirect(f"{backend_base}/sin-stock?pid={pid}")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
     body = {
         "items": [{
@@ -704,9 +763,9 @@ def go():
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{backend_base}/gracias?status=success",
-            "failure": f"{backend_base}/gracias?status=failure",
-            "pending": f"{backend_base}/gracias?status=pending",
+            "success": f"{WEB_URL}/gracias?status=success",
+            "failure": f"{WEB_URL}/gracias?status=failure",
+            "pending": f"{WEB_URL}/gracias?status=pending"
         },
         "notification_url": f"{backend_base}/api/mp/webhook",
         "statement_descriptor": "DISPEN-EASY",
@@ -722,11 +781,12 @@ def go():
         pref = r.json() or {}
         link = pref.get("init_point") or pref.get("sandbox_init_point")
         if not link:
-            return redirect(f"{backend_base}/sin-stock?pid={pid}")
-        return redirect(link, code=302)
+            return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
+        # Página intermedia "Redirigiendo…" (mejor UX que 302 directo)
+        return _html_redirect(link, title="Redirigiendo a Mercado Pago…")
     except Exception:
         app.logger.exception("[MP] error creando preferencia en /go")
-        return redirect(f"{backend_base}/sin-stock?pid={pid}")
+        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
 # -------------------------------------------------------------
 # Mercado Pago: Webhook idempotente (no descuenta stock)
@@ -872,36 +932,6 @@ def api_dispense_orden():
     return jsonify({"ok": ok})
 
 # --- PÁGINAS PÚBLICAS PARA MP Y QR ---
-
-def _html_page(title: str, subtitle: str = "", extra: str = ""):
-    html = f"""<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-<style>
-  body {{ margin:0; background:#0b1220; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
-  .box {{ max-width:680px; margin:14vh auto; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
-         border-radius:18px; padding:28px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-  h1 {{ margin:0 0 6px; font-size:34px; }}
-  p  {{ margin:6px 0; opacity:.9; }}
-  .ok {{ color:#10b981; font-weight:800; }}
-  .err{{ color:#ef4444; font-weight:800; }}
-  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
-           text-decoration:none; font-weight:700; }}
-</style>
-</head><body>
-  <div class="box">
-    <h1>{title}</h1>
-    <p>{subtitle}</p>
-    {extra}
-  </div>
-</body></html>"""
-    resp = make_response(html, 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
-
-
 @app.get("/gracias")
 def pagina_gracias():
     """
@@ -927,7 +957,6 @@ def pagina_gracias():
         extra = f"<p style='opacity:.7;font-size:12px'>Ref: {pay_id or extref}</p>"
 
     return _html_page(title, subtitle, extra)
-
 
 @app.get("/sin-stock")
 def pagina_sin_stock():
