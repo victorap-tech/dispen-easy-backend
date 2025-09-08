@@ -5,10 +5,11 @@ import threading
 import requests
 import json as _json
 
-from flask import Flask, jsonify, request, redirect, make_response
+from flask import Flask, jsonify, request, redirect, Response, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
+from queue import Queue, Empty
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
@@ -38,7 +39,7 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 # Umbrales de stock
 UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)   # notifica si stock ≤ umbral
-STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)   # bloquea venta si dejaría stock < reserva
+STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "2") or 2)   # bloquea venta si dejaría stock ≤ reserva
 
 # Telegram (opcional)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -184,18 +185,70 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
             prod.habilitado = True
             app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}) – stock={stock} > {reserva}")
 
+# ------------------------- SSE (Server-Sent Events) -------------------------
+_sse_subs = set()
+_sse_lock = threading.Lock()
+
+def _sse_publish(event: str, data: dict | str | None = None):
+    """Empuja un evento a todos los suscriptores."""
+    payload = data if isinstance(data, str) else _json.dumps(data or {})
+    msg = f"event: {event}\n" + f"data: {payload}\n\n"
+    with _sse_lock:
+        dead = []
+        for q in list(_sse_subs):
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            _sse_subs.discard(q)
+
+@app.get("/api/events")
+def sse_events():
+    """
+    Stream de eventos del backend para el Admin (SSE).
+    Eventos:
+      - refresh: cuando se publica orden a MQTT o llega 'done' desde el ESP
+      - stock:   cuando cambia stock (reponer/reset/dispensado)
+    """
+    q = Queue()
+    with _sse_lock:
+        _sse_subs.add(q)
+
+    def _stream():
+        yield "event: hello\ndata: {}\n\n"
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=25)
+                    yield msg
+                except Empty:
+                    yield "event: ping\ndata: {}\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            with _sse_lock:
+                _sse_subs.discard(q)
+
+    return Response(_stream(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    })
+
 # -------------------------------------------------------------
 # Autenticación simple por header
 # -------------------------------------------------------------
 PUBLIC_PATHS = {
     "/",                        # health
+    "/api/events",              # SSE (admin escucha)
     "/api/mp/webhook",          # Webhook de MP
     "/api/pagos/preferencia",   # generar link/QR (admin o herramientas)
     "/api/pagos/pendiente",     # consulta del ESP32
     "/api/config",              # lee modo/umbrales para UI
     "/go",                      # QR dinámico
-    "/gracias",                 # landing post-pago
-    "/sin-stock",               # landing sin stock
+    "/gracias",
+    "/sin-stock",
 }
 
 @app.before_request
@@ -283,6 +336,11 @@ def _mqtt_on_message(client, userdata, msg):
                     _post_stock_change_hook(prod, motivo="dispensado (ESP done)")
                 p.dispensado = True
                 db.session.commit()
+                try:
+                    _sse_publish("refresh", {"reason": "esp_done", "payment_id": p.mp_payment_id})
+                    _sse_publish("stock", {"product_id": getattr(prod, "id", 0)})
+                except Exception:
+                    pass
             except Exception:
                 db.session.rollback()
                 app.logger.exception("[MQTT] error al marcar dispensado/stock")
@@ -390,6 +448,7 @@ def productos_create():
         db.session.add(p)
         _post_stock_change_hook(p, motivo="create")
         db.session.commit()
+        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
     except Exception as e:
         db.session.rollback()
@@ -423,6 +482,7 @@ def productos_update(pid):
             _post_stock_change_hook(p, motivo="update cantidad")
 
         db.session.commit()
+        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -435,6 +495,7 @@ def productos_delete(pid):
     try:
         db.session.delete(p)
         db.session.commit()
+        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True}, 204)
     except Exception as e:
         db.session.rollback()
@@ -451,6 +512,7 @@ def productos_reponer(pid):
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
         _post_stock_change_hook(p, motivo="reponer")
         db.session.commit()
+        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -467,6 +529,7 @@ def productos_reset(pid):
         p.cantidad = int(litros)
         _post_stock_change_hook(p, motivo="reset_stock")
         db.session.commit()
+        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -479,10 +542,10 @@ def productos_reset(pid):
 @app.get("/api/pagos")
 def pagos_list():
     try:
-        limit = int(request.args.get("limit", 50))
+        limit = int(request.args.get("limit", 10))
         limit = max(1, min(limit, 200))
     except Exception:
-        limit = 50
+        limit = 10
     estado = (request.args.get("estado") or "").strip()
     qsearch = (request.args.get("q") or "").strip()
 
@@ -545,6 +608,8 @@ def pagos_dispensado(pid):
     p.dispensado = True
     p.procesado = True
     db.session.commit()
+    _sse_publish("refresh", {"reason": "manual_dispensado", "payment_id": p.mp_payment_id})
+    _sse_publish("stock", {"product_id": prod.id})
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
                     "producto": {"id": prod.id, "stock": prod.cantidad}})
@@ -565,6 +630,11 @@ def pagos_reenviar(pid):
         return jsonify({"ok": False, "msg": "Pago sin slot/litros válidos"})
     litros = int(p.litros or 1)
     ok = send_dispense_cmd(p.mp_payment_id, p.slot_id, litros, timeout_s=max(30, litros * 5))
+    if ok:
+        try:
+            _sse_publish("refresh", {"reason": "reenviar_cmd", "payment_id": p.mp_payment_id})
+        except Exception:
+            pass
     return jsonify({
         "ok": ok,
         "msg": "Comando reenviado" if ok else "No se pudo publicar a MQTT",
@@ -592,8 +662,7 @@ def crear_preferencia_api():
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
     _, reserva = get_thresholds()
-    # permite si deja exactamente en reserva; bloquea solo si quedaría por debajo
-    if (int(prod.cantidad) - litros) < reserva:
+    if (int(prod.cantidad) - litros) <= reserva:
         return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
@@ -671,19 +740,15 @@ def go():
         return redirect(f"{WEB_URL}/sin-stock")
 
     prod = Producto.query.get(pid)
-    if not prod:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-    if not prod.habilitado:
+    if not prod or not prod.habilitado:
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     _, reserva = get_thresholds()
-    # permite si deja exactamente en reserva; bloquea solo si quedaría por debajo
-    if (int(prod.cantidad) - litros) < reserva:
+    # bloquea si la operación dejaría stock <= reserva (reserva se respeta)
+    if (int(prod.cantidad) - litros) <= reserva:
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
-    # Crear pref igual que en /api/pagos/preferencia pero interno y redirigir
     token, _ = get_mp_token_and_base()
     if not token:
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
@@ -841,6 +906,10 @@ def mp_webhook():
             if published:
                 p.procesado = True
                 db.session.commit()
+                try:
+                    _sse_publish("refresh", {"reason": "mqtt_published", "payment_id": p.mp_payment_id})
+                except Exception:
+                    pass
             else:
                 app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; reintenta próximo webhook")
     except Exception:
@@ -870,10 +939,14 @@ def api_dispense_orden():
     if litros <= 0:
         litros = 1
     ok = send_dispense_cmd(payment_id, slot_id, litros, timeout_s=max(30, litros*5))
+    if ok:
+        try:
+            _sse_publish("refresh", {"reason": "manual_cmd", "payment_id": payment_id})
+        except Exception:
+            pass
     return jsonify({"ok": ok})
 
 # --- PÁGINAS PÚBLICAS PARA MP Y QR ---
-
 def _html_page(title: str, subtitle: str = "", extra: str = ""):
     html = f"""<!doctype html>
 <html lang="es"><head>
@@ -888,8 +961,6 @@ def _html_page(title: str, subtitle: str = "", extra: str = ""):
   p  {{ margin:6px 0; opacity:.9; }}
   .ok {{ color:#10b981; font-weight:800; }}
   .err{{ color:#ef4444; font-weight:800; }}
-  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
-           text-decoration:none; font-weight:700; }}
 </style>
 </head><body>
   <div class="box">
@@ -902,13 +973,8 @@ def _html_page(title: str, subtitle: str = "", extra: str = ""):
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
 
-
 @app.get("/gracias")
 def pagina_gracias():
-    """
-    Landing de retorno desde MercadoPago (success/failure/pending).
-    Pública, sin auth.
-    """
     status = (request.args.get("status") or "").lower()
     pay_id = request.args.get("payment_id") or request.args.get("collection_id") or ""
     extref = request.args.get("external_reference") or ""
@@ -929,15 +995,14 @@ def pagina_gracias():
 
     return _html_page(title, subtitle, extra)
 
-
 @app.get("/sin-stock")
 def pagina_sin_stock():
     """Pantalla pública cuando un QR está bloqueado por reserva crítica."""
     title = "❌ Producto sin stock"
     subtitle = "Este producto alcanzó la reserva crítica y no está disponible por ahora. Probá más tarde."
-    # Sin botón “Volver”
-    return _html_page(title, subtitle, "")
-    
+    extra = ""  # sin botón Volver
+    return _html_page(title, subtitle, extra)
+
 # -------------------------------------------------------------
 # Inicializar MQTT y Run
 # -------------------------------------------------------------
