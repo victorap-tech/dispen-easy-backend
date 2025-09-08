@@ -5,11 +5,10 @@ import threading
 import requests
 import json as _json
 
-from flask import Flask, jsonify, request, redirect, Response, make_response
+from flask import Flask, jsonify, request, redirect, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
-from queue import Queue, Empty
 import paho.mqtt.client as mqtt
 
 # -------------------------------------------------------------
@@ -32,7 +31,8 @@ MQTT_HOST = os.getenv("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
-DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
+# DEVICE_ID por compat; ahora los productos tienen su propio device_id
+DEFAULT_DEVICE_ID = os.getenv("DEVICE_ID", "dispen-01").strip()
 
 # Seguridad Admin
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
@@ -71,14 +71,24 @@ class KV(db.Model):
     key = db.Column(db.String(50), primary_key=True)
     value = db.Column(db.String(200), nullable=False)
 
+class Dispenser(db.Model):
+    __tablename__ = "dispenser"
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    nombre = db.Column(db.String(120), nullable=True, default="")
+    notas = db.Column(db.String(240), nullable=True, default="")
+    activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
+    last_seen = db.Column(db.DateTime(timezone=True), nullable=True)
+
 class Producto(db.Model):
     __tablename__ = "producto"
     id = db.Column(db.Integer, primary_key=True)
     nombre = db.Column(db.String(100), nullable=False)
     precio = db.Column(db.Float, nullable=False)                # $ por litro
     cantidad = db.Column(db.Integer, nullable=False)            # stock disponible (L)
-    slot_id = db.Column(db.Integer, nullable=False, unique=True, index=True)
+    slot_id = db.Column(db.Integer, nullable=False, index=True) # OJO: antes era unique=True
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
+    device_id = db.Column(db.String(80), nullable=False, server_default="dispen-01")  # <---
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
@@ -133,6 +143,7 @@ def serialize_producto(p: Producto) -> dict:
         "cantidad": int(p.cantidad),
         "slot": int(p.slot_id),
         "porcion_litros": int(getattr(p, "porcion_litros", 1) or 1),
+        "device_id": getattr(p, "device_id", DEFAULT_DEVICE_ID),
         "habilitado": bool(p.habilitado),
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
@@ -170,7 +181,7 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
     if stock <= umbral:
         try:
             tg_notify(
-                f"⚠️ Bajo stock en '{prod.nombre}' (slot {prod.slot_id}): {stock} L "
+                f"⚠️ Bajo stock en '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}): {stock} L "
                 f"(umbral={umbral}, reserva={reserva}) – Motivo: {motivo}"
             )
         except Exception:
@@ -179,76 +190,24 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
     if stock <= reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' (slot {prod.slot_id}) por reserva: stock={stock} ≤ {reserva}")
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}) por reserva: stock={stock} ≤ {reserva}")
     else:
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}) – stock={stock} > {reserva}")
-
-# ------------------------- SSE (Server-Sent Events) -------------------------
-_sse_subs = set()
-_sse_lock = threading.Lock()
-
-def _sse_publish(event: str, data: dict | str | None = None):
-    """Empuja un evento a todos los suscriptores."""
-    payload = data if isinstance(data, str) else _json.dumps(data or {})
-    msg = f"event: {event}\n" + f"data: {payload}\n\n"
-    with _sse_lock:
-        dead = []
-        for q in list(_sse_subs):
-            try:
-                q.put_nowait(msg)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            _sse_subs.discard(q)
-
-@app.get("/api/events")
-def sse_events():
-    """
-    Stream de eventos del backend para el Admin (SSE).
-    Eventos:
-      - refresh: cuando se publica orden a MQTT o llega 'done' desde el ESP
-      - stock:   cuando cambia stock (reponer/reset/dispensado)
-    """
-    q = Queue()
-    with _sse_lock:
-        _sse_subs.add(q)
-
-    def _stream():
-        yield "event: hello\ndata: {}\n\n"
-        try:
-            while True:
-                try:
-                    msg = q.get(timeout=25)
-                    yield msg
-                except Empty:
-                    yield "event: ping\ndata: {}\n\n"
-        except GeneratorExit:
-            pass
-        finally:
-            with _sse_lock:
-                _sse_subs.discard(q)
-
-    return Response(_stream(), mimetype="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no"
-    })
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' (slot {prod.slot_id}, dev {prod.device_id}) – stock={stock} > {reserva}")
 
 # -------------------------------------------------------------
 # Autenticación simple por header
 # -------------------------------------------------------------
 PUBLIC_PATHS = {
     "/",                        # health
-    "/api/events",              # SSE (admin escucha)
     "/api/mp/webhook",          # Webhook de MP
     "/api/pagos/preferencia",   # generar link/QR (admin o herramientas)
     "/api/pagos/pendiente",     # consulta del ESP32
     "/api/config",              # lee modo/umbrales para UI
     "/go",                      # QR dinámico
-    "/gracias",
-    "/sin-stock",
+    "/gracias",                 # landing MP
+    "/sin-stock",               # pantalla stock crítico
 }
 
 @app.before_request
@@ -287,23 +246,43 @@ def get_mp_token_and_base() -> tuple[str, str]:
 # -------------------------------------------------------------
 # MQTT
 # -------------------------------------------------------------
-MQTT_TOPIC_CMD    = f"dispen/{DEVICE_ID}/cmd/dispense"
-MQTT_TOPIC_STATE  = f"dispen/{DEVICE_ID}/state/dispense"
-MQTT_TOPIC_STATUS = f"dispen/{DEVICE_ID}/status"
+# Subscribe a TODOS los dispensers (wildcard)
+MQTT_TOPIC_STATE_WC  = "dispen/+/state/dispense"
+MQTT_TOPIC_STATUS_WC = "dispen/+/status"
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {MQTT_TOPIC_STATE} y {MQTT_TOPIC_STATUS}")
-    client.subscribe(MQTT_TOPIC_STATE, qos=1)
-    client.subscribe(MQTT_TOPIC_STATUS, qos=1)
+    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {MQTT_TOPIC_STATE_WC} y {MQTT_TOPIC_STATUS_WC}")
+    client.subscribe(MQTT_TOPIC_STATE_WC, qos=1)
+    client.subscribe(MQTT_TOPIC_STATUS_WC, qos=1)
+
+def _extract_device_from_topic(topic: str) -> str:
+    # dispen/<device_id>/state/dispense  o  dispen/<device_id>/status
+    try:
+        parts = topic.split("/")
+        return parts[1] if len(parts) >= 2 else ""
+    except Exception:
+        return ""
 
 def _mqtt_on_message(client, userdata, msg):
+    dev_from_topic = _extract_device_from_topic(msg.topic)
     try:
         raw = msg.payload.decode("utf-8", "ignore")
     except Exception:
         raw = "<binario>"
     app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
+
+    # Actualizar last_seen del dispenser si existe
+    if dev_from_topic:
+        try:
+            with app.app_context():
+                d = Dispenser.query.filter_by(device_id=dev_from_topic).first()
+                if d:
+                    d.last_seen = db.func.now()
+                    db.session.commit()
+        except Exception:
+            db.session.rollback()
 
     try:
         data = _json.loads(raw or "{}")
@@ -333,14 +312,9 @@ def _mqtt_on_message(client, userdata, msg):
                 prod = Producto.query.get(p.product_id) if p.product_id else None
                 if prod:
                     prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
-                    _post_stock_change_hook(prod, motivo="dispensado (ESP done)")
+                    _post_stock_change_hook(prod, motivo=f"dispensado (ESP done; dev={dev_from_topic or prod.device_id})")
                 p.dispensado = True
                 db.session.commit()
-                try:
-                    _sse_publish("refresh", {"reason": "esp_done", "payment_id": p.mp_payment_id})
-                    _sse_publish("stock", {"product_id": getattr(prod, "id", 0)})
-                except Exception:
-                    pass
             except Exception:
                 db.session.rollback()
                 app.logger.exception("[MQTT] error al marcar dispensado/stock")
@@ -352,8 +326,7 @@ def start_mqtt_background():
 
     def _run():
         global _mqtt_client
-        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                   client_id=f"{DEVICE_ID}-backend")
+        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="backend-multi")
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
         if int(MQTT_PORT) == 8883:
@@ -370,7 +343,10 @@ def start_mqtt_background():
     t = threading.Thread(target=_run, name="mqtt-thread", daemon=True)
     t.start()
 
-def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, timeout_s: int = 30) -> bool:
+def _topic_cmd(device_id: str) -> str:
+    return f"dispen/{device_id}/cmd/dispense"
+
+def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, device_id: str, timeout_s: int = 30) -> bool:
     if not MQTT_HOST:
         app.logger.warning("[MQTT] sin host; no se publica")
         return False
@@ -381,12 +357,15 @@ def send_dispense_cmd(payment_id: str, slot_id: int, litros: int, timeout_s: int
         "timeout_s": int(timeout_s or 30),
     }
     payload = _json.dumps(msg, ensure_ascii=False)
+    topic = _topic_cmd(device_id or DEFAULT_DEVICE_ID)
     with _mqtt_lock:
         if not _mqtt_client:
             app.logger.warning("[MQTT] cliente no inicializado")
             return False
-        info = _mqtt_client.publish(MQTT_TOPIC_CMD, payload, qos=1, retain=False)
-        return info.rc == mqtt.MQTT_ERR_SUCCESS
+        info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
+        ok = info.rc == mqtt.MQTT_ERR_SUCCESS
+        app.logger.info(f"[MQTT] publish → {topic} ok={ok} payload={payload}")
+        return ok
 
 # -------------------------------------------------------------
 # Health
@@ -422,33 +401,85 @@ def api_set_mode():
     return ok_json({"ok": True, "mp_mode": mode})
 
 # -------------------------------------------------------------
-# Productos CRUD
+# Dispensers CRUD (simple)
+# -------------------------------------------------------------
+@app.get("/api/dispensers")
+def disp_list():
+    rows = Dispenser.query.order_by(Dispenser.id.asc()).all()
+    return jsonify([
+        {
+            "id": d.id, "device_id": d.device_id, "nombre": d.nombre or d.device_id,
+            "notas": d.notas or "", "activo": bool(d.activo),
+            "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+        } for d in rows
+    ])
+
+@app.post("/api/dispensers")
+def disp_create():
+    data = request.get_json(force=True) or {}
+    dev = (data.get("device_id") or "").strip()
+    if not dev:
+        return json_error("device_id requerido", 400)
+    if Dispenser.query.filter_by(device_id=dev).first():
+        return json_error("device_id ya existe", 409)
+    d = Dispenser(
+        device_id=dev,
+        nombre=(data.get("nombre") or "").strip() or dev,
+        notas=(data.get("notas") or "").strip(),
+        activo=bool(data.get("activo", True)),
+    )
+    db.session.add(d); db.session.commit()
+    return ok_json({"ok": True, "id": d.id, "device_id": d.device_id}, 201)
+
+@app.put("/api/dispensers/<int:did>")
+def disp_update(did):
+    d = Dispenser.query.get_or_404(did)
+    data = request.get_json(force=True) or {}
+    if "nombre" in data: d.nombre = (data["nombre"] or "").strip()
+    if "notas" in data: d.notas = (data["notas"] or "").strip()
+    if "activo" in data: d.activo = bool(data["activo"])
+    db.session.commit()
+    return ok_json({"ok": True})
+
+# -------------------------------------------------------------
+# Productos CRUD (multi-dispenser)
 # -------------------------------------------------------------
 @app.get("/api/productos")
 def productos_list():
-    prods = Producto.query.order_by(Producto.slot_id.asc()).all()
+    # Filtro opcional por device_id ?device_id=xxx
+    dev = (request.args.get("device_id") or "").strip()
+    q = Producto.query
+    if dev:
+        q = q.filter(Producto.device_id == dev)
+    prods = q.order_by(Producto.device_id.asc(), Producto.slot_id.asc()).all()
     return jsonify([serialize_producto(p) for p in prods])
 
 @app.post("/api/productos")
 def productos_create():
     data = request.get_json(force=True)
     try:
+        device_id = str(data.get("device_id") or DEFAULT_DEVICE_ID).strip()
+        slot = int(data.get("slot", 1))
+
+        # Validar que no se repita slot en el mismo device
+        if Producto.query.filter(Producto.device_id == device_id, Producto.slot_id == slot).first():
+            return json_error("Slot ya asignado a otro producto en este device", 409)
+
         p = Producto(
             nombre=str(data.get("nombre", "")).strip(),
             precio=float(data.get("precio", 0)),
             cantidad=int(float(data.get("cantidad", 0))),
-            slot_id=int(data.get("slot", 1)),
+            slot_id=slot,
             porcion_litros=int(data.get("porcion_litros", 1)),
+            device_id=device_id,
             habilitado=bool(data.get("habilitado", False)),
         )
         if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1:
             return json_error("Valores inválidos", 400)
-        if Producto.query.filter(Producto.slot_id == p.slot_id).first():
-            return json_error("Slot ya asignado a otro producto", 409)
+
         db.session.add(p)
         _post_stock_change_hook(p, motivo="create")
         db.session.commit()
-        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
     except Exception as e:
         db.session.rollback()
@@ -471,10 +502,21 @@ def productos_update(pid):
             p.porcion_litros = val
         if "slot" in data:
             new_slot = int(data["slot"])
+            # Validación por device_id
             if new_slot != p.slot_id and \
-               Producto.query.filter(Producto.slot_id == new_slot, Producto.id != p.id).first():
-                return json_error("Slot ya asignado a otro producto", 409)
+               Producto.query.filter(Producto.device_id == p.device_id,
+                                     Producto.slot_id == new_slot,
+                                     Producto.id != p.id).first():
+                return json_error("Slot ya asignado a otro producto en este device", 409)
             p.slot_id = new_slot
+        if "device_id" in data:
+            new_dev = str(data["device_id"]).strip() or DEFAULT_DEVICE_ID
+            # Evitar colisión en el nuevo device
+            if Producto.query.filter(Producto.device_id == new_dev,
+                                     Producto.slot_id == p.slot_id,
+                                     Producto.id != p.id).first():
+                return json_error("Ese slot ya está ocupado en el nuevo device", 409)
+            p.device_id = new_dev
         if "habilitado" in data: p.habilitado = bool(data["habilitado"])
 
         after = int(p.cantidad or 0)
@@ -482,7 +524,6 @@ def productos_update(pid):
             _post_stock_change_hook(p, motivo="update cantidad")
 
         db.session.commit()
-        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -495,7 +536,6 @@ def productos_delete(pid):
     try:
         db.session.delete(p)
         db.session.commit()
-        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True}, 204)
     except Exception as e:
         db.session.rollback()
@@ -512,7 +552,6 @@ def productos_reponer(pid):
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
         _post_stock_change_hook(p, motivo="reponer")
         db.session.commit()
-        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -529,7 +568,6 @@ def productos_reset(pid):
         p.cantidad = int(litros)
         _post_stock_change_hook(p, motivo="reset_stock")
         db.session.commit()
-        _sse_publish("stock", {"product_id": p.id})
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
@@ -542,10 +580,10 @@ def productos_reset(pid):
 @app.get("/api/pagos")
 def pagos_list():
     try:
-        limit = int(request.args.get("limit", 10))
+        limit = int(request.args.get("limit", 50))
         limit = max(1, min(limit, 200))
     except Exception:
-        limit = 10
+        limit = 50
     estado = (request.args.get("estado") or "").strip()
     qsearch = (request.args.get("q") or "").strip()
 
@@ -592,6 +630,7 @@ def pagos_pendiente():
         data["producto_nombre"] = prod.nombre
         data["porcion_litros"] = int(getattr(prod, "porcion_litros", 1))
         data["stock_litros"] = int(prod.cantidad)
+        data["device_id"] = getattr(prod, "device_id", DEFAULT_DEVICE_ID)
     return jsonify({"ok": True, "pago": data})
 
 @app.post("/api/pagos/<int:pid>/dispensado")
@@ -608,8 +647,6 @@ def pagos_dispensado(pid):
     p.dispensado = True
     p.procesado = True
     db.session.commit()
-    _sse_publish("refresh", {"reason": "manual_dispensado", "payment_id": p.mp_payment_id})
-    _sse_publish("stock", {"product_id": prod.id})
     return jsonify({"ok": True, "msg": "Dispensado confirmado",
                     "pago": {"id": p.id, "dispensado": True},
                     "producto": {"id": prod.id, "stock": prod.cantidad}})
@@ -629,12 +666,9 @@ def pagos_reenviar(pid):
     if not p.slot_id or not p.litros:
         return jsonify({"ok": False, "msg": "Pago sin slot/litros válidos"})
     litros = int(p.litros or 1)
-    ok = send_dispense_cmd(p.mp_payment_id, p.slot_id, litros, timeout_s=max(30, litros * 5))
-    if ok:
-        try:
-            _sse_publish("refresh", {"reason": "reenviar_cmd", "payment_id": p.mp_payment_id})
-        except Exception:
-            pass
+    prod = Producto.query.get(p.product_id)
+    dev = getattr(prod, "device_id", DEFAULT_DEVICE_ID) if prod else DEFAULT_DEVICE_ID
+    ok = send_dispense_cmd(p.mp_payment_id, p.slot_id, litros, dev, timeout_s=max(30, litros * 5))
     return jsonify({
         "ok": ok,
         "msg": "Comando reenviado" if ok else "No se pudo publicar a MQTT",
@@ -665,7 +699,7 @@ def crear_preferencia_api():
     if (int(prod.cantidad) - litros) <= reserva:
         return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};device={prod.device_id}"
     body = {
         "items": [{
             "id": str(prod.id),
@@ -689,6 +723,7 @@ def crear_preferencia_api():
             "product_id": int(prod.id),
             "producto": prod.nombre,
             "litros": int(litros),
+            "device_id": prod.device_id,
         },
         "external_reference": external_ref,
         "auto_return": "approved",
@@ -745,7 +780,6 @@ def go():
 
     litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
     _, reserva = get_thresholds()
-    # bloquea si la operación dejaría stock <= reserva (reserva se respeta)
     if (int(prod.cantidad) - litros) <= reserva:
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
@@ -754,7 +788,7 @@ def go():
         return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
 
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros}"
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};device={prod.device_id}"
     body = {
         "items": [{
             "id": str(prod.id),
@@ -766,7 +800,7 @@ def go():
         }],
         "description": prod.nombre,
         "additional_info": {"items": [{"id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio)}]},
-        "metadata": {"slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre, "litros": int(litros)},
+        "metadata": {"slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre, "litros": int(litros), "device_id": prod.device_id},
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {
@@ -850,6 +884,7 @@ def mp_webhook():
     product_id = _to_int(md.get("product_id") or 0)
     slot_id = _to_int(md.get("slot_id") or 0)
     litros = _to_int(md.get("litros") or 0)
+    device_md = (md.get("device_id") or "").strip()
 
     if (not product_id or not slot_id or not litros) and pay.get("external_reference"):
         try:
@@ -857,6 +892,7 @@ def mp_webhook():
             product_id = product_id or _to_int(parts.get("pid") or 0)
             slot_id = slot_id or _to_int(parts.get("slot") or 0)
             litros = litros or _to_int(parts.get("litros") or 0)
+            device_md = device_md or (parts.get("device") or "")
         except Exception:
             app.logger.warning(f"[MP] external_reference malformado: {pay.get('external_reference')}")
 
@@ -901,15 +937,13 @@ def mp_webhook():
 
     try:
         if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
+            prod = Producto.query.get(p.product_id) if p.product_id else None
+            dev = (getattr(prod, "device_id", None) or device_md or DEFAULT_DEVICE_ID)
             published = send_dispense_cmd(p.mp_payment_id, p.slot_id, p.litros,
-                                          timeout_s=max(30, p.litros * 5))
+                                          dev, timeout_s=max(30, p.litros * 5))
             if published:
                 p.procesado = True
                 db.session.commit()
-                try:
-                    _sse_publish("refresh", {"reason": "mqtt_published", "payment_id": p.mp_payment_id})
-                except Exception:
-                    pass
             else:
                 app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; reintenta próximo webhook")
     except Exception:
@@ -932,21 +966,18 @@ def api_dispense_orden():
     payment_id = str(data.get("payment_id") or "").strip()
     slot_id = _to_int(data.get("slot_id") or 0)
     litros = _to_int(data.get("litros") or 0)
+    device_id = str((data.get("device_id") or "").strip() or DEFAULT_DEVICE_ID)
     if not payment_id:
         return json_error("Falta payment_id")
     if slot_id <= 0:
         return json_error("slot_id inválido")
     if litros <= 0:
         litros = 1
-    ok = send_dispense_cmd(payment_id, slot_id, litros, timeout_s=max(30, litros*5))
-    if ok:
-        try:
-            _sse_publish("refresh", {"reason": "manual_cmd", "payment_id": payment_id})
-        except Exception:
-            pass
+    ok = send_dispense_cmd(payment_id, slot_id, litros, device_id, timeout_s=max(30, litros*5))
     return jsonify({"ok": ok})
 
 # --- PÁGINAS PÚBLICAS PARA MP Y QR ---
+
 def _html_page(title: str, subtitle: str = "", extra: str = ""):
     html = f"""<!doctype html>
 <html lang="es"><head>
@@ -961,6 +992,8 @@ def _html_page(title: str, subtitle: str = "", extra: str = ""):
   p  {{ margin:6px 0; opacity:.9; }}
   .ok {{ color:#10b981; font-weight:800; }}
   .err{{ color:#ef4444; font-weight:800; }}
+  a.btn {{ display:inline-block; margin-top:16px; padding:10px 14px; border-radius:10px; background:#3b82f6; color:#061528; 
+           text-decoration:none; font-weight:700; }}
 </style>
 </head><body>
   <div class="box">
@@ -997,11 +1030,10 @@ def pagina_gracias():
 
 @app.get("/sin-stock")
 def pagina_sin_stock():
-    """Pantalla pública cuando un QR está bloqueado por reserva crítica."""
     title = "❌ Producto sin stock"
     subtitle = "Este producto alcanzó la reserva crítica y no está disponible por ahora. Probá más tarde."
-    extra = ""  # sin botón Volver
-    return _html_page(title, subtitle, extra)
+    # sin botón volver (kiosco)
+    return _html_page(title, subtitle, "")
 
 # -------------------------------------------------------------
 # Inicializar MQTT y Run
