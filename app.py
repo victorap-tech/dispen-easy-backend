@@ -38,10 +38,13 @@ app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-CORS(app, resources={r"/api/*": {"origins": "*"}}, allow_headers=["Content-Type", "x-admin-secret"])
-db = SQLAlchemy(app)
-logging.basicConfig(level=logging.INFO)
-app.logger.setLevel(logging.INFO)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "x-admin-secret"],
+    expose_headers=["Content-Type"],
+)
+
 
 # ---------------- Modelos ----------------
 class KV(db.Model):
