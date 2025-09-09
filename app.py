@@ -667,6 +667,31 @@ def pagina_gracias():
 def pagina_sin_stock():
     return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
 
+# ---------------- Helpers para HTML ----------------
+from flask import make_response
+
+def _html(title: str, body_html: str):
+    html = f"""<!doctype html><html lang="es"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{title}</title>
+</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
+<div style="max-width:720px;margin:14vh auto;background:rgba(255,255,255,.05);
+            border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px">
+<h1 style="margin:0 0 8px">{title}</h1>
+{body_html}
+</div></body></html>"""
+    r = make_response(html, 200)
+    r.headers["Content-Type"] = "text/html; charset=utf-8"
+    return r
+
+
+def _html_raw(html: str):
+    r = make_response(html, 200)
+    r.headers["Content-Type"] = "text/html; charset=utf-8"
+    return r
+
+
 # ---------------- Inicializar MQTT ----------------
 with app.app_context():
     try: start_mqtt_background()
