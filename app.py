@@ -1,1111 +1,852 @@
-# app.py
-import os
-import logging
-import threading
-import requests
-import json as _json
+// src/AdminPanel.jsx
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-from flask import Flask, jsonify, request, redirect, make_response
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import UniqueConstraint
-import paho.mqtt.client as mqtt
+/* ----------------- Config ----------------- */
+// URL del backend (sin "/" final)
+const API_URL = (process.env.REACT_APP_API_URL || "https://web-production-e7d2.up.railway.app")
+  .replace(/\/$/, "");
 
-# -------------------------------------------------------------
-# Config básica
-# -------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+/* ----------------- Auth header ----------------- */
+const getAdminSecret = () => sessionStorage.getItem("adminSecret") || "";
+const setAdminSecret = (s) => sessionStorage.setItem("adminSecret", s || "");
 
-# URLs
-BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL", "") or "").rstrip("/")
-WEB_URL = os.getenv("WEB_URL", "https://example.com").strip().rstrip("/")
-
-# Modo MP (test/live) y tokens
-MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
-MP_ACCESS_TOKEN_LIVE = os.getenv("MP_ACCESS_TOKEN_LIVE", "").strip()
-
-# Broker MQTT (compartido) – se multiplexa por device_id en el tópico
-MQTT_HOST = os.getenv("MQTT_HOST", "").strip()
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
-MQTT_USER = os.getenv("MQTT_USER", "")
-MQTT_PASS = os.getenv("MQTT_PASS", "")
-
-# Seguridad Admin
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
-
-# Umbrales de stock
-UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)
-STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)
-
-# Telegram (opcional)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# -------------------------------------------------------------
-# App / DB / CORS
-# -------------------------------------------------------------
-app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "x-admin-secret"],
-    expose_headers=["Content-Type"],
-)
-
-db = SQLAlchemy(app)
-logging.basicConfig(level=logging.INFO)
-app.logger.setLevel(logging.INFO)
-
-# -------------------------------------------------------------
-# Modelos
-# -------------------------------------------------------------
-class KV(db.Model):
-    __tablename__ = "kv"
-    key = db.Column(db.String(50), primary_key=True)
-    value = db.Column(db.String(200), nullable=False)
-
-class Dispenser(db.Model):
-    __tablename__ = "dispenser"
-    id = db.Column(db.Integer, primary_key=True)
-    device_id = db.Column(db.String(80), nullable=False, unique=True, index=True)
-    nombre = db.Column(db.String(100), nullable=True, default="")
-    activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-
-class Producto(db.Model):
-    __tablename__ = "producto"
-    id = db.Column(db.Integer, primary_key=True)
-    dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="SET NULL"), nullable=True, index=True)
-    nombre = db.Column(db.String(100), nullable=False)
-    precio = db.Column(db.Float, nullable=False)                 # $ por litro
-    cantidad = db.Column(db.Integer, nullable=False)             # stock disponible (L)
-    slot_id = db.Column(db.Integer, nullable=False)              # slot físico dentro del dispenser (1..6)
-    porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-    updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
-    habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
-    __table_args__ = (UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),)
-
-class Pago(db.Model):
-    __tablename__ = "pago"
-    id = db.Column(db.Integer, primary_key=True)
-    mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
-    estado = db.Column(db.String(80), nullable=False)            # approved/pending/rejected
-    producto = db.Column(db.String(120), nullable=False, default="")
-    dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
-    procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
-    slot_id = db.Column(db.Integer, nullable=False, default=0)
-    litros = db.Column(db.Integer, nullable=False, default=1)
-    monto = db.Column(db.Integer, nullable=False, default=0)     # ARS entero
-    product_id = db.Column(db.Integer, nullable=False, default=0)
-    dispenser_id = db.Column(db.Integer, nullable=False, default=0)
-    device_id = db.Column(db.String(80), nullable=True, default="")
-    raw = db.Column(JSONB, nullable=True)
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-
-with app.app_context():
-    db.create_all()
-    if not KV.query.get("mp_mode"):
-        db.session.add(KV(key="mp_mode", value="test"))
-        db.session.commit()
-    # Si no hay dispensers, se crean hasta 10 “dispen-01..10” (opcionales)
-    if Dispenser.query.count() == 0:
-        for i in range(1, 2):  # deja 1 por defecto; ajustá a 11 si querés pre-crear 10
-            did = f"dispen-{i:02d}"
-            d = Dispenser(device_id=did, nombre=f"{did}", activo=True)
-            db.session.add(d)
-        db.session.commit()
-
-# -------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------
-def ok_json(data, status=200): return jsonify(data), status
-
-def json_error(msg, status=400, extra=None):
-    p = {"error": msg}
-    if extra is not None: p["detail"] = extra
-    return jsonify(p), status
-
-def _to_int(x, default=0):
-    try: return int(x)
-    except Exception:
-        try: return int(float(x))
-        except Exception: return default
-
-def serialize_producto(p: Producto) -> dict:
-    return {
-        "id": p.id,
-        "dispenser_id": p.dispenser_id,
-        "nombre": p.nombre,
-        "precio": float(p.precio),
-        "cantidad": int(p.cantidad),
-        "slot": int(p.slot_id),
-        "porcion_litros": int(getattr(p, "porcion_litros", 1) or 1),
-        "habilitado": bool(p.habilitado),
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-    }
-
-def serialize_dispenser(d: Dispenser) -> dict:
-    return {
-        "id": d.id,
-        "device_id": d.device_id,
-        "nombre": d.nombre or "",
-        "activo": bool(d.activo),
-        "created_at": d.created_at.isoformat() if d.created_at else None,
-    }
-
-def get_thresholds():
-    reserva = max(0, int(STOCK_RESERVA_LTS))
-    umbral_cfg = max(0, int(UMBRAL_ALERTA_LTS))
-    umbral = umbral_cfg if umbral_cfg > reserva else (reserva + 1)
-    return umbral, reserva
-
-def tg_notify(text: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10
-        )
-    except Exception:
-        app.logger.exception("[TG] Error enviando notificación")
-
-def _post_stock_change_hook(prod: "Producto", motivo: str):
-    umbral, reserva = get_thresholds()
-    stock = int(prod.cantidad or 0)
-    if stock <= umbral:
-        try:
-            tg_notify(
-                f"⚠️ Bajo stock en '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
-                f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
-            )
-        except Exception:
-            pass
-    if stock <= reserva:
-        if prod.habilitado:
-            prod.habilitado = False
-            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} por reserva (stock={stock} ≤ {reserva})")
-    else:
-        if not prod.habilitado:
-            prod.habilitado = True
-            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} > {reserva})")
-
-def ensure_slots_for_dispenser(did: int) -> list[Producto]:
-    """Garantiza que existan los 6 slots (1..6) para el dispenser dado."""
-    created = []
-    for s in range(1, 7):
-        p = Producto.query.filter(Producto.dispenser_id == did, Producto.slot_id == s).first()
-        if not p:
-            p = Producto(
-                dispenser_id=did,
-                nombre=f"Slot {s}",
-                precio=0.0,
-                cantidad=0,
-                slot_id=s,
-                porcion_litros=1,
-                habilitado=False,
-            )
-            db.session.add(p)
-            created.append(p)
-    if created:
-        db.session.commit()
-    # devuelve todos ordenados
-    return Producto.query.filter(Producto.dispenser_id == did).order_by(Producto.slot_id.asc()).all()
-
-# -------------------------------------------------------------
-# Auth simple por header
-# -------------------------------------------------------------
-PUBLIC_PATHS = {
-    "/", "/gracias", "/sin-stock",
-    "/api/mp/webhook", "/webhook", "/mp/webhook",
-    "/api/pagos/preferencia", "/api/pagos/pendiente",
-    "/api/config", "/go", "/go_slot",
+/* ----------------- HTTP helpers ----------------- */
+async function apiGet(path) {
+  const r = await fetch(`${API_URL}${path}`, {
+    headers: { "x-admin-secret": getAdminSecret() },
+  });
+  if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+  return r.json();
+}
+async function apiJson(method, path, body) {
+  const r = await fetch(`${API_URL}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "x-admin-secret": getAdminSecret(),
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`${method} ${path} → ${r.status} ${t}`);
+  }
+  return r.status === 204 ? { ok: true } : r.json();
 }
 
-@app.before_request
-def _auth_guard():
-    if request.method == "OPTIONS":
-        return "", 200
-    p = request.path
-    if p in PUBLIC_PATHS:
-        return None
-    if not ADMIN_SECRET:
-        return None
-    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
-        return json_error("unauthorized", 401)
-    return None
+const prettyMoney = (n) =>
+  new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS" }).format(Number(n || 0));
+const fmtDate = (s) => (s ? new Date(s).toLocaleString() : "—");
 
-# -------------------------------------------------------------
-# MP modo/tokens
-# -------------------------------------------------------------
-def get_mp_mode() -> str:
-    row = KV.query.get("mp_mode")
-    return (row.value if row else "test").lower()
+/* =====================================================
+   AdminPanel (acordeón por dispenser, 6 slots fijos)
+   ===================================================== */
+export default function AdminPanel() {
+  const [authOk, setAuthOk] = useState(!!getAdminSecret());
+  const [checkingAuth, setCheckingAuth] = useState(false);
 
-def get_mp_token_and_base() -> tuple[str, str]:
-    mode = get_mp_mode()
-    if mode == "live":
-        return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-    return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
+  // Config
+  const [mpMode, setMpMode] = useState("test");
+  const [umbralAlerta, setUmbralAlerta] = useState(null);
+  const [stockReserva, setStockReserva] = useState(null);
+  const live = mpMode === "live";
 
-# -------------------------------------------------------------
-# MQTT (único cliente, wildcard por device)
-# -------------------------------------------------------------
-_mqtt_client = None
-_mqtt_lock = threading.Lock()
+  // Dispensers
+  const [dispensers, setDispensers] = useState([]); // [{id, device_id, nombre, activo}]
+  // Productos por dispenser -> array de 6 posiciones (1..6)
+  const [slotsByDisp, setSlotsByDisp] = useState({}); // { [dispId]: [slot1..slot6] }
+  const [expanded, setExpanded] = useState({}); // acordeón
 
-def topic_cmd(device_id: str) -> str:
-    return f"dispen/{device_id}/cmd/dispense"
-def topic_state_wild() -> str:
-    return "dispen/+/state/dispense"
-def topic_status_wild() -> str:
-    return "dispen/+/status"
+  // Estado de edición por fila (para no pisar con refresh al escribir)
+  const editingRef = useRef({}); // { `${dispId}-${slot}`: true }
 
-def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {topic_state_wild()} y {topic_status_wild()}")
-    client.subscribe(topic_state_wild(), qos=1)
-    client.subscribe(topic_status_wild(), qos=1)
+  // Pagos
+  const [pagos, setPagos] = useState([]);
+  const [pagosLoading, setPagosLoading] = useState(false);
+  const [fltEstado, setFltEstado] = useState("");
+  const [fltQ, setFltQ] = useState("");
+  const pagosTimer = useRef(null);
 
-def _mqtt_on_message(client, userdata, msg):
-    try:
-        raw = msg.payload.decode("utf-8", "ignore")
-    except Exception:
-        raw = "<binario>"
-    app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
+  // QR modal
+  const [qrLink, setQrLink] = useState("");
+  const [showQR, setShowQR] = useState(false);
 
-    # payload esperado desde ESP: {payment_id, slot_id, litros, status:[started|done|timeout|error]}
-    try:
-        data = _json.loads(raw or "{}")
-    except Exception:
-        app.logger.exception("[MQTT] payload inválido")
-        return
-
-    payment_id = str(data.get("payment_id") or "").strip()
-    status = str(data.get("status") or "").lower()
-    if status in ("ok", "finish", "finished", "success"):
-        status = "done"
-    if not payment_id or status not in ("done", "error", "timeout"):
-        return
-
-    with app.app_context():
-        p = Pago.query.filter_by(mp_payment_id=payment_id).first()
-        if not p:
-            app.logger.warning(f"[MQTT] pago {payment_id} no encontrado")
-            return
-        if status == "done" and not p.dispensado:
-            try:
-                litros_desc = int(p.litros or 0) or 1
-                prod = Producto.query.get(p.product_id) if p.product_id else None
-                if prod:
-                    prod.cantidad = max(0, int(prod.cantidad or 0) - litros_desc)
-                    _post_stock_change_hook(prod, motivo="dispensado (ESP done)")
-                p.dispensado = True
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
-                app.logger.exception("[MQTT] error al marcar dispensado/stock")
-
-def start_mqtt_background():
-    if not MQTT_HOST:
-        app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
-        return
-
-    def _run():
-        global _mqtt_client
-        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="dispen-backend")
-        if MQTT_USER or MQTT_PASS:
-            _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-        if int(MQTT_PORT) == 8883:
-            try:
-                _mqtt_client.tls_set()
-            except Exception as e:
-                app.logger.error(f"[MQTT] No se pudo habilitar TLS: {e}")
-        _mqtt_client.on_connect = _mqtt_on_connect
-        _mqtt_client.on_message = _mqtt_on_message
-        _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
-        _mqtt_client.loop_forever()
-
-    t = threading.Thread(target=_run, name="mqtt-thread", daemon=True)
-    t.start()
-
-def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int, timeout_s: int = 30) -> bool:
-    if not MQTT_HOST:
-        app.logger.warning("[MQTT] sin host; no se publica")
-        return False
-    msg = {
-        "payment_id": str(payment_id),
-        "slot_id": int(slot_id),
-        "litros": int(litros or 1),
-        "timeout_s": int(timeout_s or 30),
+  /* ----------------- Auth simple ----------------- */
+  const promptPassword = async () => {
+    const pwd = window.prompt("Ingresá la contraseña de admin:");
+    if (!pwd) return false;
+    setAdminSecret(pwd);
+    setCheckingAuth(true);
+    try {
+      await fetch(`${API_URL}/api/dispensers`, { headers: { "x-admin-secret": pwd } });
+      setAuthOk(true);
+      return true;
+    } catch {
+      alert("Contraseña inválida o backend inaccesible.");
+      setAdminSecret("");
+      setAuthOk(false);
+      return false;
+    } finally {
+      setCheckingAuth(false);
     }
-    payload = _json.dumps(msg, ensure_ascii=False)
-    with _mqtt_lock:
-        if not _mqtt_client:
-            app.logger.warning("[MQTT] cliente no inicializado")
-            return False
-        t = topic_cmd(device_id)
-        info = _mqtt_client.publish(t, payload, qos=1, retain=False)
-        ok = (info.rc == mqtt.MQTT_ERR_SUCCESS)
-        app.logger.info(f"[MQTT] publish {t} ok={ok}")
-        return ok
+  };
 
-# -------------------------------------------------------------
-# Health
-# -------------------------------------------------------------
-@app.get("/")
-def health():
-    return ok_json({"status": "ok", "message": "Backend Dispen-Easy operativo"})
-
-# -------------------------------------------------------------
-# Config (modo de pago + umbrales)
-# -------------------------------------------------------------
-@app.get("/api/config")
-def api_get_config():
-    umbral, reserva = get_thresholds()
-    return ok_json({
-        "mp_mode": get_mp_mode(),
-        "umbral_alerta_lts": umbral,
-        "stock_reserva_lts": reserva,
-    })
-
-@app.post("/api/mp/mode")
-def api_set_mode():
-    data = request.get_json(force=True, silent=True) or {}
-    mode = str(data.get("mode") or "").lower()
-    if mode not in ("test", "live"):
-        return json_error("modo inválido (test|live)", 400)
-    kv = KV.query.get("mp_mode")
-    if not kv:
-        kv = KV(key="mp_mode", value=mode)
-        db.session.add(kv)
-    kv.value = mode
-    db.session.commit()
-    return ok_json({"ok": True, "mp_mode": mode})
-
-# -------------------------------------------------------------
-# Dispensers
-# -------------------------------------------------------------
-@app.get("/api/dispensers")
-def dispensers_list():
-    ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
-    return jsonify([serialize_dispenser(d) for d in ds])
-
-@app.post("/api/dispensers")
-def dispensers_create():
-    data = request.get_json(force=True, silent=True) or {}
-    device_id = (data.get("device_id") or "").strip()
-    nombre = (data.get("nombre") or "").strip()
-    activo = bool(data.get("activo", True))
-    if not device_id:
-        return json_error("device_id requerido", 400)
-    if Dispenser.query.filter_by(device_id=device_id).first():
-        return json_error("device_id ya existe", 409)
-    d = Dispenser(device_id=device_id, nombre=nombre, activo=activo)
-    db.session.add(d); db.session.commit()
-    # crea 6 slots iniciales
-    ensure_slots_for_dispenser(d.id)
-    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)}, 201)
-
-@app.put("/api/dispensers/<int:did>")
-def dispensers_update(did):
-    d = Dispenser.query.get_or_404(did)
-    data = request.get_json(force=True, silent=True) or {}
-    if "nombre" in data: d.nombre = str(data["nombre"]).strip()
-    if "activo" in data: d.activo = bool(data["activo"])
-    if "device_id" in data:
-        nid = str(data["device_id"]).strip()
-        if nid and nid != d.device_id:
-            if Dispenser.query.filter(Dispenser.device_id == nid, Dispenser.id != d.id).first():
-                return json_error("device_id ya usado", 409)
-            d.device_id = nid
-    db.session.commit()
-    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)})
-
-@app.post("/api/dispensers/<int:did>/ensure_slots")
-def dispenser_ensure_slots(did):
-    d = Dispenser.query.get_or_404(did)
-    prods = ensure_slots_for_dispenser(d.id)
-    return ok_json({"ok": True, "productos": [serialize_producto(p) for p in prods]})
-
-# -------------------------------------------------------------
-# Productos CRUD
-# -------------------------------------------------------------
-@app.get("/api/productos")
-def productos_list():
-    disp_id = _to_int(request.args.get("dispenser_id") or 0)
-    q = Producto.query
-    if disp_id: q = q.filter(Producto.dispenser_id == disp_id)
-    prods = q.order_by(Producto.dispenser_id.asc(), Producto.slot_id.asc()).all()
-    return jsonify([serialize_producto(p) for p in prods])
-
-@app.post("/api/productos")
-def productos_create():
-    data = request.get_json(force=True)
-    try:
-        disp_id = _to_int(data.get("dispenser_id") or 0)
-        if not disp_id or not Dispenser.query.get(disp_id):
-            return json_error("dispenser_id inválido", 400)
-        p = Producto(
-            dispenser_id=disp_id,
-            nombre=str(data.get("nombre", "")).strip() or "Producto",
-            precio=float(data.get("precio", 0)),
-            cantidad=int(float(data.get("cantidad", 0))),
-            slot_id=int(data.get("slot", 1)),
-            porcion_litros=int(data.get("porcion_litros", 1)),
-            habilitado=bool(data.get("habilitado", False)),
-        )
-        if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1:
-            return json_error("Valores inválidos", 400)
-        if p.slot_id < 1 or p.slot_id > 6:
-            return json_error("slot debe ser 1..6", 400)
-        if Producto.query.filter(Producto.dispenser_id == p.dispenser_id, Producto.slot_id == p.slot_id).first():
-            return json_error("Slot ya asignado a otro producto en este dispenser", 409)
-        db.session.add(p)
-        _post_stock_change_hook(p, motivo="create")
-        db.session.commit()
-        return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception("Error creando producto")
-        return json_error("Error creando producto", 500, str(e))
-
-@app.put("/api/productos/<int:pid>")
-def productos_update(pid):
-    data = request.get_json(force=True)
-    p = Producto.query.get_or_404(pid)
-    try:
-        before = int(p.cantidad or 0)
-
-        if "dispenser_id" in data:
-            new_d = _to_int(data["dispenser_id"])
-            if new_d and new_d != p.dispenser_id and Dispenser.query.get(new_d):
-                if Producto.query.filter(Producto.dispenser_id == new_d,
-                                         Producto.slot_id == p.slot_id).first():
-                    return json_error("Slot ya usado en el nuevo dispenser", 409)
-                p.dispenser_id = new_d
-
-        if "nombre" in data: p.nombre = str(data["nombre"]).strip() or f"Slot {p.slot_id}"
-        if "precio" in data: p.precio = float(data["precio"])
-        if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
-        if "porcion_litros" in data:
-            val = int(data["porcion_litros"])
-            if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
-            p.porcion_litros = val
-        if "slot" in data:
-            new_slot = int(data["slot"])
-            if new_slot < 1 or new_slot > 6:
-                return json_error("slot debe ser 1..6", 400)
-            if new_slot != p.slot_id and \
-               Producto.query.filter(Producto.dispenser_id == p.dispenser_id,
-                                     Producto.slot_id == new_slot,
-                                     Producto.id != p.id).first():
-                return json_error("Slot ya asignado a otro producto en este dispenser", 409)
-            p.slot_id = new_slot
-        if "habilitado" in data: p.habilitado = bool(data["habilitado"])
-
-        after = int(p.cantidad or 0)
-        if after != before:
-            _post_stock_change_hook(p, motivo="update cantidad")
-
-        db.session.commit()
-        return ok_json({"ok": True, "producto": serialize_producto(p)})
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception("Error actualizando producto")
-        return json_error("Error actualizando producto", 500, str(e))
-
-@app.delete("/api/productos/<int:pid>")
-def productos_delete(pid):
-    p = Producto.query.get_or_404(pid)
-    try:
-        db.session.delete(p)
-        db.session.commit()
-        return ok_json({"ok": True}, 204)
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception("Error eliminando producto")
-        return json_error("Error eliminando producto", 500, str(e))
-
-@app.post("/api/productos/<int:pid>/reponer")
-def productos_reponer(pid):
-    p = Producto.query.get_or_404(pid)
-    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
-    if litros <= 0:
-        return json_error("Litros inválidos", 400)
-    try:
-        p.cantidad = max(0, int(p.cantidad or 0) + litros)
-        _post_stock_change_hook(p, motivo="reponer")
-        db.session.commit()
-        return ok_json({"ok": True, "producto": serialize_producto(p)})
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception("Error reponiendo producto")
-        return json_error("Error reponiendo producto", 500, str(e))
-
-@app.post("/api/productos/<int:pid>/reset_stock")
-def productos_reset(pid):
-    p = Producto.query.get_or_404(pid)
-    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
-    if litros < 0:
-        return json_error("Litros inválidos", 400)
-    try:
-        p.cantidad = int(litros)
-        _post_stock_change_hook(p, motivo="reset_stock")
-        db.session.commit()
-        return ok_json({"ok": True, "producto": serialize_producto(p)})
-    except Exception as e:
-        db.session.rollback()
-        app.logger.exception("Error reseteando stock")
-        return json_error("Error reseteando stock", 500, str(e))
-
-# -------------------------------------------------------------
-# Pagos
-# -------------------------------------------------------------
-@app.get("/api/pagos")
-def pagos_list():
-    try:
-        limit = int(request.args.get("limit", 50))
-        limit = max(1, min(limit, 200))
-    except Exception:
-        limit = 50
-    estado = (request.args.get("estado") or "").strip()
-    qsearch = (request.args.get("q") or "").strip()
-
-    q = Pago.query
-    if estado: q = q.filter(Pago.estado == estado)
-    if qsearch: q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
-
-    pagos = q.order_by(Pago.id.desc()).limit(limit).all()
-    return jsonify([
-        {
-            "id": p.id,
-            "mp_payment_id": p.mp_payment_id,
-            "estado": p.estado,
-            "producto": p.producto,
-            "product_id": p.product_id,
-            "dispenser_id": p.dispenser_id,
-            "device_id": p.device_id,
-            "slot_id": p.slot_id,
-            "litros": p.litros,
-            "monto": p.monto,
-            "dispensado": bool(p.dispensado),
-            "created_at": p.created_at.isoformat() if p.created_at else None,
-        } for p in pagos
-    ])
-
-@app.get("/api/pagos/pendiente")
-def pagos_pendiente():
-    p = (Pago.query
-            .filter(Pago.estado == "approved", Pago.dispensado == False)
-            .order_by(Pago.created_at.asc())
-            .first())
-    if not p:
-        return jsonify({"ok": True, "pago": None})
-    prod = Producto.query.get(p.product_id) if p.product_id else None
-    data = {
-        "id": p.id,
-        "mp_payment_id": p.mp_payment_id,
-        "estado": p.estado,
-        "litros": int(p.litros or 0),
-        "slot_id": int(p.slot_id or 0),
-        "product_id": int(p.product_id or 0),
-        "dispenser_id": int(p.dispenser_id or 0),
-        "device_id": p.device_id or "",
-        "producto": p.producto,
-        "created_at": p.created_at.isoformat() if p.created_at else None,
+  /* ----------------- Carga de config ----------------- */
+  const loadConfig = async () => {
+    try {
+      const c = await apiGet("/api/config");
+      setMpMode((c?.mp_mode || "test").toLowerCase());
+      if (typeof c?.umbral_alta_lts === "number") setUmbralAlerta(c.umbral_alerta_lts);
+      if (typeof c?.umbral_alerta_lts === "number") setUmbralAlerta(c.umbral_alerta_lts);
+      if (typeof c?.stock_reserva_lts === "number") setStockReserva(c.stock_reserva_lts);
+    } catch (e) {
+      console.error(e);
     }
-    if prod:
-        data["producto_nombre"] = prod.nombre
-        data["porcion_litros"] = int(getattr(prod, "porcion_litros", 1))
-        data["stock_litros"] = int(prod.cantidad)
-    return jsonify({"ok": True, "pago": data})
-
-@app.post("/api/pagos/<int:pid>/dispensado")
-def pagos_dispensado(pid):
-    p = Pago.query.get_or_404(pid)
-    if p.dispensado:
-        return jsonify({"ok": True, "msg": "Ya estaba confirmado", "pago": {"id": p.id, "dispensado": True}})
-    prod = Producto.query.get(p.product_id)
-    if not prod:
-        return json_error("Producto no encontrado para este pago", 404)
-    litros_desc = int(p.litros or 0) or 1
-    prod.cantidad = max(0, int(prod.cantidad) - litros_desc)
-    _post_stock_change_hook(prod, motivo="dispensado (manual)")
-    p.dispensado = True
-    p.procesado = True
-    db.session.commit()
-    return jsonify({"ok": True, "msg": "Dispensado confirmado",
-                    "pago": {"id": p.id, "dispensado": True},
-                    "producto": {"id": prod.id, "stock": prod.cantidad}})
-
-@app.post("/api/pagos/<int:pid>/fallo")
-def pagos_fallo(pid):
-    p = Pago.query.get_or_404(pid)
-    return jsonify({"ok": True, "msg": "Registrado fallo", "pago": {"id": p.id}})
-
-@app.post("/api/pagos/<int:pid>/reenviar")
-def pagos_reenviar(pid):
-    p = Pago.query.get_or_404(pid)
-    if p.dispensado:
-        return jsonify({"ok": False, "msg": "El pago ya está marcado como dispensado"})
-    if p.estado != "approved":
-        return jsonify({"ok": False, "msg": f"Estado no válido para reintento: {p.estado}"})
-    if not p.slot_id or not p.litros:
-        return jsonify({"ok": False, "msg": "Pago sin slot/litros válidos"})
-    # Dispositivo: del pago o del producto
-    device = p.device_id
-    if not device and p.product_id:
-        pr = Producto.query.get(p.product_id)
-        if pr and pr.dispenser_id:
-            d = Dispenser.query.get(pr.dispenser_id)
-            device = d.device_id if d else ""
-    if not device:
-        return jsonify({"ok": False, "msg": "No se pudo determinar device_id"})
-    litros = int(p.litros or 1)
-    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, litros, timeout_s=max(30, litros * 5))
-    return jsonify({
-        "ok": ok,
-        "msg": "Comando reenviado" if ok else "No se pudo publicar a MQTT",
-        "pago": {"id": p.id, "mp_payment_id": p.mp_payment_id, "slot_id": p.slot_id, "litros": litros}
-    })
-
-# -------------------------------------------------------------
-# Mercado Pago: crear preferencia (API) con bloqueo por reserva
-# -------------------------------------------------------------
-@app.post("/api/pagos/preferencia")
-def crear_preferencia_api():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = _to_int(data.get("product_id") or 0)
-    litros_req = _to_int(data.get("litros") or 0)
-
-    token, _base_api = get_mp_token_and_base()
-    if not token:
-        return json_error("MP token no configurado (TEST/LIVE)", 500)
-
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return json_error("producto no disponible", 400)
-
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return json_error("dispenser no disponible", 400)
-
-    litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) <= reserva:
-        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
-
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
-        "description": prod.nombre,
-        "additional_info": { "items": [{ "id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio) }] },
-        "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
-            "producto": prod.nombre,
-            "litros": int(litros),
-            "dispenser_id": int(disp.id),
-            "device_id": disp.device_id,
-        },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
-        },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
+  };
+  const setMode = async (mode) => {
+    try {
+      await apiJson("POST", "/api/mp/mode", { mode });
+      await loadConfig();
+    } catch (e) {
+      alert(e.message);
     }
+  };
+  const toggleMode = () => setMode(live ? "test" : "live");
 
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
-        )
-        app.logger.info("[MP] pref resp %s %s", r.status_code, r.text[:500])
-        r.raise_for_status()
-    except Exception as e:
-        app.logger.exception("[MP] error al crear preferencia")
-        detail = getattr(r, "text", str(e))[:600]
-        return json_error("mp_preference_failed", 502, detail)
+  /* ----------------- Dispensers + slots ----------------- */
+  const loadDispensers = async () => {
+    const ds = await apiGet("/api/dispensers");
+    setDispensers(ds || []);
+    const ex = {};
+    (ds || []).forEach((d, i) => (ex[d.id] = i === 0)); // abre el primero
+    setExpanded(ex);
+  };
 
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-    return ok_json({"ok": True, "link": link, "raw": pref})
-
-# -------------------------------------------------------------
-# QR DINÁMICO: /go (por producto) y /go_slot (QR fijo por slot)
-# -------------------------------------------------------------
-@app.get("/go")
-def go():
-    pid = _to_int(request.args.get("pid") or 0)
-    litros_req = _to_int(request.args.get("litros") or 0)
-    if not pid:
-        return redirect(f"{WEB_URL}/sin-stock")
-
-    prod = Producto.query.get(pid)
-    if not prod:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-    if not prod.habilitado:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-    litros = litros_req if litros_req > 0 else int(getattr(prod, "porcion_litros", 1) or 1)
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) <= reserva:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-    token, _ = get_mp_token_and_base()
-    if not token:
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-    body = {
-        "items": [{ "id": str(prod.id), "title": prod.nombre, "description": prod.nombre, "quantity": 1,
-                    "currency_id": "ARS", "unit_price": float(prod.precio) }],
-        "description": prod.nombre,
-        "additional_info": { "items": [{ "id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio) }] },
-        "metadata": { "slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre,
-                      "litros": int(litros), "dispenser_id": int(disp.id), "device_id": disp.device_id },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": { "success": f"{WEB_URL}/gracias?status=success",
-                       "failure": f"{WEB_URL}/gracias?status=failure",
-                       "pending": f"{WEB_URL}/gracias?status=pending" },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
+  const normalizeSix = (products) => {
+    const map = {};
+    (products || []).forEach((p) => (map[p.slot] = p));
+    const arr = [];
+    for (let s = 1; s <= 6; s++) {
+      arr.push(
+        map[s] || {
+          // placeholder (slot vacío)
+          id: null,
+          dispenser_id: null,
+          nombre: "",
+          precio: "",
+          cantidad: "",
+          porcion_litros: "1",
+          slot: s,
+          habilitado: false,
+          __placeholder: true,
+        }
+      );
     }
+    return arr;
+  };
 
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
-        )
-        r.raise_for_status()
-        pref = r.json() or {}
-        link = pref.get("init_point") or pref.get("sandbox_init_point")
-        if not link:
-            return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-        return redirect(link, code=302)
-    except Exception:
-        app.logger.exception("[MP] error creando preferencia en /go")
-        return redirect(f"{WEB_URL}/sin-stock?pid={pid}")
-
-@app.get("/go_slot")
-def go_slot():
-    """
-    QR fijo por slot:
-      /go_slot?disp=DISPENSER_ID&slot=1..6
-    El producto y precio se editan sobre ese slot desde el Admin.
-    """
-    did = _to_int(request.args.get("disp") or 0)
-    slot = _to_int(request.args.get("slot") or 0)
-    if not did or slot < 1 or slot > 6:
-        return redirect(f"{WEB_URL}/sin-stock")
-
-    disp = Dispenser.query.get(did)
-    if not disp or not disp.activo:
-        return redirect(f"{WEB_URL}/sin-stock")
-
-    # aseguramos que exista el slot
-    prod = Producto.query.filter(Producto.dispenser_id == did, Producto.slot_id == slot).first()
-    if not prod:
-        # si no existe, lo creamos deshabilitado
-        prod = Producto(dispenser_id=did, nombre=f"Slot {slot}", precio=0.0, cantidad=0,
-                        slot_id=slot, porcion_litros=1, habilitado=False)
-        db.session.add(prod); db.session.commit()
-
-    if not prod.habilitado:
-        return redirect(f"{WEB_URL}/sin-stock?pid={prod.id}")
-
-    litros = int(getattr(prod, "porcion_litros", 1) or 1)
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) <= reserva:
-        return redirect(f"{WEB_URL}/sin-stock?pid={prod.id}")
-
-    token, _ = get_mp_token_and_base()
-    if not token:
-        return redirect(f"{WEB_URL}/sin-stock?pid={prod.id}")
-
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-    body = {
-        "items": [{ "id": str(prod.id), "title": prod.nombre, "description": prod.nombre, "quantity": 1,
-                    "currency_id": "ARS", "unit_price": float(prod.precio) }],
-        "description": prod.nombre,
-        "additional_info": { "items": [{ "id": str(prod.id), "title": prod.nombre, "quantity": 1, "unit_price": float(prod.precio) }] },
-        "metadata": { "slot_id": int(prod.slot_id), "product_id": int(prod.id), "producto": prod.nombre,
-                      "litros": int(litros), "dispenser_id": int(disp.id), "device_id": disp.device_id },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": { "success": f"{WEB_URL}/gracias?status=success",
-                       "failure": f"{WEB_URL}/gracias?status=failure",
-                       "pending": f"{WEB_URL}/gracias?status=pending" },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
+  const loadProductosOf = async (dispId) => {
+    try {
+      const data = await apiGet(`/api/productos?dispenser_id=${dispId}`);
+      const six = normalizeSix(data);
+      // No pisar una fila si está en edición
+      const keyPrefix = `${dispId}-`;
+      const someoneEditing = Object.keys(editingRef.current).some(
+        (k) => k.startsWith(keyPrefix) && editingRef.current[k]
+      );
+      if (!someoneEditing) {
+        setSlotsByDisp((prev) => ({ ...prev, [dispId]: six }));
+      }
+    } catch (e) {
+      console.error(e);
     }
+  };
 
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
-        )
-        r.raise_for_status()
-        pref = r.json() or {}
-        link = pref.get("init_point") or pref.get("sandbox_init_point")
-        if not link:
-            return redirect(f"{WEB_URL}/sin-stock?pid={prod.id}")
-        return redirect(link, code=302)
-    except Exception:
-        app.logger.exception("[MP] error creando preferencia en /go_slot")
-        return redirect(f"{WEB_URL}/sin-stock?pid={prod.id}")
+  const loadAllSlots = async () => {
+    await Promise.all((dispensers || []).map((d) => loadProductosOf(d.id)));
+  };
 
-# -------------------------------------------------------------
-# Webhook MP (idempotente)
-# -------------------------------------------------------------
-@app.post("/api/mp/webhook")
-def mp_webhook():
-    body = request.get_json(silent=True) or {}
-    args = request.args or {}
-    topic = args.get("topic") or body.get("type")
-    live_mode = bool(body.get("live_mode", True))
+  /* ----------------- Pagos ----------------- */
+  const loadPagos = async () => {
+    setPagosLoading(true);
+    try {
+      const qs = new URLSearchParams();
+      if (fltEstado) qs.set("estado", fltEstado);
+      if (fltQ) qs.set("q", fltQ.trim());
+      qs.set("limit", "10");
+      const data = await apiGet(`/api/pagos?${qs.toString()}`);
+      setPagos(data || []);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setPagosLoading(false);
+    }
+  };
 
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
+  /* ----------------- Montaje ----------------- */
+  useEffect(() => {
+    if (!authOk) return;
+    (async () => {
+      await Promise.all([loadDispensers(), loadConfig()]);
+    })();
+    return () => {
+      if (pagosTimer.current) clearInterval(pagosTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authOk]);
 
-    app.logger.info(f"[MP] webhook topic={topic} live={live_mode} args={dict(args)} body={body}")
+  // Cuando hay dispensers, cargo sus slots + empiezo auto-refresh de pagos
+  useEffect(() => {
+    if (!authOk || (dispensers || []).length === 0) return;
+    loadAllSlots();
+    loadPagos();
+    if (pagosTimer.current) clearInterval(pagosTimer.current);
+    pagosTimer.current = setInterval(loadPagos, 5000);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dispensers.length]);
 
-    payment_id = None
-    if topic == "payment":
-        if "resource" in body and isinstance(body["resource"], str):
-            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception: payment_id = None
-        payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
+  useEffect(() => {
+    if (!authOk) return;
+    loadPagos();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fltEstado]);
 
-    if topic == "merchant_order" and not payment_id:
-        mo_id = args.get("id") or (body.get("data") or {}).get("id")
-        if mo_id:
-            try:
-                r_mo = requests.get(f"{base_api}/merchant_orders/{mo_id}",
-                                    headers={"Authorization": f"Bearer {token}"}, timeout=15)
-                if r_mo.ok:
-                    pays = (r_mo.json() or {}).get("payments") or []
-                    if pays: payment_id = str(pays[0].get("id"))
-            except Exception:
-                app.logger.exception("[MP] error consultando merchant_order")
+  /* ----------------- Helpers de stock crítico ----------------- */
+  const isCriticalSlot = (row, reserva) => {
+    if (!row || !row.id) return false;
+    const stock = Number(row.cantidad ?? 0);
+    if (Number.isNaN(stock)) return false;
+    // Alerta simple: stock actual ≤ reserva
+    return typeof reserva === "number" && stock <= reserva;
+    // Si preferís “venta posible” como criterio:
+    // const porcion = Math.max(1, Number(row.porcion_litros ?? 1));
+    // return stock - porcion <= reserva;
+  };
 
-    if not payment_id:
-        app.logger.warning("[MP] webhook sin payment_id")
-        return "ok", 200
+  /* ----------------- Handlers por slot ----------------- */
+  const setEditing = (dispId, slot, v) => {
+    const k = `${dispId}-${slot}`;
+    editingRef.current[k] = v;
+  };
 
-    try:
-        r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                             headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        r_pay.raise_for_status()
-    except Exception:
-        app.logger.exception(f"[MP] error HTTP payments/{payment_id}: "
-                             f"{getattr(r_pay,'status_code',None)} {getattr(r_pay,'text','')[:400]}")
-        return "ok", 200
+  const updateSlotField = (dispId, slot, field, value) => {
+    setSlotsByDisp((prev) => {
+      const arr = prev[dispId] ? [...prev[dispId]] : [];
+      const idx = slot - 1;
+      if (!arr[idx]) return prev;
+      arr[idx] = { ...arr[idx], [field]: value };
+      return { ...prev, [dispId]: arr };
+    });
+  };
 
-    pay = r_pay.json() or {}
-    estado = (pay.get("status") or "").lower()
-    md = pay.get("metadata") or {}
-    product_id = _to_int(md.get("product_id") or 0)
-    slot_id = _to_int(md.get("slot_id") or 0)
-    litros = _to_int(md.get("litros") or 0)
-    dispenser_id = _to_int(md.get("dispenser_id") or 0)
-    device_id = str(md.get("device_id") or "")
+  const saveSlot = (disp, slotIdx) => async () => {
+    const slotNum = slotIdx + 1;
+    const row = (slotsByDisp[disp.id] || [])[slotIdx];
+    if (!row) return;
 
-    if (not product_id or not slot_id or not litros) and pay.get("external_reference"):
-        try:
-            parts = dict(kv.split("=", 1) for kv in pay["external_reference"].split(";") if "=" in kv)
-            product_id = product_id or _to_int(parts.get("pid") or 0)
-            slot_id = slot_id or _to_int(parts.get("slot") or 0)
-            litros = litros or _to_int(parts.get("litros") or 0)
-            dispenser_id = dispenser_id or _to_int(parts.get("disp") or 0)
-            device_id = device_id or parts.get("dev") or ""
-        except Exception:
-            app.logger.warning(f"[MP] external_reference malformado: {pay.get('external_reference')}")
+    try {
+      const payload = {
+        nombre: String(row.nombre || "").trim(),
+        precio: Number(row.precio || 0),
+        cantidad: Number(row.cantidad || 0),
+        porcion_litros: Math.max(1, Number(row.porcion_litros || 1)),
+        habilitado: Boolean(row.habilitado),
+      };
 
-    monto = int(round(float(pay.get("transaction_amount") or 0)))
-    producto_txt = (
-        md.get("producto")
-        or (pay.get("additional_info", {}).get("items") or [{}])[0].get("title")
-        or pay.get("description")
-        or ""
-    )[:120]
+      if (row.__placeholder || !row.id) {
+        // Crear producto en ese slot fijo
+        const res = await apiJson("POST", `/api/productos`, {
+          dispenser_id: disp.id,
+          slot: slotNum,
+          ...payload,
+        });
+        const p = res?.producto;
+        if (p) {
+          setSlotsByDisp((prev) => {
+            const arr = [...(prev[disp.id] || [])];
+            arr[slotIdx] = p;
+            return { ...prev, [disp.id]: arr };
+          });
+          alert("Slot creado/guardado");
+        }
+      } else {
+        // Actualizar producto existente
+        const res = await apiJson("PUT", `/api/productos/${row.id}`, payload);
+        const p = res?.producto;
+        if (p) {
+          setSlotsByDisp((prev) => {
+            const arr = [...(prev[disp.id] || [])];
+            arr[slotIdx] = p;
+            return { ...prev, [disp.id]: arr };
+          });
+          alert("Cambios guardados");
+        }
+      }
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setEditing(disp.id, slotNum, false);
+      // refrescar para reflejar thresholds/habilitado que pudo cambiar por stock
+      await loadProductosOf(disp.id);
+    }
+  };
 
-    p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-    if not p:
-        p = Pago(
-            mp_payment_id=str(payment_id),
-            estado=estado or "pending",
-            producto=producto_txt,
-            dispensado=False,
-            procesado=False,
-            slot_id=slot_id,
-            litros=litros if litros > 0 else 1,
-            monto=monto,
-            product_id=product_id,
-            dispenser_id=dispenser_id,
-            device_id=device_id,
-            raw=pay,
-        )
-        db.session.add(p)
-    else:
-        p.estado = estado or p.estado
-        p.producto = producto_txt or p.producto
-        p.slot_id = p.slot_id or slot_id
-        p.product_id = p.product_id or product_id
-        p.litros = p.litros or (litros if litros > 0 else p.litros)
-        p.monto = p.monto or monto
-        p.dispenser_id = p.dispenser_id or dispenser_id
-        p.device_id = p.device_id or device_id
-        p.raw = pay
+  const reponer = (disp, slotIdx) => async () => {
+    const row = (slotsByDisp[disp.id] || [])[slotIdx];
+    if (!row?.id) return alert("Primero guardá el producto del slot");
+    const litros = Number(prompt("¿Cuántos litros querés reponer? (ej: 5)") || 0);
+    if (!litros || litros <= 0) return;
+    try {
+      const res = await apiJson("POST", `/api/productos/${row.id}/reponer`, { litros });
+      const p = res?.producto;
+      if (p) {
+        setSlotsByDisp((prev) => {
+          const arr = [...(prev[disp.id] || [])];
+          arr[slotIdx] = p;
+          return { ...prev, [disp.id]: arr };
+        });
+      }
+    } catch (e) {
+      alert(e.message);
+    }
+  };
 
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        app.logger.exception("[DB] error guardando pago")
-        return "ok", 200
+  const resetStock = (disp, slotIdx) => async () => {
+    const row = (slotsByDisp[disp.id] || [])[slotIdx];
+    if (!row?.id) return alert("Primero guardá el producto del slot");
+    const litros = Number(prompt("Setear stock exacto en litros (ej: 20)") || 0);
+    if (litros < 0) return;
+    try {
+      const res = await apiJson("POST", `/api/productos/${row.id}/reset_stock`, { litros });
+      const p = res?.producto;
+      if (p) {
+        setSlotsByDisp((prev) => {
+          const arr = [...(prev[disp.id] || [])];
+          arr[slotIdx] = p;
+          return { ...prev, [disp.id]: arr };
+        });
+      }
+    } catch (e) {
+      alert(e.message);
+    }
+  };
 
-    try:
-        if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
-            dev = p.device_id
-            if not dev and p.product_id:
-                pr = Producto.query.get(p.product_id)
-                if pr and pr.dispenser_id:
-                    d = Dispenser.query.get(pr.dispenser_id)
-                    dev = d.device_id if d else ""
-            if dev:
-                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros,
-                                              timeout_s=max(30, p.litros * 5))
-                if published:
-                    p.procesado = True
-                    db.session.commit()
-                else:
-                    app.logger.error(f"[MQTT] publicación falló para pago {p.mp_payment_id}; reintenta próximo webhook")
-            else:
-                app.logger.error(f"[MQTT] no hay device_id para pago {p.id}")
-    except Exception:
-        app.logger.exception("[MQTT] no se pudo publicar orden tras approval")
+  const toggleHabilitado = (disp, slotIdx) => async (checked) => {
+    const row = (slotsByDisp[disp.id] || [])[slotIdx];
+    if (!row?.id) return alert("Primero guardá el producto del slot");
+    try {
+      const res = await apiJson("PUT", `/api/productos/${row.id}`, { habilitado: !!checked });
+      const p = res?.producto;
+      if (p) {
+        setSlotsByDisp((prev) => {
+          const arr = [...(prev[disp.id] || [])];
+          arr[slotIdx] = p;
+          return { ...prev, [disp.id]: arr };
+        });
+      }
+    } catch (e) {
+      alert(e.message);
+    }
+  };
 
-    return "ok", 200
+  // QR fijo /go (por slot → por product_id fijo)
+  const mostrarQRFijo = (row) => () => {
+    if (!row?.id) return alert("Primero guardá el producto del slot");
+    const link = `${API_URL}/go?pid=${row.id}`;
+    setQrLink(link);
+    setShowQR(true);
+  };
 
-@app.post("/webhook")
-def mp_webhook_alias1(): return mp_webhook()
-@app.post("/mp/webhook")
-def mp_webhook_alias2(): return mp_webhook()
+  // Reenviar orden (tabla pagos)
+  const reenviarPago = async (id) => {
+    try {
+      const res = await apiJson("POST", `/api/pagos/${id}/reenviar`);
+      alert(res.msg || "Reenvío enviado");
+      await loadPagos();
+    } catch (e) {
+      alert("Error reintentando: " + e.message);
+    }
+  };
 
-# -------------------------------------------------------------
-# Orden manual (pruebas)
-# -------------------------------------------------------------
-@app.post("/api/dispense/orden")
-def api_dispense_orden():
-    data = request.get_json(force=True, silent=True) or {}
-    device_id = str(data.get("device_id") or "").strip()
-    payment_id = str(data.get("payment_id") or "").strip()
-    slot_id = _to_int(data.get("slot_id") or 0)
-    litros = _to_int(data.get("litros") or 0)
-    if not payment_id: return json_error("Falta payment_id")
-    if not device_id: return json_error("Falta device_id")
-    if slot_id <= 0: return json_error("slot_id inválido")
-    if litros <= 0: litros = 1
-    ok = send_dispense_cmd(device_id, payment_id, slot_id, litros, timeout_s=max(30, litros*5))
-    return jsonify({"ok": ok})
+  const qrImg = useMemo(() => {
+    if (!qrLink) return "";
+    return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+      qrLink
+    )}`;
+  }, [qrLink]);
 
-# -------------------------------------------------------------
-# Páginas públicas para MP y QR
-# -------------------------------------------------------------
-def _html_page(title: str, subtitle: str = "", extra: str = ""):
-    html = f"""<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-<style>
-  body {{ margin:0; background:#0b1220; color:#e5e7eb; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
-  .box {{ max-width:680px; margin:14vh auto; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08);
-         border-radius:18px; padding:28px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-  h1 {{ margin:0 0 6px; font-size:34px; }}
-  p  {{ margin:6px 0; opacity:.9; }}
-  .ok {{ color:#10b981; font-weight:800; }}
-  .err{{ color:#ef4444; font-weight:800; }}
-</style>
-</head><body>
-  <div class="box">
-    <h1>{title}</h1>
-    <p>{subtitle}</p>
-    {extra}
-  </div>
-</body></html>"""
-    resp = make_response(html, 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
+  /* ----------------- Render ----------------- */
+  if (!authOk) {
+    return (
+      <div style={styles.page}>
+        <div style={{ ...styles.card, maxWidth: 480, margin: "100px auto" }}>
+          <h1 style={styles.title}>Dispen-Easy · Admin</h1>
+          <p style={styles.subtitle}>
+            Backend: <code>{API_URL}</code>
+          </p>
+          <button
+            style={{ ...styles.primaryBtn, width: "100%", marginTop: 12 }}
+            onClick={promptPassword}
+            disabled={checkingAuth}
+          >
+            {checkingAuth ? "Ingresando…" : "Ingresar"}
+          </button>
+          <p style={{ opacity: 0.7, fontSize: 12, marginTop: 8 }}>
+            Esta contraseña viaja como header <code>x-admin-secret</code>.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
-@app.get("/gracias")
-def pagina_gracias():
-    status = (request.args.get("status") or "").lower()
-    pay_id = request.args.get("payment_id") or request.args.get("collection_id") or ""
-    extref = request.args.get("external_reference") or ""
-    if status in ("success", "approved"):
-        title = "¡Gracias por su compra!"
-        subtitle = '<span class="ok">Pago aprobado.</span> En breve se dispensará el producto.'
-    elif status in ("pending", "in_process"):
-        title = "Pago pendiente"
-        subtitle = "Tu pago está en revisión. Si se aprueba, se dispensará automáticamente."
-    else:
-        title = "Pago no completado"
-        subtitle = '<span class="err">El pago fue cancelado o rechazado.</span>'
-    extra = ""
-    if pay_id or extref:
-        extra = f"<p style='opacity:.7;font-size:12px'>Ref: {pay_id or extref}</p>"
-    return _html_page(title, subtitle, extra)
+  return (
+    <div style={styles.page}>
+      <header style={styles.header}>
+        <div>
+          <h1 style={{ ...styles.title, color: live ? "#10b981" : "#e5e7eb" }}>
+            Dispen-Easy · Administración
+          </h1>
+          <div style={styles.subtitle}>Backend: <code>{API_URL}</code></div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button style={styles.reloadBtn} onClick={loadPagos} disabled={pagosLoading}>
+            {pagosLoading ? "Pagos…" : "Actualizar pagos"}
+          </button>
+        </div>
+      </header>
 
-@app.get("/sin-stock")
-def pagina_sin_stock():
-    title = "❌ Producto sin stock"
-    subtitle = "Este producto alcanzó la reserva crítica y no está disponible por ahora. Probá más tarde."
-    return _html_page(title, subtitle, "")
+      {/* Modo de pago */}
+      <section style={styles.card}>
+        <h2 style={styles.h2}>Modo de pago</h2>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span
+            style={{
+              padding: "6px 12px",
+              borderRadius: 999,
+              fontWeight: 800,
+              background: live ? "#10b981" : "#f59e0b",
+              color: live ? "#05251c" : "#2a1702",
+            }}
+            title={live ? "Producción (pagos reales)" : "Test (sandbox)"}
+          >
+            {live ? "PROD" : "TEST"}
+          </span>
+          <button
+            style={styles.secondaryBtn}
+            onClick={toggleMode}
+            title={live ? "Pasar a Test" : "Pasar a Producción"}
+          >
+            {live ? "Pasar a Test" : "Pasar a Producción"}
+          </button>
+          <div style={{ marginLeft: 12, opacity: 0.8, fontSize: 12 }}>
+            Umbral alerta: <b>{umbralAlerta ?? "—"} L</b> · Reserva crítica:{" "}
+            <b>{stockReserva ?? "—"} L</b>
+          </div>
+        </div>
+      </section>
 
-# -------------------------------------------------------------
-# Inicializar MQTT y Run
-# -------------------------------------------------------------
-with app.app_context():
-    try:
-        start_mqtt_background()
-    except Exception:
-        app.logger.exception("[MQTT] error iniciando hilo")
+      {/* Acordeón de dispensers (cada uno con 6 slots fijos) */}
+      {dispensers.map((disp) => {
+        const rows = slotsByDisp[disp.id] || normalizeSix([]);
+        const hasCritical = rows.some((row) => isCriticalSlot(row, stockReserva));
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+        return (
+          <section key={disp.id} style={styles.card}>
+            <div
+              style={styles.dispHeader}
+              onClick={() => setExpanded((e) => ({ ...e, [disp.id]: !e[disp.id] }))}
+            >
+              <div style={styles.dispTitle}>
+                <span style={styles.dispBadge}>{disp.device_id}</span>
+                <b style={hasCritical ? styles.dispTitleCritical : undefined}>
+                  {disp.nombre || `Dispenser ${disp.id}`}
+                </b>
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <span style={disp.activo ? styles.ok : styles.warn}>
+                  {disp.activo ? "Activo" : "Suspendido"}
+                </span>
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    apiJson("PUT", `/api/dispensers/${disp.id}`, { activo: !disp.activo })
+                      .then((res) =>
+                        setDispensers((list) =>
+                          list.map((d) => (d.id === disp.id ? { ...d, ...res.dispenser } : d))
+                        )
+                      )
+                      .catch((err) => alert(err.message));
+                  }}
+                >
+                  {disp.activo ? "Suspender" : "Activar"}
+                </button>
+                <button
+                  style={styles.secondaryBtn}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    loadProductosOf(disp.id);
+                  }}
+                >
+                  Refrescar
+                </button>
+              </div>
+            </div>
+
+            {expanded[disp.id] && (
+              <div style={{ overflowX: "auto", marginTop: 10 }}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th>Slot</th>
+                      <th>Nombre</th>
+                      <th>$ por L</th>
+                      <th>Porción (L)</th>
+                      <th>Stock (L)</th>
+                      <th>Activo</th>
+                      <th>Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row, idx) => {
+                      const slotNum = idx + 1;
+                      const k = `${disp.id}-${slotNum}`;
+                      return (
+                        <tr
+                          key={k}
+                          onFocus={() => setEditing(disp.id, slotNum, true)}
+                          onBlur={() => setEditing(disp.id, slotNum, false)}
+                        >
+                          <td><b>{slotNum}</b></td>
+                          <td>
+                            <input
+                              style={styles.inputInline}
+                              placeholder="Nombre"
+                              value={row.nombre ?? ""}
+                              onChange={(e) =>
+                                updateSlotField(disp.id, slotNum, "nombre", e.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              style={styles.inputInline}
+                              type="number"
+                              step="0.01"
+                              placeholder="Precio"
+                              value={row.precio ?? ""}
+                              onChange={(e) =>
+                                updateSlotField(disp.id, slotNum, "precio", e.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              style={styles.inputInline}
+                              type="number"
+                              step="1"
+                              min="1"
+                              placeholder="Porción"
+                              value={row.porcion_litros ?? "1"}
+                              onChange={(e) =>
+                                updateSlotField(disp.id, slotNum, "porcion_litros", e.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              style={styles.inputInline}
+                              type="number"
+                              step="1"
+                              placeholder="Stock"
+                              value={row.cantidad ?? ""}
+                              onChange={(e) =>
+                                updateSlotField(disp.id, slotNum, "cantidad", e.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <Toggle
+                              checked={!!row.habilitado}
+                              onChange={toggleHabilitado(disp, idx)}
+                            />
+                          </td>
+                          <td>
+                            <div style={styles.actions}>
+                              <button style={styles.primaryBtn} onClick={saveSlot(disp, idx)}>
+                                Guardar
+                              </button>
+                              <button style={styles.secondaryBtn} onClick={reponer(disp, idx)}>
+                                Reponer
+                              </button>
+                              <button style={styles.secondaryBtn} onClick={resetStock(disp, idx)}>
+                                Reset
+                              </button>
+                              <button style={styles.qrBtn} onClick={mostrarQRFijo(row)}>
+                                QR fijo (/go)
+                              </button>
+                              {row?.id ? (
+                                <span style={{ fontSize: 12, opacity: 0.75 }}>
+                                  pid: <code>{row.id}</code>
+                                </span>
+                              ) : (
+                                <span style={{ fontSize: 12, opacity: 0.6 }}>sin producto</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        );
+      })}
+
+      {/* Pagos recientes */}
+      <section style={styles.card}>
+        <h2 style={styles.h2}>Pagos recientes (últimos 10)</h2>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "center" }}>
+          <label>
+            Estado:&nbsp;
+            <select
+              value={fltEstado}
+              onChange={(e) => setFltEstado(e.target.value)}
+              style={styles.inputInline}
+            >
+              <option value="">Todos</option>
+              <option value="approved">Approved</option>
+              <option value="pending">Pending</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </label>
+          <input
+            style={{ ...styles.inputInline, maxWidth: 260 }}
+            placeholder="Buscar por mp_payment_id"
+            value={fltQ}
+            onChange={(e) => setFltQ(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && loadPagos()}
+          />
+          <button style={styles.secondaryBtn} onClick={loadPagos} disabled={pagosLoading}>
+            {pagosLoading ? "Buscando…" : "Buscar / Actualizar pagos"}
+          </button>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>mp_payment_id</th>
+                <th>Estado</th>
+                <th>Litros</th>
+                <th>Monto</th>
+                <th>Slot</th>
+                <th>Producto ID</th>
+                <th>Disp</th>
+                <th>Fecha</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pagos.length === 0 && (
+                <tr>
+                  <td colSpan={10} style={styles.empty}>
+                    {pagosLoading ? "Cargando…" : "Sin pagos para mostrar"}
+                  </td>
+                </tr>
+              )}
+              {pagos.map((p) => {
+                const puedeReintentar =
+                  p.estado === "approved" && !p.dispensado && p.slot_id > 0 && p.litros > 0;
+                return (
+                  <tr key={p.id}>
+                    <td>{p.id}</td>
+                    <td style={{ fontFamily: "monospace" }}>{p.mp_payment_id}</td>
+                    <td><span style={badgeFor(p.estado)}>{p.estado}</span></td>
+                    <td>{p.litros}</td>
+                    <td>{prettyMoney(p.monto)}</td>
+                    <td>{p.slot_id}</td>
+                    <td>{p.product_id}</td>
+                    <td style={{ fontFamily: "monospace", fontSize: 12 }}>{p.device_id || "—"}</td>
+                    <td>{fmtDate(p.created_at)}</td>
+                    <td>
+                      <button
+                        style={{
+                          ...styles.secondaryBtn,
+                          opacity: puedeReintentar ? 1 : 0.5,
+                          cursor: puedeReintentar ? "pointer" : "not-allowed",
+                        }}
+                        onClick={() => puedeReintentar && reenviarPago(p.id)}
+                        disabled={!puedeReintentar}
+                        title={
+                          puedeReintentar
+                            ? "Reenviar orden al ESP"
+                            : "Solo para pagos approved y no dispensados"
+                        }
+                      >
+                        Reintentar
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {/* Modal QR */}
+      {showQR && (
+        <div style={styles.modalBackdrop} onClick={() => setShowQR(false)}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: 0, marginBottom: 8 }}>Link</h3>
+            <p style={{ margin: 0, marginBottom: 12, wordBreak: "break-all" }}>{qrLink}</p>
+            {qrImg && <img src={qrImg} alt="QR" style={{ width: 220, height: 220, borderRadius: 8 }} />}
+            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+              <a href={qrLink} target="_blank" rel="noreferrer" style={styles.primaryBtn}>
+                Abrir link
+              </a>
+              <button style={styles.secondaryBtn} onClick={() => setShowQR(false)}>
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------- UI helpers ----------------- */
+function Toggle({ checked, onChange }) {
+  return (
+    <label style={styles.switch}>
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span style={styles.slider} />
+    </label>
+  );
+}
+function badgeFor(status) {
+  const base = {
+    padding: "4px 8px",
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  };
+  if (status === "approved") return { ...base, background: "#10b981", color: "#06251d" };
+  if (status === "pending") return { ...base, background: "#f59e0b", color: "#2a1702" };
+  if (status === "rejected") return { ...base, background: "#ef4444", color: "#2a0a0a" };
+  return { ...base, background: "#334155", color: "#e5e7eb" };
+}
+
+/* ----------------- Estilos ----------------- */
+const styles = {
+  page: {
+    fontFamily: "Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    background: "#0b1220",
+    minHeight: "100vh",
+    color: "#e5e7eb",
+    padding: 24,
+  },
+  header: {
+    display: "flex",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
+  title: { margin: 0, fontSize: 24, fontWeight: 700 },
+  subtitle: { margin: "4px 0 0", opacity: 0.8, fontSize: 12 },
+  reloadBtn: {
+    background: "#334155",
+    border: "1px solid #475569",
+    color: "#e5e7eb",
+    padding: "8px 12px",
+    borderRadius: 10,
+    cursor: "pointer",
+  },
+  h2: { margin: "0 0 12px", fontSize: 18 },
+  card: {
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid rgba(255,255,255,0.08)",
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 16,
+    boxShadow: "0 5px 20px rgba(0,0,0,0.25)",
+  },
+  ok: { color: "#10b981", fontWeight: 700 },
+  warn: { color: "#f59e0b", fontWeight: 700 },
+
+  dispHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    cursor: "pointer",
+  },
+  dispTitle: { display: "flex", alignItems: "center", gap: 8, fontSize: 18, marginBottom: 2 },
+  dispTitleCritical: { color: "#f59e0b" }, // <--- amarillo si hay stock crítico
+  dispBadge: {
+    background: "#1f2937",
+    border: "1px solid #374151",
+    color: "#e5e7eb",
+    fontSize: 12,
+    padding: "2px 8px",
+    borderRadius: 999,
+  },
+
+  table: { width: "100%", borderCollapse: "separate", borderSpacing: 0 },
+  inputInline: {
+    background: "#0f172a",
+    border: "1px solid #334155",
+    color: "#e5e7eb",
+    padding: "6px 8px",
+    borderRadius: 8,
+    outline: "none",
+    width: "100%",
+  },
+  actions: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" },
+  primaryBtn: {
+    background: "#10b981",
+    border: "none",
+    color: "#06251d",
+    padding: "8px 10px",
+    borderRadius: 10,
+    cursor: "pointer",
+    fontWeight: 700,
+  },
+  secondaryBtn: {
+    background: "#1f2937",
+    border: "1px solid #374151",
+    color: "#e5e7eb",
+    padding: "8px 10px",
+    borderRadius: 10,
+    cursor: "pointer",
+  },
+  qrBtn: {
+    background: "#3b82f6",
+    border: "none",
+    color: "#061528",
+    padding: "8px 10px",
+    borderRadius: 10,
+    cursor: "pointer",
+    fontWeight: 700,
+  },
+
+  switch: {
+    position: "relative",
+    display: "inline-block",
+    width: 44,
+    height: 24,
+  },
+  slider: {
+    position: "absolute",
+    cursor: "pointer",
+    inset: 0,
+    background: "#374151",
+    borderRadius: 999,
+    transition: "0.2s",
+  },
+};
