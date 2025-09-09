@@ -479,74 +479,6 @@ def pagos_list():
     } for p in pagos])
 
 # -------------- preferencia (con litros elegidos) --------------
-@app.post("/api/pagos/preferencia")
-def crear_preferencia_api():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = _to_int(data.get("product_id") or 0)
-    litros = _to_int(data.get("litros") or 0) or 1
-
-    token, _base_api = get_mp_token_and_base()
-    if not token: return json_error("MP token no configurado", 500)
-
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado: return json_error("producto no disponible", 400)
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo: return json_error("dispenser no disponible", 400)
-
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) <= reserva:
-        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
-
-    monto_final = compute_total_price_ars(prod, litros)
-
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": f"{prod.nombre} · {litros} L",
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final),
-        }],
-        "description": f"{prod.nombre} · {litros} L",
-        "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
-            "producto": prod.nombre,
-            "litros": int(litros),
-            "dispenser_id": int(disp.id),
-            "device_id": disp.device_id,
-            "precio_final": int(monto_final),
-        },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
-        },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
-    }
-
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
-        ); r.raise_for_status()
-    except Exception as e:
-        detail = getattr(r, "text", str(e))[:600]
-        return json_error("mp_preference_failed", 502, detail)
-
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link: return json_error("preferencia_sin_link", 502, pref)
-    return ok_json({"ok": True, "link": link, "raw": pref, "precio_final": monto_final})
-
-# ---------------- QR dinámico v2: selección de litros ----------------
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
     pid = _to_int(request.args.get("pid") or 0)
@@ -559,82 +491,78 @@ def ui_seleccionar():
     if not disp or not disp.activo:
         return _html("No disponible", "<p>Dispenser no disponible.</p>")
 
-    # Render html minimalista que consulta opciones y muestra 1/2/3 L con precios.
     backend = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    html = f"""<!doctype html>
+
+    # Usamos marcadores __BACKEND__, __PID__, __NOMBRE__, __DEVICE__, __SLOT__
+    tmpl = """
+<!doctype html>
 <html lang="es"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Seleccionar litros</title>
 <style>
-  body{{margin:0;background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto}}
-  .box{{max-width:720px;margin:12vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px}}
-  h1{{margin:0 0 6px}} .row{{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}}
-  .opt{{flex:1;min-width:170px;background:#111827;border:1px solid #374151;border-radius:12px;padding:14px;text-align:center;cursor:pointer}}
-  .opt[aria-disabled="true"]{{opacity:.5;cursor:not-allowed}}
-  .name{{opacity:.8;margin-bottom:4px}}
-  .L{{font-size:28px;font-weight:800}}
-  .price{{margin-top:6px;font-size:18px;font-weight:700;color:#10b981}}
-  .note{{opacity:.75;font-size:12px;margin-top:10px}}
-  .err{{color:#fca5a5}}
+  body{margin:0;background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto}
+  .box{max-width:720px;margin:12vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px}
+  h1{margin:0 0 6px}
+  .name{opacity:.8;margin-bottom:4px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+  .opt{flex:1;min-width:170px;background:#111827;border:1px solid #374151;border-radius:12px;padding:14px;text-align:center;cursor:pointer}
+  .opt[aria-disabled="true"]{opacity:.5;cursor:not-allowed}
+  .L{font-size:28px;font-weight:800}
+  .price{margin-top:6px;font-size:18px;font-weight:700;color:#10b981}
+  .note{opacity:.75;font-size:12px;margin-top:10px}
+  .err{color:#fca5a5}
 </style>
 </head><body>
 <div class="box">
-  <h1>{prod.nombre}</h1>
-  <div class="name">Dispenser <code>{disp.device_id}</code> · Slot <b>{prod.slot_id}</b></div>
+  <h1>__NOMBRE__</h1>
+  <div class="name">Dispenser <code>__DEVICE__</code> · Slot <b>__SLOT__</b></div>
   <div id="row" class="row"></div>
   <div id="msg" class="note"></div>
 </div>
 <script>
-  const fmt = n => new Intl.NumberFormat('es-AR',{{style:'currency',currency:'ARS'}}).format(n);
+  const fmt = n => new Intl.NumberFormat('es-AR',{style:'currency',currency:'ARS'}).format(n);
   async function load(){
-    const res = await fetch('{backend}/api/productos/{pid}/opciones');
+    const res = await fetch('__BACKEND__/api/productos/__PID__/opciones');
     const js = await res.json();
     const row = document.getElementById('row');
     const msg = document.getElementById('msg');
     row.innerHTML = '';
-    if(!js.ok){{ msg.innerHTML = '<span class="err">No disponible</span>'; return; }}
-    js.opciones.forEach(o=>{{
+    if(!js.ok){ msg.innerHTML = '<span class="err">No disponible</span>'; return; }
+    js.opciones.forEach(o=>{
       const d = document.createElement('div');
       d.className='opt';
       if(!o.disponible) d.setAttribute('aria-disabled','true');
       d.innerHTML = `
-        <div class="L">${{o.litros}} L</div>
-        <div class="price">${{o.precio_final ? fmt(o.precio_final) : '—'}}</div>`;
-      d.onclick = async ()=>{{
+        <div class="L">${o.litros} L</div>
+        <div class="price">${o.precio_final ? fmt(o.precio_final) : '—'}</div>`;
+      d.onclick = async ()=>{
         if(!o.disponible) return;
         d.style.opacity=.6;
-        try {{
-          const r = await fetch('{backend}/api/pagos/preferencia', {{
-            method:'POST', headers:{{'Content-Type':'application/json'}},
-            body: JSON.stringify({{ product_id:{pid}, litros:o.litros }})
-          }});
+        try {
+          const r = await fetch('__BACKEND__/api/pagos/preferencia', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ product_id: __PID__, litros: o.litros })
+          });
           const jr = await r.json();
           if(jr.ok && jr.link) window.location.href = jr.link;
           else alert(jr.error || 'No se pudo crear el pago');
-        }}catch(e){{ alert('Error de red'); }}
+        }catch(e){ alert('Error de red'); }
         d.style.opacity=1;
-      }};
+      };
       row.appendChild(d);
-    }});
-  }}
+    });
+  }
   load();
 </script>
-</body></html>"""
+</body></html>
+"""
+    html = (tmpl
+            .replace("__BACKEND__", backend)
+            .replace("__PID__", str(pid))
+            .replace("__NOMBRE__", prod.nombre)
+            .replace("__DEVICE__", disp.device_id or "")
+            .replace("__SLOT__", str(prod.slot_id)))
     return _html_raw(html)
-
-def _html(title: str, body_html: str):
-    html = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-<div style="max-width:720px;margin:14vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px">
-<h1 style="margin:0 0 8px">{title}</h1>
-{body_html}
-</div></body></html>"""
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
-
-def _html_raw(html: str):
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
 # ---------------- Webhook MP (igual que antes, respeta litros seleccionados) ----------------
 @app.post("/api/mp/webhook")
