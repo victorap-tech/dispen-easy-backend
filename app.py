@@ -217,7 +217,7 @@ def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
     p = request.path
-    if p in PUBLIC_PATHS:
+    if p in PUBLIC_PATHS or p.startswith("/api/productos/") and p.endswith("/opciones"):
         return None
     if not ADMIN_SECRET:
         return None
