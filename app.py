@@ -209,7 +209,8 @@ PUBLIC_PATHS = {
     "/api/mp/webhook", "/webhook", "/mp/webhook",
     "/api/pagos/preferencia", "/api/pagos/pendiente",
     "/api/config", "/go", "/ui/seleccionar",
-    "/api/productos/opciones",
+    # Rutas de productos públicas
+    "/api/productos/opciones",            # alias
 }
 @app.before_request
 def _auth_guard():
