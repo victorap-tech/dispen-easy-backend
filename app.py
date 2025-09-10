@@ -45,6 +45,10 @@ CORS(
     expose_headers=["Content-Type"],
 )
 
+db = SQLAlchemy(app)
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
+
 
 # ---------------- Modelos ----------------
 class KV(db.Model):
