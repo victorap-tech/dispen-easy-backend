@@ -736,7 +736,7 @@ def mp_webhook_alias2(): return mp_webhook()
 def pagina_gracias():
     status = (request.args.get("status") or "").lower()
     if status in ("success","approved"):
-        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> En breve se dispensará.'
+        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> Presione el botón para dispensar.'
     elif status in ("pending","in_process"):
         title="Pago pendiente"; subtitle="Tu pago está en revisión. Si se aprueba, se dispensará automáticamente."
     else:
