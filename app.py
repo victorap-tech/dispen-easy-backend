@@ -485,6 +485,46 @@ def pagos_list():
         "created_at": p.created_at.isoformat() if p.created_at else None,
     } for p in pagos])
 
+# ---------------- Reintentar un pago (reanudar/armar slot) ----------------
+@app.post("/api/pagos/<int:pid>/reenviar")
+def pagos_reenviar(pid: int):
+    p = Pago.query.get_or_404(pid)
+
+    # Solo tiene sentido si el pago fue aprobado y aún no se marcó como dispensado
+    if (p.estado or "").lower() != "approved":
+        return json_error("solo pagos en estado 'approved' pueden reintentarse", 400)
+    if p.dispensado:
+        return json_error("este pago ya fue dispensado", 409)
+    if not p.slot_id or not p.litros:
+        return json_error("pago sin slot/litros válidos", 400)
+
+    # Determinar device_id (del pago o, si falta, desde el producto/dispenser)
+    device_id = (p.device_id or "").strip()
+    if not device_id and p.product_id:
+        pr = Producto.query.get(p.product_id)
+        if pr and pr.dispenser_id:
+            d = Dispenser.query.get(pr.dispenser_id)
+            if d and d.device_id:
+                device_id = d.device_id
+
+    if not device_id:
+        return json_error("no se pudo resolver el device_id del dispenser", 500)
+
+    # Publicar el comando: el ESP32 solo arrancará si el slot está ARMADO,
+    # así que esto vuelve a dejar el botón parpadeando a la espera de ser presionado.
+    timeout_s = max(30, int(p.litros or 1) * 5)
+    ok = send_dispense_cmd(device_id, p.mp_payment_id, int(p.slot_id), int(p.litros), timeout_s=timeout_s)
+
+    if ok:
+        # Marcamos como "procesado" para no spamear desde el webhook, pero NO como dispensado.
+        try:
+            p.procesado = True
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return ok_json({"ok": True, "msg": "Reenvío publicado. Botón quedará habilitado en el equipo."})
+    else:
+        return json_error("no se pudo publicar el comando (MQTT desconectado?)", 502)
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
