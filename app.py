@@ -341,8 +341,7 @@ def _mqtt_on_message(client, userdata, msg):
 
         icon = "✅" if st == "online" else "⚠️"
         line = f"{icon} {dev}: {st.upper()}"
-        with _batch_lock:
-            _batch_events.append(line)
+        tg_notify(line)
         _last_telegram[dev] = now
         return
 
