@@ -270,10 +270,10 @@ def sse_stream():
     return Response(gen(), mimetype="text/event-stream")
 
 # ---- Estado online/offline con debounce + batch TG ----
-last_status = defaultdict(lambda: {"status":"unknown","t":0})
+_last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
 ON_DEBOUNCE_S  = 5
-DEVICE_COOLDOWN_S = 30   # 30 min
+DEVICE_COOLDOWN_S = 30 * 60   # 30 min
 _pending_change = {}                        # dev -> {"status":..., "first_t":...}
 _last_telegram  = defaultdict(lambda: 0.0)  # dev -> last sent epoch
 _batch_lock = threading.Lock()
