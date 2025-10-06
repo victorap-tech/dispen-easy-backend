@@ -324,9 +324,11 @@ def _mqtt_on_message(client, userdata, msg):
         st  = str(data.get("status") or "").lower().strip()
         now = time.time()
 
+        # Actualizo último estado visto y lo mando al SSE
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
+        # Debounce por cambio de estado
         pend = _pending_change.get(dev)
         if not pend or pend["status"] != st:
             _pending_change[dev] = {"status": st, "first_t": now}
@@ -336,15 +338,14 @@ def _mqtt_on_message(client, userdata, msg):
         if now - pend["first_t"] < window:
             return
 
-        if now - _last_telegram[dev] < DEVICE_COOLDOWN_S:
+        # ✅ Solo notificar si AÚN no avisamos este mismo estado
+        if _last_notified_status[dev] == st:
             return
 
-        # ✅ Envío directo a Telegram sin batch (inmediato)
         icon = "✅" if st == "online" else "⚠️"
-        line = f"{icon} {dev}: {st.upper()}"
-        tg_notify(line)
+        tg_notify(f"{icon} {dev}: {st.upper()}")
 
-        _last_telegram[dev] = now
+        _last_notified_status[dev] = st
         return
 
     # ----- Estado de dispensa DONE/TIMEOUT para stock -----
