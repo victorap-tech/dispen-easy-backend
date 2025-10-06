@@ -884,6 +884,22 @@ def admin_reset_dispenser():
         db.session.rollback()
         return json_error("reset_failed", 500, str(e))
 
+# ---------------- Gracias / Sin stock ----------------
+@app.get("/gracias")
+def pagina_gracias():
+    status = (request.args.get("status") or "").lower()
+    if status in ("success","approved"):
+        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> Presione el botón para dispensar.'
+    elif status in ("pending","in_process"):
+        title="Pago pendiente"; subtitle="Tu pago está en revisión. Si se aprueba, se dispensará automáticamente."
+    else:
+        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado.</span>'
+    return _html(title, f"<p>{subtitle}</p>")
+
+@app.get("/sin-stock")
+def pagina_sin_stock():
+    return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
+
 # ---------------- Inicializar MQTT + batch sender ----------------
 with app.app_context():
     try: start_mqtt_background()
