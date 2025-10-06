@@ -269,6 +269,11 @@ def sse_stream():
                 except Exception: pass
     return Response(gen(), mimetype="text/event-stream")
 
+# ---- Estado online/offline en memoria ----
+from collections import defaultdict
+
+last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
+
 # ---- Estado online/offline con debounce + batch TG ----
 _last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
