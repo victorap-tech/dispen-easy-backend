@@ -320,6 +320,7 @@ def _mqtt_on_message(client, userdata, msg):
         return
 
     # ----- Estado ONLINE/OFFLINE con debounce + batch TG -----
+    # ----- Estado ONLINE/OFFLINE con debounce + TG -----
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
             data = _json.loads(raw or "{}")
@@ -329,30 +330,30 @@ def _mqtt_on_message(client, userdata, msg):
         st  = str(data.get("status") or "").lower().strip()
         now = time.time()
 
-        # Actualizo último estado visto y lo mando al SSE
+        # Actualizo cache + SSE para el admin
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-        # Debounce por cambio de estado
+        # Si el estado es igual al último notificado, no duplicar
+        if _last_notified_status[dev] == st:
+            return
+
+        # 🔸 OFFLINE se notifica al instante
+        if st == "offline":
+            tg_notify(f"⚠️ {dev}: OFFLINE")
+            _last_notified_status[dev] = "offline"
+            return
+
+        # 🔹 ONLINE se notifica con debounce (para evitar falsos)
         pend = _pending_change.get(dev)
         if not pend or pend["status"] != st:
             _pending_change[dev] = {"status": st, "first_t": now}
             return
 
-        window = OFF_DEBOUNCE_S if st == "offline" else ON_DEBOUNCE_S
-        if now - pend["first_t"] < window:
-            return
-
-        # ✅ Solo notificar si AÚN no avisamos este mismo estado
-        if _last_notified_status[dev] == st:
-            return
-
-        icon = "✅" if st == "online" else "⚠️"
-        tg_notify(f"{icon} {dev}: {st.upper()}")
-
-        _last_notified_status[dev] = st
+        if now - pend["first_t"] >= ON_DEBOUNCE_S:
+            tg_notify(f"✅ {dev}: ONLINE")
+            _last_notified_status[dev] = "online"
         return
-
     # ----- Estado de dispensa DONE/TIMEOUT para stock -----
     try: data = _json.loads(raw or "{}")
     except Exception: return
