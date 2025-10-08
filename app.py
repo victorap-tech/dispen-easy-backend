@@ -901,7 +901,7 @@ def pagina_gracias():
     elif status in ("pending","in_process"):
         title="Pago pendiente"; subtitle="Tu pago está en revisión."
     else:
-        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado.</span>'
+        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado.Intente nuevamente.</span>'
     return _html(title, f"<p>{subtitle}</p>")
 
 @app.get("/sin-stock")
