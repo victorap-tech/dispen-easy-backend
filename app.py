@@ -571,7 +571,7 @@ def productos_opciones(pid):
         _, reserva = get_thresholds()
         options = []
         for L in litros_list:
-            if (int(prod.cantidad) - L) <= reserva:
+            if (int(prod.cantidad) - L) < reserva:
                 options.append({"litros": L, "disponible": False})
             else:
                 options.append({
