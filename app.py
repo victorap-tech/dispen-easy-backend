@@ -620,7 +620,7 @@ def crear_preferencia_api():
     if not disp or not disp.activo: return json_error("dispenser no disponible", 400)
 
     _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) <= reserva:
+    if (int(prod.cantidad) - litros) < reserva:
         return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
     monto_final = compute_total_price_ars(prod, litros)
