@@ -897,9 +897,9 @@ def admin_reset_dispenser():
 def pagina_gracias():
     status = (request.args.get("status") or "").lower()
     if status in ("success","approved"):
-        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> Presione el botón para dispensar.'
+        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> Presione el botón del producto seleccionado para dispensar.'
     elif status in ("pending","in_process"):
-        title="Pago pendiente"; subtitle="Tu pago está en revisión. Si se aprueba, se dispensará automáticamente."
+        title="Pago pendiente"; subtitle="Tu pago está en revisión."
     else:
         title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado.</span>'
     return _html(title, f"<p>{subtitle}</p>")
