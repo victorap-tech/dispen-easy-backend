@@ -174,7 +174,7 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
             f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
             f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
         )
-    if stock <= reserva:
+    if stock < reserva:
         if prod.habilitado:
             prod.habilitado = False
             app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≤ {reserva})")
