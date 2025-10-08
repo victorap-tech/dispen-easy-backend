@@ -169,19 +169,30 @@ def tg_notify(text: str):
 def _post_stock_change_hook(prod: "Producto", motivo: str):
     umbral, reserva = get_thresholds()
     stock = int(prod.cantidad or 0)
+
+    # Aviso de bajo stock (solo notifica)
     if stock <= umbral:
         tg_notify(
             f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
             f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
         )
+
+    # Deshabilitar SOLO si está por DEBAJO de la reserva crítica
     if stock < reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≤ {reserva})")
+            app.logger.info(
+                f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} "
+                f"(stock={stock} < {reserva})"
+            )
     else:
+        # Rehabilitar si volvió a estar por ENCIMA o IGUAL a la reserva
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} > {reserva})")
+            app.logger.info(
+                f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} "
+                f"(stock={stock} ≥ {reserva})"
+            )
 
 # --- Pricing ---
 def compute_total_price_ars(prod: Producto, litros: int) -> int:
