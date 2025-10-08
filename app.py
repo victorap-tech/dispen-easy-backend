@@ -718,14 +718,22 @@ def ui_seleccionar():
     const row = document.getElementById('row');
     const msg = document.getElementById('msg');
     row.innerHTML = '';
-    if(!js.ok){ msg.innerHTML = '<span class="err">No disponible</span>'; return; }
+
+    if(!js.ok){
+      msg.innerHTML = '<span class="err">Disculpe, producto sin stock o en reserva crítica.</span>';
+      return;
+    }
+
+    let disponibles = 0;
     js.opciones.forEach(o=>{
       const d = document.createElement('div');
       d.className='opt';
-      if(!o.disponible) d.setAttribute('aria-disabled','true');
+      if(!o.disponible) d.setAttribute('aria-disabled','true'); else disponibles++;
+
       d.innerHTML = `
         <div class="L">${o.litros} L</div>
         <div class="price">${o.precio_final ? fmt(o.precio_final) : '—'}</div>`;
+
       d.onclick = async ()=>{
         if(!o.disponible) return;
         d.style.opacity=.6;
@@ -742,6 +750,12 @@ def ui_seleccionar():
       };
       row.appendChild(d);
     });
+
+    if(disponibles === 0){
+      msg.innerHTML = '<span class="err">Disculpe, producto sin stock. Vuelva a intentar más tarde.</span>';
+    } else {
+      msg.innerHTML = 'Elegí la cantidad a dispensar.';
+    }
   }
   load();
 </script>
