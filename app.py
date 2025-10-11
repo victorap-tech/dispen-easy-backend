@@ -374,6 +374,7 @@ PUBLIC_PATHS = {
     "/api/config", "/go", "/ui/seleccionar",
     "/api/productos/opciones",
     "/api/auth/login",
+    "/api/events/stream",
 }
 @app.before_request
 def _auth_guard():
@@ -449,35 +450,35 @@ def sse_stream():
     token = request.args.get("token")
     secret = request.args.get("secret")
 
-    # 🔐 Validar JWT o secret legacy
+    # Validar JWT (nuevo) o admin secret (legacy)
     if token:
         try:
-            user = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         except Exception as e:
-            print("JWT error:", e)
+            app.logger.warning(f"[SSE] JWT inválido: {e}")
             return json_error("unauthorized", 401)
     elif ADMIN_SECRET and (secret or "") != ADMIN_SECRET:
         return json_error("unauthorized", 401)
 
     q = Queue(maxsize=100)
     with _sse_lock:
-        sse_clients.append(q)
+        _sse_clients.append(q)
 
     def gen():
         yield "retry: 5000\n\n"
         try:
             while True:
                 data = q.get()
-                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
         except GeneratorExit:
             with _sse_lock:
                 try:
-                    sse_clients.remove(q)
+                    _sse_clients.remove(q)
                 except Exception:
                     pass
 
     return Response(gen(), mimetype="text/event-stream")
-
+    
 # ---- Estado online/offline en memoria ----
 last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
 
