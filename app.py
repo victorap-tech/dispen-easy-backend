@@ -271,6 +271,51 @@ def compute_total_price_ars(prod: Producto, litros: int) -> int:
     except Exception:
         return max(1, litros)
 
+# --- AUTH ENDPOINTS ---
+
+@app.post("/api/auth/login")
+def api_login():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    if not email or not password:
+        return json_error("Faltan credenciales", 400)
+
+    u = User.query.filter_by(email=email).first()
+    if not u or not check_password_hash(u.password_hash, password):
+        return json_error("Credenciales inválidas", 401)
+    if not u.active:
+        return json_error("Usuario inactivo", 403)
+
+    token = create_jwt(u)
+    return ok_json({"token": token, "email": u.email, "role": u.role})
+
+@app.post("/api/auth/users")
+def api_create_user():
+    # Solo superadmin crea usuarios
+    current = parse_jwt_from_request()
+    if not current or current.role != "superadmin":
+        return json_error("Solo superadmin", 403)
+
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    role = (data.get("role") or "disp_admin").strip()
+    dispenser_id = data.get("dispenser_id")
+
+    if not email or not password:
+        return json_error("Faltan datos", 400)
+    if User.query.filter_by(email=email).first():
+        return json_error("Email ya registrado", 409)
+
+    u = User(email=email, password_hash=generate_password_hash(password), role=role, active=True)
+    db.session.add(u); db.session.commit()
+
+    if dispenser_id:
+        db.session.add(DispenserAdmin(user_id=u.id, dispenser_id=int(dispenser_id)))
+        db.session.commit()
+
+    return ok_json({"msg": "Usuario creado", "user_id": u.id}, 201)
 # ---------------- Auth guard ----------------
 PUBLIC_PATHS = {
     "/", "/gracias", "/sin-stock",
