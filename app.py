@@ -603,6 +603,50 @@ def pagos_list():
         "created_at": p.created_at.isoformat() if p.created_at else None,
     } for p in pagos])
 
+# ---------------- Reintento de dispensa (admin) ----------------
+@app.post("/api/pagos/<int:pid>/reenviar")
+def pagos_reenviar(pid):
+    # Requiere x-admin-secret (entra por el guard)
+    p = Pago.query.get_or_404(pid)
+
+    # Validaciones mínimas
+    if p.dispensado:
+        return json_error("ya_dispensado", 409)
+    if (p.estado or "").lower() != "approved":
+        return json_error("estado_no_aprobado", 409, {"estado": p.estado})
+    if not p.slot_id or not p.litros:
+        return json_error("pago_incompleto", 400)
+
+    # Resolver device_id por las dudas
+    dev = (p.device_id or "").strip()
+    if not dev and p.product_id:
+        pr = Producto.query.get(p.product_id)
+        if pr and pr.dispenser_id:
+            d = Dispenser.query.get(pr.dispenser_id)
+            if d:
+                dev = d.device_id or ""
+
+    if not dev:
+        return json_error("sin_device_id", 400, "No se pudo inferir device_id")
+
+    # Publicar comando MQTT
+    try:
+        published = send_dispense_cmd(
+            dev,
+            p.mp_payment_id,
+            int(p.slot_id),
+            int(p.litros),
+            timeout_s=max(30, int(p.litros) * 5),
+        )
+        if not published:
+            return json_error("mqtt_publish_failed", 502)
+        # Marcamos 'procesado' para evitar reenviar en el webhook
+        p.procesado = True
+        db.session.commit()
+        return ok_json({"ok": True, "msg": "Comando de dispensa re-enviado", "device_id": dev})
+    except Exception as e:
+        db.session.rollback()
+        return json_error("reenviar_failed", 500, str(e))
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
