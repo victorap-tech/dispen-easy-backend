@@ -1,4 +1,3 @@
-# app.py
 import os
 import logging
 import threading
@@ -9,11 +8,10 @@ from collections import defaultdict
 from queue import Queue
 from threading import Lock
 
-from flask import Flask, jsonify, request, redirect, make_response, Response
+from flask import Flask, jsonify, request, make_response, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import UniqueConstraint, text as sqltext
+from sqlalchemy import UniqueConstraint, text as sqltext, JSON
 import paho.mqtt.client as mqtt
 
 # ---------------- Config ----------------
@@ -79,7 +77,7 @@ class Producto(db.Model):
     cantidad = db.Column(db.Integer, nullable=False)      # stock (L)
     slot_id = db.Column(db.Integer, nullable=False)       # 1..6
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
-    bundle_precios = db.Column(JSONB, nullable=True)      # {"2": 1800, "3": 2600}
+    bundle_precios = db.Column(JSON, nullable=True)       # {"2": 1800, "3": 2600}
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
@@ -99,7 +97,7 @@ class Pago(db.Model):
     product_id = db.Column(db.Integer, nullable=False, default=0)
     dispenser_id = db.Column(db.Integer, nullable=False, default=0)
     device_id = db.Column(db.String(80), nullable=True, default="")
-    raw = db.Column(JSONB, nullable=True)
+    raw = db.Column(JSON, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 with app.app_context():
@@ -110,24 +108,43 @@ with app.app_context():
     if Dispenser.query.count() == 0:
         db.session.add(Dispenser(device_id="dispen-01", nombre="dispen-01 (por defecto)", activo=True))
         db.session.commit()
+    # Intento migrar JSONB -> JSON si estás en Postgres (ignora en SQLite)
     try:
-        db.session.execute(sqltext("ALTER TABLE producto ADD COLUMN IF NOT EXISTS bundle_precios JSONB"))
+        db.session.execute(sqltext("""
+            DO $$
+            BEGIN
+                IF to_regclass('public.producto') IS NOT NULL THEN
+                    ALTER TABLE producto ALTER COLUMN bundle_precios TYPE JSON USING bundle_precios::json;
+                END IF;
+                IF to_regclass('public.pago') IS NOT NULL THEN
+                    ALTER TABLE pago ALTER COLUMN raw TYPE JSON USING raw::json;
+                END IF;
+            EXCEPTION WHEN others THEN
+                NULL;
+            END;$$;
+        """))
         db.session.commit()
     except Exception:
         db.session.rollback()
 
 # ---------------- Helpers ----------------
-def ok_json(data, status=200): return jsonify(data), status
+def ok_json(data, status=200):
+    return jsonify(data), status
+
 def json_error(msg, status=400, extra=None):
-    p={"error":msg}
-    if extra is not None: p["detail"]=extra
+    p = {"error": msg}
+    if extra is not None:
+        p["detail"] = extra
     return jsonify(p), status
 
 def _to_int(x, default=0):
-    try: return int(x)
+    try:
+        return int(x)
     except Exception:
-        try: return int(float(x))
-        except Exception: return default
+        try:
+            return int(float(x))
+        except Exception:
+            return default
 
 def serialize_producto(p: Producto) -> dict:
     return {
@@ -161,7 +178,7 @@ def tg_notify(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10
+            timeout=10,
         )
     except Exception as e:
         app.logger.error(f"[TG] Error enviando notificación: {e}")
@@ -182,16 +199,14 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
         if prod.habilitado:
             prod.habilitado = False
             app.logger.info(
-                f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} "
-                f"(stock={stock} < {reserva})"
+                f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} < {reserva})"
             )
     else:
         # Rehabilitar si volvió a estar por ENCIMA o IGUAL a la reserva
         if not prod.habilitado:
             prod.habilitado = True
             app.logger.info(
-                f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} "
-                f"(stock={stock} ≥ {reserva})"
+                f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≥ {reserva})"
             )
 
 # --- Pricing ---
@@ -222,7 +237,7 @@ def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
     p = request.path
-    if p in PUBLIC_PATHS or p.startswith("/api/productos/") and p.endswith("/opciones"):
+    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")):
         return None
     if not ADMIN_SECRET:
         return None
@@ -234,6 +249,7 @@ def _auth_guard():
 def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
     return (row.value if row else "test").lower()
+
 def get_mp_token_and_base() -> tuple[str, str]:
     mode = get_mp_mode()
     if mode == "live":
@@ -281,31 +297,10 @@ def sse_stream():
     return Response(gen(), mimetype="text/event-stream")
 
 # ---- Estado online/offline en memoria ----
-from collections import defaultdict
-
 last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
-
-# ---- Estado online/offline con debounce + batch TG ----
 _last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
 ON_DEBOUNCE_S  = 5
-DEVICE_COOLDOWN_S = 30 * 60   # 30 min
-_pending_change = {}                        # dev -> {"status":..., "first_t":...}
-_last_telegram  = defaultdict(lambda: 0.0)  # dev -> last sent epoch
-_batch_lock = threading.Lock()
-_batch_events = []
-
-def _batch_sender_loop():
-    while True:
-        time.sleep(120)
-        with _batch_lock:
-            if not _batch_events:
-                continue
-            msg = "🔔 Cambios de estado:\n" + "\n".join(_batch_events[:30])
-            if len(_batch_events) > 30:
-                msg += f"\n… y {len(_batch_events)-30} más"
-            _batch_events.clear()
-        tg_notify(msg)
 
 # ---- MQTT callbacks ----
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
@@ -330,7 +325,6 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # ----- Estado ONLINE/OFFLINE con debounce + batch TG -----
     # ----- Estado ONLINE/OFFLINE con debounce + TG -----
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
@@ -355,16 +349,17 @@ def _mqtt_on_message(client, userdata, msg):
             _last_notified_status[dev] = "offline"
             return
 
-        # 🔹 ONLINE se notifica con debounce (para evitar falsos)
-        pend = _pending_change.get(dev)
-        if not pend or pend["status"] != st:
-            _pending_change[dev] = {"status": st, "first_t": now}
+        # 🔹 ONLINE se notifica con debounce
+        pend = last_status.get(dev)
+        if not pend or pend.get("status") != st:
+            last_status[dev] = {"status": st, "t": now}
             return
 
-        if now - pend["first_t"] >= ON_DEBOUNCE_S:
+        if now - pend["t"] >= ON_DEBOUNCE_S:
             tg_notify(f"✅ {dev}: ONLINE")
             _last_notified_status[dev] = "online"
         return
+
     # ----- Estado de dispensa DONE/TIMEOUT para stock -----
     try: data = _json.loads(raw or "{}")
     except Exception: return
@@ -508,9 +503,13 @@ def productos_update(pid):
                 p.dispenser_id = new_d
         if "nombre" in data: p.nombre = str(data["nombre"]).strip()
         if "precio" in data: p.precio = float(data["precio"])
-        if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
+        if "cantidad" in data:
+            new_cant = int(float(data["cantidad"]))
+            if new_cant < 0:
+                return json_error("cantidad no puede ser negativa", 400)
+            p.cantidad = new_cant
         if "porcion_litros" in data:
-            val = int(data["porcion_litros"]); 
+            val = int(data["porcion_litros"])
             if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
             p.porcion_litros = val
         if "slot" in data:
@@ -790,10 +789,11 @@ def _html_raw(html: str):
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
+
+    # ✅ Usar SIEMPRE el par (token, base) del modo actual (KV)
+    token, base_api = get_mp_token_and_base()
+
     topic = args.get("topic") or body.get("type")
-    live_mode = bool(body.get("live_mode", True))
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
 
     payment_id = None
     if topic == "payment":
@@ -896,6 +896,7 @@ def admin_reset_dispenser():
                 val = max(0, int(reset_stock_to))
                 for p in Producto.query.filter(Producto.dispenser_id == did).all():
                     p.cantidad = val
+                    _post_stock_change_hook(p, motivo="admin soft reset_stock_to")
                 stock_set = val
             db.session.commit()
             return ok_json({"ok": True, "mode":"soft", "deleted_pagos": deleted_pagos, "stock_set": stock_set})
@@ -903,6 +904,7 @@ def admin_reset_dispenser():
         if mode == "hard_keep":
             for p in Producto.query.filter(Producto.dispenser_id == did).all():
                 p.cantidad = 0
+                _post_stock_change_hook(p, motivo="admin hard_keep")
             db.session.commit()
             return ok_json({"ok": True, "mode":"hard_keep", "deleted_pagos": deleted_pagos, "stock_set": 0})
 
@@ -933,12 +935,10 @@ def pagina_gracias():
 def pagina_sin_stock():
     return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
 
-# ---------------- Inicializar MQTT + batch sender ----------------
+# ---------------- Inicializar MQTT ----------------
 with app.app_context():
     try: start_mqtt_background()
     except Exception: app.logger.exception("[MQTT] error iniciando hilo")
-
-threading.Thread(target=_batch_sender_loop, name="tg-batch", daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
