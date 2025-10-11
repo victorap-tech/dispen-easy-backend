@@ -116,6 +116,68 @@ with app.app_context():
     except Exception:
         db.session.rollback()
 
+# --- AUTH / USERS ---
+import datetime
+import jwt
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import g
+
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-please")
+JWT_EXP_HOURS = int(os.getenv("JWT_EXP_HOURS", "48") or 48)
+
+class User(db.Model):
+    __tablename__ = "user"
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(160), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(40), nullable=False, default="disp_admin")  # disp_admin | superadmin
+    active = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+
+class DispenserAdmin(db.Model):
+    __tablename__ = "dispenser_admin"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="CASCADE"), nullable=False, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "dispenser_id", name="uq_user_disp"),)
+
+with app.app_context():
+    db.create_all()
+    # bootstrap superadmin si no existe
+    if not User.query.filter_by(role="superadmin").first():
+        # credenciales iniciales por env (o fija si no hay env)
+        admin_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "admin@dispeneasy.local")
+        admin_pass  = os.getenv("BOOTSTRAP_ADMIN_PASS",  "admin123")
+        u = User(email=admin_email, password_hash=generate_password_hash(admin_pass), role="superadmin", active=True)
+        db.session.add(u); db.session.commit()
+        app.logger.info(f"[BOOTSTRAP] superadmin creado: {admin_email} / {admin_pass}")
+
+def create_jwt(user: "User") -> str:
+    payload = {
+        "sub": user.id,
+        "email": user.email,
+        "role": user.role,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXP_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def parse_jwt_from_request() -> "User|None":
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "): return None
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except Exception:
+        return None
+    uid = data.get("sub")
+    return User.query.get(uid) if uid else None
+
+def user_can_access_dispenser(user: "User", dispenser_id: int) -> bool:
+    if not user or not user.active: return False
+    if user.role == "superadmin": return True
+    if not dispenser_id: return False
+    return bool(DispenserAdmin.query.filter_by(user_id=user.id, dispenser_id=dispenser_id).first())
+
 # ---------------- Helpers ----------------
 def ok_json(data, status=200): return jsonify(data), status
 def json_error(msg, status=400, extra=None):
