@@ -446,21 +446,36 @@ def _sse_broadcast(data: dict):
 
 @app.get("/api/events/stream")
 def sse_stream():
-    if ADMIN_SECRET and (request.args.get("secret") or "") != ADMIN_SECRET:
+    token = request.args.get("token")
+    secret = request.args.get("secret")
+
+    # 🔐 Validar JWT o secret legacy
+    if token:
+        try:
+            user = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        except Exception as e:
+            print("JWT error:", e)
+            return json_error("unauthorized", 401)
+    elif ADMIN_SECRET and (secret or "") != ADMIN_SECRET:
         return json_error("unauthorized", 401)
+
     q = Queue(maxsize=100)
     with _sse_lock:
-        _sse_clients.append(q)
+        sse_clients.append(q)
+
     def gen():
         yield "retry: 5000\n\n"
         try:
             while True:
                 data = q.get()
-                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
         except GeneratorExit:
             with _sse_lock:
-                try: _sse_clients.remove(q)
-                except Exception: pass
+                try:
+                    sse_clients.remove(q)
+                except Exception:
+                    pass
+
     return Response(gen(), mimetype="text/event-stream")
 
 # ---- Estado online/offline en memoria ----
