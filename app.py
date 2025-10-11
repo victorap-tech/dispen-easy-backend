@@ -4,6 +4,7 @@ import threading
 import requests
 import json as _json
 import time
+import secrets
 from collections import defaultdict
 from queue import Queue
 from threading import Lock
@@ -46,7 +47,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "x-admin-secret"],
+    allow_headers=["Content-Type", "x-admin-secret", "x-operator-token"],
     expose_headers=["Content-Type"],
 )
 
@@ -88,8 +89,7 @@ class Pago(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
     estado = db.Column(db.String(80), nullable=False)
-    producto = db.Column(db.String(120), nullable=False, default=""
-    )
+    producto = db.Column(db.String(120), nullable=False, default="")
     dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     slot_id = db.Column(db.Integer, nullable=False, default=0)
@@ -99,6 +99,14 @@ class Pago(db.Model):
     dispenser_id = db.Column(db.Integer, nullable=False, default=0)
     device_id = db.Column(db.String(80), nullable=True, default="")
     raw = db.Column(JSON, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+
+class OperatorToken(db.Model):
+    __tablename__ = "operator_token"
+    token = db.Column(db.String(80), primary_key=True)
+    dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="CASCADE"), nullable=False, index=True)
+    nombre = db.Column(db.String(100), nullable=True, default="")
+    activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 with app.app_context():
@@ -129,23 +137,17 @@ with app.app_context():
         db.session.rollback()
 
 # ---------------- Helpers ----------------
-def ok_json(data, status=200):
-    return jsonify(data), status
-
+def ok_json(data, status=200): return jsonify(data), status
 def json_error(msg, status=400, extra=None):
-    p = {"error": msg}
-    if extra is not None:
-        p["detail"] = extra
+    p={"error":msg}
+    if extra is not None: p["detail"]=extra
     return jsonify(p), status
 
 def _to_int(x, default=0):
-    try:
-        return int(x)
+    try: return int(x)
     except Exception:
-        try:
-            return int(float(x))
-        except Exception:
-            return default
+        try: return int(float(x))
+        except Exception: return default
 
 def serialize_producto(p: Producto) -> dict:
     return {
@@ -179,7 +181,7 @@ def tg_notify(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10,
+            timeout=10
         )
     except Exception as e:
         app.logger.error(f"[TG] Error enviando notificación: {e}")
@@ -188,42 +190,30 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
     umbral, reserva = get_thresholds()
     stock = int(prod.cantidad or 0)
 
-    # Aviso de bajo stock (solo notifica)
     if stock <= umbral:
         tg_notify(
             f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
             f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
         )
 
-    # Deshabilitar SOLO si está por DEBAJO de la reserva crítica
     if stock < reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(
-                f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} < {reserva})"
-            )
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} < {reserva})")
     else:
-        # Rehabilitar si volvió a estar por ENCIMA o IGUAL a la reserva
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(
-                f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≥ {reserva})"
-            )
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≥ {reserva})")
 
 # --- Pricing ---
 def compute_total_price_ars(prod: Producto, litros: int) -> int:
     litros = int(litros or 1)
     bundles = prod.bundle_precios or {}
     if str(litros) in bundles:
-        try:
-            return int(round(float(bundles[str(litros)])))
-        except Exception:
-            pass
-    try:
-        base = float(prod.precio) * litros
-        return int(round(base))
-    except Exception:
-        return max(1, litros)
+        try: return int(round(float(bundles[str(litros)])))
+        except Exception: pass
+    try: return int(round(float(prod.precio) * litros))
+    except Exception: return max(1, litros)
 
 # ---------------- Auth guard ----------------
 PUBLIC_PATHS = {
@@ -237,14 +227,25 @@ PUBLIC_PATHS = {
 def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
-    p = request.path
-    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")):
+    p = request.path or ""
+    # Permitir rutas públicas y rutas de operador sin admin secret
+    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")) or p.startswith("/api/op/"):
         return None
     if not ADMIN_SECRET:
         return None
     if request.headers.get("x-admin-secret") != ADMIN_SECRET:
         return json_error("unauthorized", 401)
     return None
+
+# ---- Operator helpers ----
+def _unauth_op():
+    return json_error("operator_unauthorized", 401)
+
+def get_operator_scope():
+    tok = (request.headers.get("x-operator-token") or "").strip()
+    if not tok:
+        return None
+    return OperatorToken.query.filter_by(token=tok, activo=True).first()
 
 # ---------------- MP tokens ----------------
 def get_mp_mode() -> str:
@@ -297,13 +298,11 @@ def sse_stream():
                 except Exception: pass
     return Response(gen(), mimetype="text/event-stream")
 
-# ---- Estado online/offline en memoria ----
+# ---- Estado online/offline ----
 last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
 _last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
 ON_DEBOUNCE_S  = 5
-
-# ✅ Debounce por Timer para ONLINE
 _online_timers = {}  # dev -> threading.Timer
 
 def _notify_online_if_stable(dev: str):
@@ -324,7 +323,7 @@ def _mqtt_on_message(client, userdata, msg):
     except Exception: raw = "<binario>"
     app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
 
-    # ----- Evento de botón físico → SSE -----
+    # Evento botón físico → SSE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/event"):
         try: data = _json.loads(raw or "{}")
         except Exception: data = {}
@@ -335,7 +334,7 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # ----- Estado ONLINE/OFFLINE con debounce por Timer -----
+    # Estado ONLINE/OFFLINE con debounce por Timer
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
             data = _json.loads(raw or "{}")
@@ -345,15 +344,12 @@ def _mqtt_on_message(client, userdata, msg):
         st  = str(data.get("status") or "").lower().strip()
         now = time.time()
 
-        # Actualizo cache + SSE
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-        # Evitar duplicados exactos
         if _last_notified_status[dev] == st:
             return
 
-        # OFFLINE: notifica inmediato y cancela timer pendiente
         if st == "offline":
             t = _online_timers.pop(dev, None)
             if t:
@@ -363,7 +359,6 @@ def _mqtt_on_message(client, userdata, msg):
             _last_notified_status[dev] = "offline"
             return
 
-        # ONLINE: programa notificación si se mantiene estable
         t = _online_timers.pop(dev, None)
         if t:
             try: t.cancel()
@@ -374,7 +369,7 @@ def _mqtt_on_message(client, userdata, msg):
         new_t.start()
         return
 
-    # ----- Estado de dispensa DONE/TIMEOUT para stock -----
+    # Estado de dispensa DONE/TIMEOUT para stock
     try: data = _json.loads(raw or "{}")
     except Exception: return
 
@@ -798,6 +793,85 @@ def api_disp_status():
     for dev, info in last_status.items():
         out.append({"device_id": dev, "status": info["status"]})
     return jsonify(out)
+
+# ---------------- Admin: Operator Tokens ----------------
+@app.get("/api/admin/operator_tokens")
+def admin_list_operator_tokens():
+    rows = OperatorToken.query.order_by(OperatorToken.created_at.desc()).all()
+    return ok_json({"ok": True, "tokens": [{
+        "token": r.token, "dispenser_id": r.dispenser_id, "nombre": r.nombre or "",
+        "activo": bool(r.activo),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]})
+
+@app.post("/api/admin/operator_tokens")
+def admin_create_operator_token():
+    data = request.get_json(force=True, silent=True) or {}
+    did = int(data.get("dispenser_id") or 0)
+    nombre = (data.get("nombre") or "").strip()
+    if not did or not Dispenser.query.get(did):
+        return json_error("dispenser_id inválido", 400)
+    tok = secrets.token_urlsafe(32)
+    row = OperatorToken(token=tok, dispenser_id=did, nombre=nombre, activo=True)
+    db.session.add(row); db.session.commit()
+    return ok_json({"ok": True, "token": tok, "dispenser_id": did, "nombre": nombre})
+
+@app.post("/api/admin/operator_tokens/<string:token>/toggle")
+def admin_toggle_operator_token(token):
+    row = OperatorToken.query.get_or_404(token)
+    row.activo = not bool(row.activo)
+    db.session.commit()
+    return ok_json({"ok": True, "token": row.token, "activo": bool(row.activo)})
+
+@app.delete("/api/admin/operator_tokens/<string:token>")
+def admin_delete_operator_token(token):
+    row = OperatorToken.query.get_or_404(token)
+    db.session.delete(row); db.session.commit()
+    return ok_json({"ok": True, "deleted": True})
+
+# ---------------- Operator (scoped) ----------------
+@app.get("/api/op/productos")
+def op_list_productos_of_dispenser():
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    prods = Producto.query.filter(Producto.dispenser_id == op.dispenser_id).order_by(Producto.slot_id.asc()).all()
+    return jsonify([serialize_producto(p) for p in prods])
+
+@app.post("/api/op/productos/<int:pid>/reponer")
+def op_reponer(pid):
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    p = Producto.query.get_or_404(pid)
+    if p.dispenser_id != op.dispenser_id:
+        return json_error("forbidden", 403, "No podés modificar productos de otro dispenser")
+    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
+    if litros <= 0: return json_error("Litros inválidos", 400)
+    try:
+        p.cantidad = max(0, int(p.cantidad or 0) + litros)
+        _post_stock_change_hook(p, motivo=f"reponer (operator:{op.token[:8]}..)")
+        db.session.commit()
+        return ok_json({"ok": True, "producto": serialize_producto(p)})
+    except Exception as e:
+        db.session.rollback()
+        return json_error("Error reponiendo producto", 500, str(e))
+
+@app.post("/api/op/productos/<int:pid>/reset_stock")
+def op_reset_stock(pid):
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    p = Producto.query.get_or_404(pid)
+    if p.dispenser_id != op.dispenser_id:
+        return json_error("forbidden", 403, "No podés modificar productos de otro dispenser")
+    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
+    if litros < 0: return json_error("Litros inválidos", 400)
+    try:
+        p.cantidad = int(litros)
+        _post_stock_change_hook(p, motivo=f"reset_stock (operator:{op.token[:8]}..)")
+        db.session.commit()
+        return ok_json({"ok": True, "producto": serialize_producto(p)})
+    except Exception as e:
+        db.session.rollback()
+        return json_error("Error reseteando stock", 500, str(e))
 
 # ---------------- Gracias / Sin stock ----------------
 @app.get("/gracias")
