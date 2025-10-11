@@ -317,6 +317,32 @@ def api_me():
         allowed = [row.dispenser_id for row in q.all()]
     return ok_json({"email": u.email, "role": u.role, "dispenser_ids": allowed})
 
+# ----------------------------------------
+# 🔐 Bootstrap de usuario admin (solo 1 vez)
+# ----------------------------------------
+from werkzeug.security import generate_password_hash
+
+@app.post("/api/auth/bootstrap")
+def api_auth_bootstrap():
+    """Permite crear el primer usuario admin si la tabla está vacía."""
+    if ADMIN_SECRET and request.headers.get("x-admin-secret") != ADMIN_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    existing = User.query.count()
+    if existing > 0:
+        return jsonify({"error": "ya existen usuarios"}), 409
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    if not email or not password:
+        return jsonify({"error": "faltan datos"}), 400
+
+    u = User(email=email, password_hash=generate_password_hash(password),
+             role="superadmin", active=True)
+    db.session.add(u)
+    db.session.commit()
+    return jsonify({"msg": f"Usuario admin creado correctamente ({email})"})
 # ---------------- Auth guard ----------------
 PUBLIC_PATHS = {
     "/", "/gracias", "/sin-stock",
