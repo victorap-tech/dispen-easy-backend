@@ -88,7 +88,8 @@ class Pago(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     mp_payment_id = db.Column(db.String(120), nullable=False, unique=True, index=True)
     estado = db.Column(db.String(80), nullable=False)
-    producto = db.Column(db.String(120), nullable=False, default="")
+    producto = db.Column(db.String(120), nullable=False, default=""
+    )
     dispensado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     procesado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     slot_id = db.Column(db.Integer, nullable=False, default=0)
@@ -108,7 +109,7 @@ with app.app_context():
     if Dispenser.query.count() == 0:
         db.session.add(Dispenser(device_id="dispen-01", nombre="dispen-01 (por defecto)", activo=True))
         db.session.commit()
-    # Intento migrar JSONB -> JSON si estás en Postgres (ignora en SQLite)
+    # Migración defensiva JSONB->JSON (ignorada en SQLite)
     try:
         db.session.execute(sqltext("""
             DO $$
@@ -302,6 +303,15 @@ _last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
 ON_DEBOUNCE_S  = 5
 
+# ✅ Debounce por Timer para ONLINE
+_online_timers = {}  # dev -> threading.Timer
+
+def _notify_online_if_stable(dev: str):
+    st = (last_status.get(dev) or {}).get("status", "")
+    if st == "online" and _last_notified_status[dev] != "online":
+        tg_notify(f"✅ {dev}: ONLINE")
+        _last_notified_status[dev] = "online"
+
 # ---- MQTT callbacks ----
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
     app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {topic_state_wild()} {topic_status_wild()} {topic_event_wild()}")
@@ -325,7 +335,7 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # ----- Estado ONLINE/OFFLINE con debounce + TG -----
+    # ----- Estado ONLINE/OFFLINE con debounce por Timer -----
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
             data = _json.loads(raw or "{}")
@@ -335,29 +345,33 @@ def _mqtt_on_message(client, userdata, msg):
         st  = str(data.get("status") or "").lower().strip()
         now = time.time()
 
-        # Actualizo cache + SSE para el admin
+        # Actualizo cache + SSE
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-        # Si el estado es igual al último notificado, no duplicar
+        # Evitar duplicados exactos
         if _last_notified_status[dev] == st:
             return
 
-        # 🔸 OFFLINE se notifica al instante
+        # OFFLINE: notifica inmediato y cancela timer pendiente
         if st == "offline":
+            t = _online_timers.pop(dev, None)
+            if t:
+                try: t.cancel()
+                except Exception: pass
             tg_notify(f"⚠️ {dev}: OFFLINE")
             _last_notified_status[dev] = "offline"
             return
 
-        # 🔹 ONLINE se notifica con debounce
-        pend = last_status.get(dev)
-        if not pend or pend.get("status") != st:
-            last_status[dev] = {"status": st, "t": now}
-            return
-
-        if now - pend["t"] >= ON_DEBOUNCE_S:
-            tg_notify(f"✅ {dev}: ONLINE")
-            _last_notified_status[dev] = "online"
+        # ONLINE: programa notificación si se mantiene estable
+        t = _online_timers.pop(dev, None)
+        if t:
+            try: t.cancel()
+            except Exception: pass
+        new_t = threading.Timer(ON_DEBOUNCE_S, _notify_online_if_stable, args=(dev,))
+        _online_timers[dev] = new_t
+        new_t.daemon = True
+        new_t.start()
         return
 
     # ----- Estado de dispensa DONE/TIMEOUT para stock -----
@@ -505,8 +519,7 @@ def productos_update(pid):
         if "precio" in data: p.precio = float(data["precio"])
         if "cantidad" in data:
             new_cant = int(float(data["cantidad"]))
-            if new_cant < 0:
-                return json_error("cantidad no puede ser negativa", 400)
+            if new_cant < 0: return json_error("cantidad no puede ser negativa", 400)
             p.cantidad = new_cant
         if "porcion_litros" in data:
             val = int(data["porcion_litros"])
@@ -603,50 +616,6 @@ def pagos_list():
         "created_at": p.created_at.isoformat() if p.created_at else None,
     } for p in pagos])
 
-# ---------------- Reintento de dispensa (admin) ----------------
-@app.post("/api/pagos/<int:pid>/reenviar")
-def pagos_reenviar(pid):
-    # Requiere x-admin-secret (entra por el guard)
-    p = Pago.query.get_or_404(pid)
-
-    # Validaciones mínimas
-    if p.dispensado:
-        return json_error("ya_dispensado", 409)
-    if (p.estado or "").lower() != "approved":
-        return json_error("estado_no_aprobado", 409, {"estado": p.estado})
-    if not p.slot_id or not p.litros:
-        return json_error("pago_incompleto", 400)
-
-    # Resolver device_id por las dudas
-    dev = (p.device_id or "").strip()
-    if not dev and p.product_id:
-        pr = Producto.query.get(p.product_id)
-        if pr and pr.dispenser_id:
-            d = Dispenser.query.get(pr.dispenser_id)
-            if d:
-                dev = d.device_id or ""
-
-    if not dev:
-        return json_error("sin_device_id", 400, "No se pudo inferir device_id")
-
-    # Publicar comando MQTT
-    try:
-        published = send_dispense_cmd(
-            dev,
-            p.mp_payment_id,
-            int(p.slot_id),
-            int(p.litros),
-            timeout_s=max(30, int(p.litros) * 5),
-        )
-        if not published:
-            return json_error("mqtt_publish_failed", 502)
-        # Marcamos 'procesado' para evitar reenviar en el webhook
-        p.procesado = True
-        db.session.commit()
-        return ok_json({"ok": True, "msg": "Comando de dispensa re-enviado", "device_id": dev})
-    except Exception as e:
-        db.session.rollback()
-        return json_error("reenviar_failed", 500, str(e))
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
@@ -715,128 +684,13 @@ def crear_preferencia_api():
     if not link: return json_error("preferencia_sin_link", 502, pref)
     return ok_json({"ok": True, "link": link, "raw": pref, "precio_final": monto_final})
 
-# ---------------- QR dinámico v2: selección de litros ----------------
-@app.get("/ui/seleccionar")
-def ui_seleccionar():
-    pid = _to_int(request.args.get("pid") or 0)
-    if not pid:
-        return _html("Producto no encontrado", "<p>Falta parámetro <code>pid</code>.</p>")
-    prod = Producto.query.get(pid)
-    if not prod or not prod.habilitado:
-        return _html("No disponible", "<p>Producto sin stock o deshabilitado.</p>")
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return _html("No disponible", "<p>Dispenser no disponible.</p>")
-
-    backend = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    tmpl = """
-<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Seleccionar litros</title>
-<style>
-  body{margin:0;background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto}
-  .box{max-width:720px;margin:12vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px}
-  h1{margin:0 0 6px} .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
-  .opt{flex:1;min-width:170px;background:#111827;border:1px solid #374151;border-radius:12px;padding:14px;text-align:center;cursor:pointer}
-  .opt[aria-disabled="true"]{opacity:.5;cursor:not-allowed}
-  .name{opacity:.8;margin-bottom:4px}
-  .L{font-size:28px;font-weight:800}
-  .price{margin-top:6px;font-size:18px;font-weight:700;color:#10b981}
-  .note{opacity:.75;font-size:12px;margin-top:10px}
-  .err{color:#fca5a5}
-</style>
-</head><body>
-<div class="box">
-  <h1>__NOMBRE__</h1>
-  <div class="name">Dispenser <code>__DEVICE__</code> · Slot <b>__SLOT__</b></div>
-  <div id="row" class="row"></div>
-  <div id="msg" class="note"></div>
-</div>
-<script>
-  const fmt = n => new Intl.NumberFormat('es-AR',{style:'currency',currency:'ARS'}).format(n);
-  async function load(){
-    const res = await fetch('__BACKEND__/api/productos/__PID__/opciones');
-    const js = await res.json();
-    const row = document.getElementById('row');
-    const msg = document.getElementById('msg');
-    row.innerHTML = '';
-
-    if(!js.ok){
-      msg.innerHTML = '<span class="err">Disculpe, producto sin stock o en reserva crítica.</span>';
-      return;
-    }
-
-    let disponibles = 0;
-    js.opciones.forEach(o=>{
-      const d = document.createElement('div');
-      d.className='opt';
-      if(!o.disponible) d.setAttribute('aria-disabled','true'); else disponibles++;
-
-      d.innerHTML = `
-        <div class="L">${o.litros} L</div>
-        <div class="price">${o.precio_final ? fmt(o.precio_final) : '—'}</div>`;
-
-      d.onclick = async ()=>{
-        if(!o.disponible) return;
-        d.style.opacity=.6;
-        try{
-          const r = await fetch('__BACKEND__/api/pagos/preferencia',{
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ product_id:__PID__, litros:o.litros })
-          });
-          const jr = await r.json();
-          if(jr.ok && jr.link) window.location.href = jr.link;
-          else alert(jr.error || 'No se pudo crear el pago');
-        }catch(e){ alert('Error de red'); }
-        d.style.opacity=1;
-      };
-      row.appendChild(d);
-    });
-
-    if(disponibles === 0){
-      msg.innerHTML = '<span class="err">Disculpe, producto sin stock. Vuelva a intentar más tarde.</span>';
-    } else {
-      msg.innerHTML = 'Elegí la cantidad a dispensar.';
-    }
-  }
-  load();
-</script>
-</body></html>
-"""
-    html = (
-        tmpl
-        .replace("__BACKEND__", backend)
-        .replace("__PID__", str(pid))
-        .replace("__NOMBRE__", prod.nombre)
-        .replace("__DEVICE__", disp.device_id or "")
-        .replace("__SLOT__", str(prod.slot_id))
-    )
-    return _html_raw(html)
-
-def _html(title: str, body_html: str):
-    html = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-<div style="max-width:720px;margin:14vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px">
-<h1 style="margin:0 0 8px">{title}</h1>
-{body_html}
-</div></body></html>"""
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
-
-def _html_raw(html: str):
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
-
 # ---------------- Webhook MP ----------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
 
-    # ✅ Usar SIEMPRE el par (token, base) del modo actual (KV)
     token, base_api = get_mp_token_and_base()
-
     topic = args.get("topic") or body.get("type")
 
     payment_id = None
@@ -907,6 +761,36 @@ def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
 def mp_webhook_alias2(): return mp_webhook()
 
+# ---------------- Reintento de dispensa (admin) ----------------
+@app.post("/api/pagos/<int:pid>/reenviar")
+def pagos_reenviar(pid):
+    p = Pago.query.get_or_404(pid)
+    if p.dispensado:
+        return json_error("ya_dispensado", 409)
+    if (p.estado or "").lower() != "approved":
+        return json_error("estado_no_aprobado", 409, {"estado": p.estado})
+    if not p.slot_id or not p.litros:
+        return json_error("pago_incompleto", 400)
+    dev = (p.device_id or "").strip()
+    if not dev and p.product_id:
+        pr = Producto.query.get(p.product_id)
+        if pr and pr.dispenser_id:
+            d = Dispenser.query.get(pr.dispenser_id)
+            if d:
+                dev = d.device_id or ""
+    if not dev:
+        return json_error("sin_device_id", 400, "No se pudo inferir device_id")
+    try:
+        published = send_dispense_cmd(dev, p.mp_payment_id, int(p.slot_id), int(p.litros), timeout_s=max(30, int(p.litros) * 5))
+        if not published:
+            return json_error("mqtt_publish_failed", 502)
+        p.procesado = True
+        db.session.commit()
+        return ok_json({"ok": True, "msg": "Comando de dispensa re-enviado", "device_id": dev})
+    except Exception as e:
+        db.session.rollback()
+        return json_error("reenviar_failed", 500, str(e))
+
 # ---------------- Estado para Admin (fallback) ----------------
 @app.get("/api/dispensers/status")
 def api_disp_status():
@@ -914,54 +798,6 @@ def api_disp_status():
     for dev, info in last_status.items():
         out.append({"device_id": dev, "status": info["status"]})
     return jsonify(out)
-
-# ---------------- Reset por dispenser ----------------
-@app.post("/api/admin/reset_dispenser")
-def admin_reset_dispenser():
-    data = request.get_json(force=True, silent=True) or {}
-    did = int(data.get("dispenser_id") or 0)
-    mode = (data.get("mode") or "soft").lower()           # "soft" | "hard_keep" | "hard_wipe"
-    reset_stock_to = data.get("reset_stock_to", None)
-    confirm = (data.get("confirm") or "").strip().lower()
-
-    if not did or confirm != "reset":
-        return json_error("dispenser_id y confirm='reset' requeridos", 400)
-
-    disp = Dispenser.query.get(did)
-    if not disp:
-        return json_error("dispenser no encontrado", 404)
-
-    try:
-        deleted_pagos = Pago.query.filter(Pago.dispenser_id == did).delete(synchronize_session=False)
-
-        if mode == "soft":
-            stock_set = None
-            if reset_stock_to is not None:
-                val = max(0, int(reset_stock_to))
-                for p in Producto.query.filter(Producto.dispenser_id == did).all():
-                    p.cantidad = val
-                    _post_stock_change_hook(p, motivo="admin soft reset_stock_to")
-                stock_set = val
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"soft", "deleted_pagos": deleted_pagos, "stock_set": stock_set})
-
-        if mode == "hard_keep":
-            for p in Producto.query.filter(Producto.dispenser_id == did).all():
-                p.cantidad = 0
-                _post_stock_change_hook(p, motivo="admin hard_keep")
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"hard_keep", "deleted_pagos": deleted_pagos, "stock_set": 0})
-
-        if mode == "hard_wipe":
-            Producto.query.filter(Producto.dispenser_id == did).delete(synchronize_session=False)
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"hard_wipe", "deleted_pagos": deleted_pagos, "productos_borrados": True})
-
-        return json_error("mode inválido (soft|hard_keep|hard_wipe)", 400)
-
-    except Exception as e:
-        db.session.rollback()
-        return json_error("reset_failed", 500, str(e))
 
 # ---------------- Gracias / Sin stock ----------------
 @app.get("/gracias")
@@ -978,6 +814,21 @@ def pagina_gracias():
 @app.get("/sin-stock")
 def pagina_sin_stock():
     return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
+
+# ---- HTML helpers ----
+def _html(title: str, body_html: str):
+    html = f"""<!doctype html><html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title}</title>
+</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
+<div style="max-width:720px;margin:14vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px">
+<h1 style="margin:0 0 8px">{title}</h1>
+{body_html}
+</div></body></html>"""
+    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
+
+def _html_raw(html: str):
+    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
 # ---------------- Inicializar MQTT ----------------
 with app.app_context():
