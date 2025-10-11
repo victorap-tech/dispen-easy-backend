@@ -343,6 +343,29 @@ def api_auth_bootstrap():
     db.session.add(u)
     db.session.commit()
     return jsonify({"msg": f"Usuario admin creado correctamente ({email})"})
+
+# ----------------------------------------
+# 🔧 Reset de contraseña del admin
+# ----------------------------------------
+@app.post("/api/auth/reset_admin_pass")
+def api_reset_admin_pass():
+    """Permite resetear la contraseña del admin existente (solo con ADMIN_SECRET)."""
+    if ADMIN_SECRET and request.headers.get("x-admin-secret") != ADMIN_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    newpass = (data.get("password") or "").strip()
+    if not email or not newpass:
+        return jsonify({"error": "faltan datos"}), 400
+
+    u = User.query.filter_by(email=email).first()
+    if not u:
+        return jsonify({"error": "usuario no encontrado"}), 404
+
+    u.password_hash = generate_password_hash(newpass)
+    db.session.commit()
+    return jsonify({"msg": f"Contraseña actualizada para {email}"})
 # ---------------- Auth guard ----------------
 PUBLIC_PATHS = {
     "/", "/gracias", "/sin-stock",
