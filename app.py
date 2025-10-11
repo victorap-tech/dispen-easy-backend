@@ -545,37 +545,56 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # Estado ONLINE/OFFLINE con debounce
-    if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-        try:
-            data = _json.loads(raw or "{}")
-        except Exception:
-            return
-        dev = str(data.get("device") or "").strip()
-        st  = str(data.get("status") or "").lower().strip()
-        now = time.time()
-
-        last_status[dev] = {"status": st, "t": now}
-        _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
-
-        if _last_notified_status[dev] == st:
-            return
-
-        if st == "offline":
-            tg_notify(f"⚠️ {dev}: OFFLINE")
-            _last_notified_status[dev] = "offline"
-            return
-
-        pend = _pending_change.get(dev)
-        if not pend or pend["status"] != st:
-            _pending_change[dev] = {"status": st, "first_t": now}
-            return
-
-        if now - pend["first_t"] >= ON_DEBOUNCE_S:
-            tg_notify(f"✅ {dev}: ONLINE")
-            _last_notified_status[dev] = "online"
+    # Estado ONLINE/OFFLINE con debounce + cooldown + filtro de retained
+if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
+    try:
+        data = _json.loads(raw or "{}")
+    except Exception:
         return
 
+    dev = str(data.get("device") or "").strip()
+    st  = str(data.get("status") or "").lower().strip()
+    now = time.time()
+
+    # Guardar último estado recibido y avisar por SSE
+    last_status[dev] = {"status": st, "t": now}
+    _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
+
+    # 1) Ignorar duplicados exactos (mismo estado ya notificado)
+    if _last_notified_status[dev] == st:
+        return
+
+    # 2) Si es un mensaje RETAINED y ya notificamos hace poco, lo ignoramos
+    #    (evita spam al reconectar/subscribir)
+    if getattr(msg, "retain", False):
+        # No molestar si avisamos recientemente, aunque el estado difiera
+        if now - _last_telegram[dev] < DEVICE_COOLDOWN_S:
+            return
+
+    if st == "offline":
+        # OFFLINE: notificar siempre (sin debounce), pero con cooldown
+        if now - _last_telegram[dev] >= 10:  # p.ej. 10s para evitar racheos
+            tg_notify(f"⚠️ {dev}: OFFLINE")
+            _last_telegram[dev] = now
+        _last_notified_status[dev] = "offline"
+        _pending_change.pop(dev, None)
+        return
+
+    # ONLINE: requerir estabilidad + cooldown
+    pend = _pending_change.get(dev)
+    if not pend or pend["status"] != st:
+        _pending_change[dev] = {"status": st, "first_t": now}
+        return
+
+    # estable por ON_DEBOUNCE_S
+    if now - pend["first_t"] >= ON_DEBOUNCE_S:
+        # Cooldown para no spamear en reconexiones
+        if now - _last_telegram[dev] >= DEVICE_COOLDOWN_S:
+            tg_notify(f"✅ {dev}: ONLINE")
+            _last_telegram[dev] = now
+        _last_notified_status[dev] = "online"
+        _pending_change.pop(dev, None)
+    return
     # Estado de dispensa DONE/TIMEOUT → stock
     try: data = _json.loads(raw or "{}")
     except Exception: return
