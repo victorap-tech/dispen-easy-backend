@@ -48,7 +48,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "x-admin-secret"],
+    allow_headers=["Content-Type", "x-admin-secret", "Authorization"],
     expose_headers=["Content-Type"],
 )
 
@@ -120,7 +120,6 @@ with app.app_context():
 import datetime
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask import g
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me-please")
 JWT_EXP_HOURS = int(os.getenv("JWT_EXP_HOURS", "48") or 48)
@@ -143,9 +142,7 @@ class DispenserAdmin(db.Model):
 
 with app.app_context():
     db.create_all()
-    # bootstrap superadmin si no existe
     if not User.query.filter_by(role="superadmin").first():
-        # credenciales iniciales por env (o fija si no hay env)
         admin_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "admin@dispeneasy.local")
         admin_pass  = os.getenv("BOOTSTRAP_ADMIN_PASS",  "admin123")
         u = User(email=admin_email, password_hash=generate_password_hash(admin_pass), role="superadmin", active=True)
@@ -178,7 +175,7 @@ def user_can_access_dispenser(user: "User", dispenser_id: int) -> bool:
     if not dispenser_id: return False
     return bool(DispenserAdmin.query.filter_by(user_id=user.id, dispenser_id=dispenser_id).first())
 
-# ---------------- Helpers ----------------
+# ---- Helpers ----
 def ok_json(data, status=200): return jsonify(data), status
 def json_error(msg, status=400, extra=None):
     p={"error":msg}
@@ -210,6 +207,7 @@ def serialize_dispenser(d: Dispenser) -> dict:
     }
 
 def get_thresholds():
+    # umbral = solo notifica (<= umbral); reserva = crítica (deshabilita SI stock < reserva)
     reserva = max(0, int(STOCK_RESERVA_LTS))
     umbral_cfg = max(0, int(UMBRAL_ALERTA_LTS))
     umbral = umbral_cfg if umbral_cfg > reserva else (reserva + 1)
@@ -232,29 +230,21 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
     umbral, reserva = get_thresholds()
     stock = int(prod.cantidad or 0)
 
-    # Aviso de bajo stock (solo notifica)
     if stock <= umbral:
         tg_notify(
             f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
             f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
         )
 
-    # Deshabilitar SOLO si está por DEBAJO de la reserva crítica
+    # Deshabilita SOLO si stock < reserva
     if stock < reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(
-                f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} "
-                f"(stock={stock} < {reserva})"
-            )
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} < {reserva})")
     else:
-        # Rehabilitar si volvió a estar por ENCIMA o IGUAL a la reserva
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(
-                f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} "
-                f"(stock={stock} ≥ {reserva})"
-            )
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≥ {reserva})")
 
 # --- Pricing ---
 def compute_total_price_ars(prod: Producto, litros: int) -> int:
@@ -272,7 +262,6 @@ def compute_total_price_ars(prod: Producto, litros: int) -> int:
         return max(1, litros)
 
 # --- AUTH ENDPOINTS ---
-
 @app.post("/api/auth/login")
 def api_login():
     data = request.get_json() or {}
@@ -292,7 +281,6 @@ def api_login():
 
 @app.post("/api/auth/users")
 def api_create_user():
-    # Solo superadmin crea usuarios
     current = parse_jwt_from_request()
     if not current or current.role != "superadmin":
         return json_error("Solo superadmin", 403)
@@ -316,6 +304,19 @@ def api_create_user():
         db.session.commit()
 
     return ok_json({"msg": "Usuario creado", "user_id": u.id}, 201)
+
+@app.get("/api/auth/me")
+def api_me():
+    u = parse_jwt_from_request()
+    if not u:
+        return json_error("unauthorized", 401)
+    if u.role == "superadmin":
+        allowed = [d.id for d in Dispenser.query.order_by(Dispenser.id.asc()).all()]
+    else:
+        q = db.session.query(DispenserAdmin.dispenser_id).filter(DispenserAdmin.user_id == u.id)
+        allowed = [row.dispenser_id for row in q.all()]
+    return ok_json({"email": u.email, "role": u.role, "dispenser_ids": allowed})
+
 # ---------------- Auth guard ----------------
 PUBLIC_PATHS = {
     "/", "/gracias", "/sin-stock",
@@ -323,6 +324,7 @@ PUBLIC_PATHS = {
     "/api/pagos/preferencia", "/api/pagos/pendiente",
     "/api/config", "/go", "/ui/seleccionar",
     "/api/productos/opciones",
+    "/api/auth/login",
 }
 @app.before_request
 def _auth_guard():
@@ -333,14 +335,11 @@ def _auth_guard():
     if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")):
         return None
 
-    # --- Compatibilidad: admin_secret clásico ---
+    # Compatibilidad: admin_secret clásico
     if ADMIN_SECRET and request.headers.get("x-admin-secret") == ADMIN_SECRET:
         return None
-    if not ADMIN_SECRET:
-        # Si no hay secret configurado, permitimos JWT o libre (modo dev)
-        pass
 
-    # --- Nuevo: autenticación JWT ---
+    # Nuevo: autenticación JWT
     u = parse_jwt_from_request()
     if not u:
         return json_error("unauthorized", 401)
@@ -416,17 +415,15 @@ def sse_stream():
     return Response(gen(), mimetype="text/event-stream")
 
 # ---- Estado online/offline en memoria ----
-from collections import defaultdict
-
 last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
 
-# ---- Estado online/offline con debounce + batch TG ----
+# ---- Estado online/offline con debounce + TG ----
 _last_notified_status = defaultdict(lambda: "")
 OFF_DEBOUNCE_S = 5
 ON_DEBOUNCE_S  = 5
-DEVICE_COOLDOWN_S = 30 * 60   # 30 min
-_pending_change = {}                        # dev -> {"status":..., "first_t":...}
-_last_telegram  = defaultdict(lambda: 0.0)  # dev -> last sent epoch
+DEVICE_COOLDOWN_S = 30 * 60
+_pending_change = {}
+_last_telegram  = defaultdict(lambda: 0.0)
 _batch_lock = threading.Lock()
 _batch_events = []
 
@@ -454,7 +451,7 @@ def _mqtt_on_message(client, userdata, msg):
     except Exception: raw = "<binario>"
     app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
 
-    # ----- Evento de botón físico → SSE -----
+    # Evento de botón → SSE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/event"):
         try: data = _json.loads(raw or "{}")
         except Exception: data = {}
@@ -465,8 +462,7 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # ----- Estado ONLINE/OFFLINE con debounce + batch TG -----
-    # ----- Estado ONLINE/OFFLINE con debounce + TG -----
+    # Estado ONLINE/OFFLINE con debounce
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
             data = _json.loads(raw or "{}")
@@ -476,21 +472,17 @@ def _mqtt_on_message(client, userdata, msg):
         st  = str(data.get("status") or "").lower().strip()
         now = time.time()
 
-        # Actualizo cache + SSE para el admin
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-        # Si el estado es igual al último notificado, no duplicar
         if _last_notified_status[dev] == st:
             return
 
-        # 🔸 OFFLINE se notifica al instante
         if st == "offline":
             tg_notify(f"⚠️ {dev}: OFFLINE")
             _last_notified_status[dev] = "offline"
             return
 
-        # 🔹 ONLINE se notifica con debounce (para evitar falsos)
         pend = _pending_change.get(dev)
         if not pend or pend["status"] != st:
             _pending_change[dev] = {"status": st, "first_t": now}
@@ -500,7 +492,8 @@ def _mqtt_on_message(client, userdata, msg):
             tg_notify(f"✅ {dev}: ONLINE")
             _last_notified_status[dev] = "online"
         return
-    # ----- Estado de dispensa DONE/TIMEOUT para stock -----
+
+    # Estado de dispensa DONE/TIMEOUT → stock
     try: data = _json.loads(raw or "{}")
     except Exception: return
 
@@ -572,12 +565,29 @@ def api_set_mode():
 # ---------------- Dispensers ----------------
 @app.get("/api/dispensers")
 def dispensers_list():
-    ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
+    current = parse_jwt_from_request()
+    q = Dispenser.query
+
+    # Si no es superadmin, limitar a sus dispensers
+    if current and current.role != "superadmin":
+        ids = [row.dispenser_id for row in
+               db.session.query(DispenserAdmin.dispenser_id)
+               .filter(DispenserAdmin.user_id == current.id).all()]
+        if not ids:
+            return ok_json([])
+        q = q.filter(Dispenser.id.in_(ids))
+
+    ds = q.order_by(Dispenser.id.asc()).all()
     return jsonify([serialize_dispenser(d) for d in ds])
 
 @app.put("/api/dispensers/<int:did>")
 def dispensers_update(did):
     d = Dispenser.query.get_or_404(did)
+    current = parse_jwt_from_request()
+    if current and current.role != "superadmin":
+        if not user_can_access_dispenser(current, did):
+            return json_error("forbidden", 403)
+
     data = request.get_json(force=True, silent=True) or {}
     if "nombre" in data: d.nombre = str(data["nombre"]).strip()
     if "activo" in data: d.activo = bool(data["activo"])
@@ -593,9 +603,26 @@ def dispensers_update(did):
 # ---------------- Productos CRUD ----------------
 @app.get("/api/productos")
 def productos_list():
+    current = parse_jwt_from_request()
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
+
     q = Producto.query
-    if disp_id: q = q.filter(Producto.dispenser_id == disp_id)
+    if current and current.role != "superadmin":
+        if not disp_id:
+            ids = [row.dispenser_id for row in
+                   db.session.query(DispenserAdmin.dispenser_id)
+                   .filter(DispenserAdmin.user_id == current.id).all()]
+            if not ids:
+                return ok_json([])
+            q = q.filter(Producto.dispenser_id.in_(ids))
+        else:
+            if not user_can_access_dispenser(current, disp_id):
+                return json_error("forbidden", 403)
+            q = q.filter(Producto.dispenser_id == disp_id)
+    else:
+        if disp_id:
+            q = q.filter(Producto.dispenser_id == disp_id)
+
     prods = q.order_by(Producto.dispenser_id.asc(), Producto.slot_id.asc()).all()
     return jsonify([serialize_producto(p) for p in prods])
 
@@ -609,7 +636,7 @@ def productos_create():
         p = Producto(
             dispenser_id=disp_id,
             nombre=str(data.get("nombre", "")).strip(),
-            precio=float(data.get("precio", 0)),  # $/L
+            precio=float(data.get("precio", 0)),
             cantidad=int(float(data.get("cantidad", 0))),
             slot_id=int(data.get("slot", 1)),
             porcion_litros=int(data.get("porcion_litros", 1)),
@@ -645,7 +672,7 @@ def productos_update(pid):
         if "precio" in data: p.precio = float(data["precio"])
         if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
         if "porcion_litros" in data:
-            val = int(data["porcion_litros"]); 
+            val = int(data["porcion_litros"])
             if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
             p.porcion_litros = val
         if "slot" in data:
@@ -721,14 +748,32 @@ def productos_opciones(pid):
 # ---------------- Pagos ----------------
 @app.get("/api/pagos")
 def pagos_list():
+    current = parse_jwt_from_request()
     try:
         limit = int(request.args.get("limit", 50)); limit = max(1, min(limit, 200))
     except Exception: limit = 50
     estado = (request.args.get("estado") or "").strip()
-    qsearch = (request.args.get("q") or "").strip()
+    disp_id = _to_int(request.args.get("dispenser_id") or 0)
+
     q = Pago.query
     if estado: q = q.filter(Pago.estado == estado)
-    if qsearch: q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
+
+    if current and current.role != "superadmin":
+        if not disp_id:
+            ids = [row.dispenser_id for row in
+                   db.session.query(DispenserAdmin.dispenser_id)
+                   .filter(DispenserAdmin.user_id == current.id).all()]
+            if not ids:
+                return ok_json([])
+            q = q.filter(Pago.dispenser_id.in_(ids))
+        else:
+            if not user_can_access_dispenser(current, disp_id):
+                return json_error("forbidden", 403)
+            q = q.filter(Pago.dispenser_id == disp_id)
+    else:
+        if disp_id:
+            q = q.filter(Pago.dispenser_id == disp_id)
+
     pagos = q.order_by(Pago.id.desc()).limit(limit).all()
     return jsonify([{
         "id": p.id, "mp_payment_id": p.mp_payment_id, "estado": p.estado,
