@@ -538,33 +538,61 @@ def productos_update(pid):
         db.session.rollback()
         return json_error("Error actualizando producto", 500, str(e))
 
-@app.post("/api/productos/<int:pid>/reponer")
-def productos_reponer(pid):
+# ─── Utilidad: obtener operador desde el header ────────────────────────────────
+def _require_operator():
+    token = (request.headers.get("x-operator-token") or "").strip()
+    if not token:
+        return None, json_error("missing operator token", 401)
+    op = OperatorToken.query.filter_by(token=token).first()
+    if not op or not op.activo:
+        return None, json_error("invalid operator token", 401)
+    return op, None
+
+# ─── Reponer (vía operador) ───────────────────────────────────────────────────
+@app.post("/api/op/productos/<int:pid>/reponer")
+def op_productos_reponer(pid):
+    op, err = _require_operator()
+    if err: return err
     p = Producto.query.get_or_404(pid)
+    if int(p.dispenser_id or 0) != int(op.dispenser_id):
+        return json_error("forbidden", 403)
+
     litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
     if litros <= 0: return json_error("Litros inválidos", 400)
+
     try:
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
-        _post_stock_change_hook(p, motivo="reponer")
+        # 👇 ahora notificamos con el NOMBRE del operador (si no tiene, mostramos “operador”)
+        nombre = (op.nombre or "").strip() or "operador"
+        _post_stock_change_hook(p, motivo=f"reponer (operador: {nombre})")
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
         return json_error("Error reponiendo producto", 500, str(e))
 
-@app.post("/api/productos/<int:pid>/reset_stock")
-def productos_reset(pid):
+# ─── Reset stock (vía operador) ───────────────────────────────────────────────
+@app.post("/api/op/productos/<int:pid>/reset_stock")
+def op_productos_reset(pid):
+    op, err = _require_operator()
+    if err: return err
     p = Producto.query.get_or_404(pid)
+    if int(p.dispenser_id or 0) != int(op.dispenser_id):
+        return json_error("forbidden", 403)
+
     litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
     if litros < 0: return json_error("Litros inválidos", 400)
+
     try:
         p.cantidad = int(litros)
-        _post_stock_change_hook(p, motivo="reset_stock")
+        # 👇 nombre en la notificación
+        nombre = (op.nombre or "").strip() or "operador"
+        _post_stock_change_hook(p, motivo=f"reset_stock (operador: {nombre})")
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
-        return json_error("Error reseteando stock", 500, str(e))
+        return json_error("Error reseteando producto", 500, str(e))
 
 # -------- Opciones (1/2/3 L con precios calculados) --------
 @app.get("/api/productos/<int:pid>/opciones")
