@@ -328,13 +328,41 @@ PUBLIC_PATHS = {
 def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
+
     p = request.path
-    if p in PUBLIC_PATHS or p.startswith("/api/productos/") and p.endswith("/opciones"):
+    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")):
+        return None
+
+    # --- Compatibilidad: admin_secret clásico ---
+    if ADMIN_SECRET and request.headers.get("x-admin-secret") == ADMIN_SECRET:
         return None
     if not ADMIN_SECRET:
-        return None
-    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
+        # Si no hay secret configurado, permitimos JWT o libre (modo dev)
+        pass
+
+    # --- Nuevo: autenticación JWT ---
+    u = parse_jwt_from_request()
+    if not u:
         return json_error("unauthorized", 401)
+
+    # Si el endpoint involucra dispenser_id, validamos permisos
+    disp_id = None
+    try:
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            disp_id = body.get("dispenser_id", disp_id)
+    except Exception:
+        pass
+    disp_id = disp_id or request.args.get("dispenser_id")
+
+    if disp_id is not None:
+        try:
+            disp_id = int(disp_id)
+        except Exception:
+            disp_id = 0
+        if disp_id and not user_can_access_dispenser(u, disp_id):
+            return json_error("forbidden", 403)
+
     return None
 
 # ---------------- MP tokens ----------------
