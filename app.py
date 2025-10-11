@@ -435,46 +435,64 @@ def topic_event_wild() -> str: return "dispen/+/event"
 # ---- SSE infra ----
 _sse_clients = []
 _sse_lock = Lock()
+
 def _sse_broadcast(data: dict):
     with _sse_lock:
         dead = []
         for q in _sse_clients:
-            try: q.put_nowait(data)
-            except Exception: dead.append(q)
+            try:
+                q.put_nowait(data)
+            except Exception:
+                dead.append(q)
         for q in dead:
-            try: _sse_clients.remove(q)
-            except Exception: pass
+            try:
+                _sse_clients.remove(q)
+            except Exception:
+                pass
 
 @app.get("/api/events/stream")
 def sse_stream():
-    token = request.args.get("token")
-    secret = request.args.get("secret")
+    token  = (request.args.get("token")  or "").strip()
+    secret = (request.args.get("secret") or "").strip()
 
-    # Validar JWT (nuevo) o admin secret (legacy)
+    # ✅ Autenticación: primero JWT, si no viene token usa ADMIN_SECRET (modo legacy)
     if token:
         try:
-            jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            uid = payload.get("sub")
+            u = User.query.get(uid) if uid else None
+            if not u or not u.active:
+                return json_error("unauthorized", 401)
         except Exception as e:
             app.logger.warning(f"[SSE] JWT inválido: {e}")
             return json_error("unauthorized", 401)
-    elif ADMIN_SECRET and (secret or "") != ADMIN_SECRET:
-        return json_error("unauthorized", 401)
+    elif ADMIN_SECRET:
+        if secret != ADMIN_SECRET:
+            return json_error("unauthorized", 401)
+    # (si no hay ADMIN_SECRET y no viene token, se permite — útil en dev)
 
     q = Queue(maxsize=100)
     with _sse_lock:
         _sse_clients.append(q)
 
     def gen():
+        # hint de reintento para el EventSource del navegador
         yield "retry: 5000\n\n"
         try:
             while True:
-                data = q.get()
-                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                try:
+                    data = q.get(timeout=25)   # espera eventos
+                    yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                except Exception:
+                    # heartbeat para mantener viva la conexión
+                    yield ": keepalive\n\n"
         except GeneratorExit:
+            pass
+        finally:
             with _sse_lock:
                 try:
                     _sse_clients.remove(q)
-                except Exception:
+                except ValueError:
                     pass
 
     return Response(gen(), mimetype="text/event-stream")
