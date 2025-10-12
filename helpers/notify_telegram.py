@@ -1,45 +1,36 @@
 import os
 import requests
-from models import OperatorToken  # importa tu modelo
+from flask import current_app
 
 def notify_telegram(message, dispenser_id=None):
-    """
-    Envía un mensaje de Telegram al administrador y al operador vinculado (si lo hay).
-    Se usa para avisos de estado, stock bajo, recargas, etc.
-    """
+    try:
+        from app import db, OperatorToken  # Importa directamente desde app.py
+    except Exception as e:
+        print("⚠️ Error importando modelos desde app:", e)
+        return
+
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    admin_chat = os.getenv("TELEGRAM_CHAT_ID")
+    admin_chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-    if not bot_token:
-        print("⚠️ TELEGRAM_BOT_TOKEN no configurado en variables de entorno")
-        return False
+    if not bot_token or not admin_chat_id:
+        print("⚠️ TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID no configurados")
+        return
 
-    # --- 1️⃣ Enviar al administrador principal ---
-    if admin_chat:
-        try:
-            requests.get(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                params={"chat_id": admin_chat, "text": message},
-                timeout=5
-            )
-            print(f"📨 Notificación enviada al admin: {admin_chat}")
-        except Exception as e:
-            print(f"❌ Error al enviar al admin: {e}")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    # --- 2️⃣ Enviar al operador vinculado al dispenser (si existe) ---
+    # Enviar al admin principal
+    try:
+        requests.post(url, json={"chat_id": admin_chat_id, "text": message})
+        print("✅ Mensaje enviado al admin")
+    except Exception as e:
+        print("⚠️ Error enviando al admin:", e)
+
+    # Enviar al operador vinculado al dispenser (si existe)
     if dispenser_id:
         try:
-            op = OperatorToken.query.filter_by(dispenser_id=dispenser_id, activo=True).first()
-            if op and op.chat_id:
-                requests.get(
-                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                    params={"chat_id": op.chat_id, "text": message},
-                    timeout=5
-                )
-                print(f"📨 Notificación enviada al operador {op.nombre} ({op.chat_id})")
-            else:
-                print("⚠️ No hay operador activo vinculado a este dispenser")
+            operator = OperatorToken.query.filter_by(dispenser_id=dispenser_id, activo=True).first()
+            if operator and operator.chat_id:
+                requests.post(url, json={"chat_id": operator.chat_id, "text": message})
+                print(f"✅ Mensaje enviado al operador {operator.nombre}")
         except Exception as e:
-            print(f"❌ Error al enviar al operador: {e}")
-
-    return True
+            print("⚠️ Error enviando al operador:", e)
