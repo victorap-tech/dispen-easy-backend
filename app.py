@@ -489,6 +489,7 @@ def dispensers_update(did):
     ra = require_admin()
     if ra:
         return ra
+        
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
     if "nombre" in data: d.nombre = str(data["nombre"]).strip()
