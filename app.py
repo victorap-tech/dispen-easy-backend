@@ -864,19 +864,29 @@ def admin_operator_list():
     } for t in toks])
 
 @app.post("/api/admin/operator_tokens")
-def admin_operator_create():
+def create_operator_token():
+    require_admin()
     data = request.get_json(force=True, silent=True) or {}
-    disp_id = _to_int(data.get("dispenser_id") or 0)
-    if not disp_id or not Dispenser.query.get(disp_id):
-        return json_error("dispenser_id inválido", 400)
-    nombre = (data.get("nombre") or "").strip()
-    tok = OperatorToken(dispenser_id=disp_id, nombre=nombre or "")
-    db.session.add(tok); db.session.commit()
-    return ok_json({"ok": True, "token": tok.token, "record": {
-        "token": tok.token, "dispenser_id": tok.dispenser_id, "nombre": tok.nombre or "",
-        "activo": bool(tok.activo), "chat_id": tok.chat_id or "",
-        "created_at": tok.created_at.isoformat() if t.created_at else None
-    }}, 201)
+    dispenser_id = data.get("dispenser_id")
+    nombre = data.get("nombre", "")
+    telegram_user = data.get("telegram_user", "")
+    chat_id = data.get("chat_id", "")
+    if not dispenser_id:
+        return jsonify({"ok": False, "error": "dispenser_id requerido"}), 400
+
+    tok = secrets.token_urlsafe(16)
+    op = OperatorToken(
+        token=tok,
+        dispenser_id=dispenser_id,
+        nombre=nombre,
+        telegram_user=telegram_user,
+        chat_id=chat_id,
+        activo=True,
+        creado=datetime.utcnow(),
+    )
+    db.session.add(op)
+    db.session.commit()
+    return jsonify({"ok": True, "token": tok})
 
 @app.put("/api/admin/operator_tokens/<token>")
 def admin_operator_update(token):
