@@ -107,10 +107,16 @@ class Pago(db.Model):
 
 class OperatorToken(db.Model):
     __tablename__ = "operator_token"
-    id = db.Column(db.Integer, primary_key=True)
-    token = db.Column(db.String(80), unique=True, index=True, nullable=False, default=lambda: secrets.token_urlsafe(24))
-    dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="CASCADE"), nullable=False, index=True)
-    nombre = db.Column(db.String(120), nullable=True, default="")
+
+    token = db.Column(db.String(80), primary_key=True, unique=True, index=True,
+                      default=lambda: secrets.token_urlsafe(24))
+    dispenser_id = db.Column(
+        db.Integer,
+        db.ForeignKey("dispenser.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    nombre = db.Column(db.String(120), nullable=False, default="")
     chat_id = db.Column(db.String(40), nullable=True)  # Telegram del cliente
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
