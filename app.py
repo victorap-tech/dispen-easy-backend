@@ -491,6 +491,14 @@ def dispensers_update(did):
                 return json_error("device_id ya usado", 409)
             d.device_id = nid
     db.session.commit()
+    
+    # 🟢 Si se activó o cambió estado, enviar notificación
+    if "activo" in data and data["activo"]:
+        try:
+            notify_telegram(f"🟢 Dispenser {d.nombre} está ONLINE ✅", dispenser_id=d.id)
+        except Exception as e:
+            print("Error enviando notificación Telegram:", e)
+            
     return ok_json({"ok": True, "dispenser": serialize_dispenser(d)})
 
 # ---------------- Productos CRUD ----------------
