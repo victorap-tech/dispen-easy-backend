@@ -22,12 +22,15 @@ from flask import request, jsonify
 
 #------Protección admin-----------
 def require_admin():
-    token_hdr = request.headers.get("x-admin-token", "")
-    env_raw = os.getenv("ADMIN_TOKEN") or ""
+    # Acepta x-admin-token o x-admin-secret
+    token_hdr = (
+        request.headers.get("x-admin-token", "") or
+        request.headers.get("x-admin-secret", "")
+    )
+    env_raw = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET") or ""
     env_stripped = env_raw.strip()
 
-    # LOG a deploy logs para ver exactamente qué llega
-    print(f"[ADMIN DEBUG] hdr={repr(token_hdr)} raw={repr(env_raw)} stripped={repr(env_stripped)} len_hdr={len(token_hdr)} len_env={len(env_stripped)}")
+    print(f"[ADMIN DEBUG] hdr={repr(token_hdr)} raw={repr(env_raw)} stripped={repr(env_stripped)}")
 
     if token_hdr != env_stripped:
         return jsonify({"error": "unauthorized"}), 401
