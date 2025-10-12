@@ -29,6 +29,7 @@ mercadopago
 # (Opcional) si usás MQTT o Postgres
 paho-mqtt==2.1.0
 psycopg2-binary==2.9.10
+python-telegram-bot==20.3
 
 
 
