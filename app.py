@@ -265,30 +265,44 @@ def compute_total_price_ars(prod: Producto, litros: int) -> int:
         return max(1, litros)
 
 # ---------------- Auth guard ----------------
-PUBLIC_PATHS = {
-    "/", "/gracias", "/sin-stock",
-    "/api/mp/webhook", "/webhook", "/mp/webhook",
-    "/api/pagos/preferencia", "/api/pagos/pendiente",
-    "/api/config", "/go", "/ui/seleccionar",
-    "/api/productos/opciones",
-    # Operador (público por token)
-    "/api/operator/productos", "/api/operator/productos/reponer",
-    "/api/operator/productos/reset",
-    "/api/operator/link",
-}
 @app.before_request
 def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
-    p = request.path
-    if p in PUBLIC_PATHS or p.startswith("/api/productos/") and p.endswith("/opciones") or p.startswith("/api/operator/"):
-        return None
-    if not ADMIN_SECRET:
-        return None
-    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
-        return json_error("unauthorized", 401)
-    return None
 
+    p = request.path
+
+    PUBLIC_PATHS = {
+        "/", "/gracias", "/sin-stock",
+        "/api/mp/webhook", "/webhook", "/mp/webhook",
+        "/api/pagos/preferencia", "/api/pagos/pendiente",
+        "/api/config", "/go", "/ui/seleccionar",
+        "/api/productos/opciones",
+        # Operador (público por token)
+        "/api/operator/productos", "/api/operator/productos/reponer",
+        "/api/operator/productos/reset",
+        "/api/operator/link",
+        # debug temporal (podés quitarlo cuando termines)
+        "/api/_debug/admin",
+    }
+
+    # Permitir también caminos que comienzan con estas bases
+    if (
+        p in PUBLIC_PATHS
+        or (p.startswith("/api/productos/") and p.endswith("/opciones"))
+        or p.startswith("/api/operator/")
+    ):
+        return None
+
+    # Si no hay token configurado, no exigirlo (útil en dev)
+    if not ADMIN_TOKEN:
+        return None
+
+    hdr = (request.headers.get("x-admin-token") or "").strip()
+    if hdr != ADMIN_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    return None
 # ---------------- MP tokens ----------------
 def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
