@@ -863,31 +863,41 @@ def admin_operator_list():
         "created_at": t.created_at.isoformat() if t.created_at else None
     } for t in toks])
 
+# ======================================================
+# ===  Crear nuevo token de operador  ==================
+# ======================================================
 @app.post("/api/admin/operator_tokens")
 def create_operator_token():
     require_admin()
     data = request.get_json(force=True, silent=True) or {}
     dispenser_id = data.get("dispenser_id")
-    nombre = data.get("nombre", "")
-    telegram_user = data.get("telegram_user", "")
-    chat_id = data.get("chat_id", "")
+    nombre = data.get("nombre", "").strip() or "Operador"
     if not dispenser_id:
         return jsonify({"ok": False, "error": "dispenser_id requerido"}), 400
 
-    tok = secrets.token_urlsafe(16)
-    op = OperatorToken(
-        token=tok,
-        dispenser_id=dispenser_id,
-        nombre=nombre,
-        telegram_user=telegram_user,
-        chat_id=chat_id,
-        activo=True,
-        creado=datetime.utcnow(),
-    )
-    db.session.add(op)
-    db.session.commit()
-    return jsonify({"ok": True, "token": tok})
+    try:
+        tok = secrets.token_urlsafe(16)
+        op = OperatorToken(
+            token=tok,
+            dispenser_id=dispenser_id,
+            nombre=nombre,
+            activo=True,
+            created_at=datetime.utcnow(),
+            chat_id=None
+        )
+        db.session.add(op)
+        db.session.commit()
 
+        return jsonify({
+            "ok": True,
+            "token": tok,
+            "dispenser_id": dispenser_id,
+            "nombre": nombre
+        })
+    except Exception as e:
+        db.session.rollback()
+        print("Error creando operator token:", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 @app.put("/api/admin/operator_tokens/<token>")
 def admin_operator_update(token):
     data = request.get_json(force=True, silent=True) or {}
