@@ -21,19 +21,34 @@ import os
 from flask import request, jsonify
 
 #------Protección admin-----------
+# -------- Protección admin --------
 def require_admin():
-    # Acepta x-admin-token o x-admin-secret
+    # Acepta x-admin-secret o x-admin-token
     token_hdr = (
-        request.headers.get("x-admin-token", "") or
-        request.headers.get("x-admin-secret", "")
+        request.headers.get("x-admin-secret")
+        or request.headers.get("X-Admin-Secret")
+        or request.headers.get("x-admin-token")
+        or request.headers.get("X-Admin-Token")
+        or ""
     )
-    env_raw = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_SECRET") or ""
-    env_stripped = env_raw.strip()
 
-    print(f"[ADMIN DEBUG] hdr={repr(token_hdr)} raw={repr(env_raw)} stripped={repr(env_stripped)}")
+    env_raw = (
+        os.getenv("ADMIN_SECRET")
+        or os.getenv("ADMIN_TOKEN")
+        or ""
+    )
 
+    # Limpieza de posibles espacios o comillas
+    token_hdr = token_hdr.strip().strip("'").strip('"')
+    env_stripped = env_raw.strip().strip("'").strip('"')
+
+    # Debug opcional
+    print(f"[ADMIN DEBUG] header={repr(token_hdr)} env={repr(env_stripped)}")
+
+    # Comparación
     if token_hdr != env_stripped:
         return jsonify({"error": "unauthorized"}), 401
+
     return None
         
 # ---------------- Config ----------------
