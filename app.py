@@ -49,7 +49,6 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)
 STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)
