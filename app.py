@@ -175,23 +175,36 @@ def get_thresholds():
     return umbral, reserva
 
 # ---- Telegram ----
-def tg_notify(text: str, extra_chat_ids: list[str] | None = None):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def tg_notify_to(chat_id: str, text: str):
+    if not (TELEGRAM_BOT_TOKEN and chat_id):
         return
-    chats = [str(TELEGRAM_CHAT_ID)]
-    for c in (extra_chat_ids or []):
-        s = str(c or "").strip()
-        if s and s not in chats:
-            chats.append(s)
-    for chat in chats:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat, "text": text},
-                timeout=10
-            )
-        except Exception as e:
-            app.logger.error(f"[TG] Error enviando notificación a {chat}: {e}")
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10
+        )
+    except Exception as e:
+        app.logger.error(f"[TG] Error enviando a {chat_id}: {e}")
+
+def tg_notify_admin(text: str):
+    if TELEGRAM_CHAT_ID:
+        tg_notify_to(TELEGRAM_CHAT_ID, text)
+
+def notify_admin_and_ops(dispenser_id: int, text: str):
+    # Admin
+    tg_notify_admin(text)
+    # Operadores vinculados a este dispenser
+    try:
+        ops = OperatorToken.query.filter(
+            OperatorToken.dispenser_id == dispenser_id,
+            OperatorToken.activo == True,
+            OperatorToken.chat_id.isnot(None)
+        ).all()
+        for op in ops:
+            tg_notify_to(op.chat_id, text)
+    except Exception as e:
+        app.logger.error(f"[TG] notify ops: {e}")
 
 def _operator_chats_for_dispenser(dispenser_id: int) -> list[str]:
     try:
@@ -211,13 +224,13 @@ def _post_stock_change_hook(prod: "Producto", motivo: str):
     # También reenviamos al/los operadores vinculados a este dispenser
     extra = _operator_chats_for_dispenser(prod.dispenser_id or 0)
 
-    # Aviso de bajo stock
-    if stock <= umbral:
-        tg_notify(
-            f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
-            f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}",
-            extra_chat_ids=extra
-        )
+   # Aviso bajo stock
+if stock <= umbral:
+    notify_admin_and_ops(
+        prod.dispenser_id,
+        f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
+        f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
+    )
 
     # Deshabilitar si quedó por debajo de la reserva
     if stock < reserva:
@@ -368,16 +381,13 @@ def _mqtt_on_message(client, userdata, msg):
             return
 
         if st == "offline":
-            tg_notify(f"⚠️ {dev}: OFFLINE")
-            _last_notified_status[dev] = "offline"
-            return
-
-        # ONLINE con debounce
-        pend = last_status.get(dev, {})
-        first_t = pend.get("t", now)
-        if (now - first_t) >= ON_DEBOUNCE_S:
-            tg_notify(f"✅ {dev}: ONLINE")
-            _last_notified_status[dev] = "online"
+    notify_admin_and_ops(dev_id_from_name(dev), f"⚠️ {dev}: OFFLINE")
+    _last_notified_status[dev] = "offline"
+    return
+...
+if now - pend["first_t"] >= ON_DEBOUNCE_S:
+    notify_admin_and_ops(dev_id_from_name(dev), f"✅ {dev}: ONLINE")
+    _last_notified_status[dev] = "online"
         return
 
     # ----- Estado de dispensa DONE/TIMEOUT para stock -----
