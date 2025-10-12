@@ -20,9 +20,11 @@ from helpers.notify_telegram import notify_telegram
 
 #------Protección admin-----------
 def require_admin():
-    token = request.headers.get('x-admin-token')
-    if not token or token != os.getenv('ADMIN_TOKEN'):
+    token = request.headers.get("x-admin-token", "")
+    admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
+    if token != admin_token:
         return jsonify({"error": "unauthorized"}), 401
+    return None
         
 # ---------------- Config ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
