@@ -16,6 +16,7 @@ from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import UniqueConstraint, text as sqltext, and_
 import paho.mqtt.client as mqtt
+from helpers.notify_telegram import notify_telegram
 
 # ---------------- Config ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
