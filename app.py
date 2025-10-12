@@ -65,7 +65,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 CORS(
     app,
     resources={r"/api/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "x-admin-secret", "x-operator-token"],
+    allow_headers=["Content-Type", "x-admin-token", "x-operator-token"],
     expose_headers=["Content-Type"],
 )
 
