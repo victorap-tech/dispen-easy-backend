@@ -18,6 +18,12 @@ from sqlalchemy import UniqueConstraint, text as sqltext, and_
 import paho.mqtt.client as mqtt
 from helpers.notify_telegram import notify_telegram
 
+#------Protección admin-----------
+def require_admin():
+    token = request.headers.get('x-admin-token')
+    if not token or token != os.getenv('ADMIN_TOKEN'):
+        return jsonify({"error": "unauthorized"}), 401
+        
 # ---------------- Config ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL.startswith("postgres://"):
@@ -480,6 +486,9 @@ def dispensers_list():
 
 @app.put("/api/dispensers/<int:did>")
 def dispensers_update(did):
+    ra = require_admin()
+    if ra:
+        return ra
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
     if "nombre" in data: d.nombre = str(data["nombre"]).strip()
