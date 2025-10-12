@@ -17,12 +17,19 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import UniqueConstraint, text as sqltext, and_
 import paho.mqtt.client as mqtt
 from helpers.notify_telegram import notify_telegram
+import os
+from flask import request, jsonify
 
 #------Protección admin-----------
 def require_admin():
-    token = request.headers.get("x-admin-token", "")
-    admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
-    if token != admin_token:
+    token_hdr = request.headers.get("x-admin-token", "")
+    env_raw = os.getenv("ADMIN_TOKEN") or ""
+    env_stripped = env_raw.strip()
+
+    # LOG a deploy logs para ver exactamente qué llega
+    print(f"[ADMIN DEBUG] hdr={repr(token_hdr)} raw={repr(env_raw)} stripped={repr(env_stripped)} len_hdr={len(token_hdr)} len_env={len(env_stripped)}")
+
+    if token_hdr != env_stripped:
         return jsonify({"error": "unauthorized"}), 401
     return None
         
@@ -975,6 +982,18 @@ def admin_reset_dispenser():
         db.session.rollback()
         return json_error("reset_failed", 500, str(e))
 
+# --- Debug admin token (temporal) ---
+@app.get("/api/_debug/admin")
+def debug_admin():
+    token_hdr = request.headers.get("x-admin-token", "")
+    env_raw = os.getenv("ADMIN_TOKEN") or ""
+    env_stripped = env_raw.strip()
+    return jsonify({
+        "hdr": repr(token_hdr),
+        "env": repr(env_stripped),
+        "equal": token_hdr == env_stripped
+    })
+# --- /Debug admin token ---
 # ------------------- Operadores (Admin) -------------------
 @app.get("/api/admin/operator_tokens")
 def admin_operator_list():
