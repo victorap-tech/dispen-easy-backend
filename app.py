@@ -21,29 +21,32 @@ import os
 from flask import request, jsonify
 
 #------Protección admin-----------
+# -------- Protección admin --------
 def require_admin():
-    # Acepta múltiples variantes de encabezado
+    # Captura de headers con fallback en WSGI
     token_hdr = (
         request.headers.get("x-admin-secret")
         or request.headers.get("x_admin_secret")
         or request.headers.get("x-admin-token")
         or request.headers.get("x_admin_token")
+        or request.environ.get("HTTP_X_ADMIN_SECRET")
+        or request.environ.get("HTTP_X_ADMIN_TOKEN")
         or ""
     )
 
-    # Lee las variables del entorno
+    # Variable de entorno
     env_raw = (
         os.getenv("ADMIN_SECRET")
         or os.getenv("ADMIN_TOKEN")
         or ""
     )
 
-    # Limpieza de espacios y comillas
+    # Limpieza de comillas y espacios
     token_hdr = token_hdr.strip().strip("'").strip('"')
     env_stripped = env_raw.strip().strip("'").strip('"')
 
-    # Log en consola
-    print(f"[ADMIN DEBUG] header={repr(token_hdr)} env={repr(env_stripped)}")
+    # Registro de debug visible en logs Railway
+    print(f"[ADMIN DEBUG] Header={repr(token_hdr)} Env={repr(env_stripped)}")
 
     # Validación
     if token_hdr != env_stripped:
