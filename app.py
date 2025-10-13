@@ -60,9 +60,10 @@ app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},
+    resources={r"/api/*": {"origins": ["https://dispen-easy-web-production.up.railway.app"]}},
     allow_headers=["Content-Type", "x-admin-secret", "x-admin-token", "x-operator-token"],
     expose_headers=["Content-Type"],
 )
