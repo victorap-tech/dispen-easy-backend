@@ -390,33 +390,35 @@ def _mqtt_on_message(client, userdata, msg):
 
     # Estado ONLINE/OFFLINE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
+    try:
+        data = _json.loads(raw or "{}")
+    except Exception:
+        return
+
+    dev = str(data.get("device") or "").strip()
+    st = str(data.get("status") or "").lower().strip()
+    if not dev or st not in ("online", "offline"):
+        return
+
+    now = time.time()
+    last_status[dev] = {"status": st, "t": now}
+    _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
+
+    if st == "offline":
+        # cancelar timer de ONLINE
+        t_old = _online_timers.get(dev)
         try:
-            data = _json.loads(raw or "{}")
+            if t_old:
+                t_old.cancel()
         except Exception:
-            return
-        dev = str(data.get("device") or "").strip()
-        st  = str(data.get("status") or "").lower().strip()
-        if not dev or st not in ("online", "offline"):
-            return
-        now = time.time()
-        last_status[dev] = {"status": st, "t": now}
-        _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
+            pass
+        with app.app_context():
+            _device_notify(dev, "offline")
+        return
 
-        if st == "offline":
-            # Si había un timer pendiente para ONLINE, cancelarlo
-            t_old = _online_timers.get(dev)
-            try:
-                if t_old:
-                    t_old.cancel()
-            except Exception:
-                pass
-
-            # Notificar SOLO si lo último notificado no fue "offline"
-            if _last_notified_status[dev] != "offline":
-                _last_notified_status[dev] = "offline"
-                with app.app_context():
-                    _device_notify(dev, "offline")
-            return
+    if st == "online":
+        _schedule_online_notify(dev, now)
+        return
 
         # st == "online" -> programar notificación con debounce
         _schedule_online_notify(dev, now)
