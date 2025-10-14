@@ -414,13 +414,22 @@ def _mqtt_on_message(client, userdata, msg):
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
         if st == "offline":
-            _last_sent_ts[dev]["offline"] = now
-            _last_notified_status[dev] = "offline"
-            with app.app_context():
-                _device_notify(dev, "offline")
+            # Si había un timer pendiente para ONLINE, cancelarlo
+            t_old = _online_timers.get(dev)
+            try:
+                if t_old:
+                    t_old.cancel()
+            except Exception:
+                pass
+
+            # Notificar SOLO si lo último notificado no fue "offline"
+            if _last_notified_status[dev] != "offline":
+                _last_notified_status[dev] = "offline"
+                with app.app_context():
+                    _device_notify(dev, "offline")
             return
 
-        # st == "online" -> programar notificación diferida
+        # st == "online" -> programar notificación con debounce
         _schedule_online_notify(dev, now)
         return
 
