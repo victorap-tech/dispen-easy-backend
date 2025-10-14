@@ -350,12 +350,29 @@ def _schedule_online_notify(dev: str, ts_mark: float):
     t = threading.Timer(ON_DEBOUNCE_S, _do)
     t.daemon = True
     _online_timers[dev] = t
-    t.start()
+   t.start()
+
+# --- Enviar mensajes ONLINE/OFFLINE con control anti-spam ---
+_last_notified_status = defaultdict(lambda: "")
+_last_sent_ts = defaultdict(lambda: {"online": 0.0, "offline": 0.0})
+COOLDOWN_S = 30 * 60  # 30 minutos
 
 def _device_notify(dev: str, status: str):
     disp = Dispenser.query.filter(Dispenser.device_id == dev).first()
     disp_id = disp.id if disp else None
     icon = "✅" if status == "online" else "⚠️"
+
+    now = time.time()
+    last_sent = _last_sent_ts[dev][status]
+    last_status = _last_notified_status[dev]
+
+    # Evita enviar si ya notificó ese mismo estado hace poco
+    if last_status == status and (now - last_sent) < COOLDOWN_S:
+        app.logger.info(f"[NOTIFY] Ignorado {dev} {status} (cooldown activo)")
+        return
+
+    _last_sent_ts[dev][status] = now
+    _last_notified_status[dev] = status
     tg_notify_all(f"{icon} {dev}: {status.upper()}", dispenser_id=disp_id)
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
