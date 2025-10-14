@@ -318,51 +318,23 @@ def sse_stream():
                 except Exception: pass
     return Response(gen(), mimetype="text/event-stream")
 
-# Estado online/offline
-last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
-_last_notified_status = defaultdict(lambda: "")   # "online"/"offline"
-_last_sent_ts = defaultdict(lambda: {"online": 0.0, "offline": 0.0})
+# ===================== Control de estados ONLINE / OFFLINE =====================
+from collections import defaultdict
+import threading, time
 
-OFF_DEBOUNCE_S = 0
-ON_DEBOUNCE_S  = 5
-COOLDOWN_S = 0 # 30 min
-
-# Timer para notificar ONLINE tras debounce
-_online_timers = {}
-
-def _schedule_online_notify(dev: str, ts_mark: float):
-    def _do():
-        rec = last_status.get(dev, {"status": "unknown", "t": 0})
-        # Sigue online desde que se programó
-        if rec["status"] != "online" or rec["t"] < ts_mark:
-            return
-        # Notificar SOLO si el último aviso no fue "online"
-        if _last_notified_status[dev] != "online":
-            _last_notified_status[dev] = "online"
-            with app.app_context():
-                _device_notify(dev, "online")
-
-    # cancelar timer previo (si lo había) y re-programar
-    t_old = _online_timers.get(dev)
-    try:
-        if t_old:
-            t_old.cancel()
-    except Exception:
-        pass
-    t = threading.Timer(ON_DEBOUNCE_S, _do)
-    t.daemon = True
-    _online_timers[dev] = t
-    t.start()
-
-# --- Enviar mensajes ONLINE/OFFLINE con control anti-spam ---
 _last_notified_status = defaultdict(lambda: "")
+_online_timers = {}
+last_status = {}
+
+ON_DEBOUNCE_S = 5   # segundos para confirmar ONLINE
+OFF_DEBOUNCE_S = 0  # sin demora para OFFLINE
 
 def _device_notify(dev: str, status: str):
+    """Envía notificación a Telegram solo si hay cambio de estado."""
     disp = Dispenser.query.filter(Dispenser.device_id == dev).first()
     disp_id = disp.id if disp else None
     icon = "✅" if status == "online" else "⚠️"
 
-    # Solo notificar si hubo un cambio respecto al último estado enviado
     last_state = _last_notified_status[dev]
     if last_state != status:
         _last_notified_status[dev] = status
@@ -371,14 +343,28 @@ def _device_notify(dev: str, status: str):
     else:
         app.logger.info(f"[NOTIFY] Ignorado {dev} {status} (sin cambio)")
 
-    # Evita enviar si ya notificó ese mismo estado hace poco
-    if last_status == status and (now - last_sent) < COOLDOWN_S:
-        app.logger.info(f"[NOTIFY] Ignorado {dev} {status} (cooldown activo)")
-        return
+def _schedule_online_notify(dev: str, ts_mark: float):
+    """Espera unos segundos antes de confirmar ONLINE."""
+    def _do():
+        rec = last_status.get(dev, {"status": "unknown", "t": 0})
+        if rec["status"] != "online" or rec["t"] < ts_mark:
+            return
+        if _last_notified_status[dev] != "online":
+            _last_notified_status[dev] = "online"
+            with app.app_context():
+                _device_notify(dev, "online")
 
-    _last_sent_ts[dev][status] = now
-    _last_notified_status[dev] = status
-    tg_notify_all(f"{icon} {dev}: {status.upper()}", dispenser_id=disp_id)
+    t_old = _online_timers.get(dev)
+    try:
+        if t_old:
+            t_old.cancel()
+    except Exception:
+        pass
+
+    t = threading.Timer(ON_DEBOUNCE_S, _do)
+    t.daemon = True
+    _online_timers[dev] = t
+    t.start()
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
     app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {topic_state_wild()} {topic_status_wild()} {topic_event_wild()}")
