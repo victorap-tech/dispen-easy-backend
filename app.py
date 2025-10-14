@@ -329,22 +329,24 @@ COOLDOWN_S = 0 # 30 min
 
 # Timer para notificar ONLINE tras debounce
 _online_timers = {}
+
 def _schedule_online_notify(dev: str, ts_mark: float):
     def _do():
-        rec = last_status.get(dev, {"status":"unknown","t":0})
+        rec = last_status.get(dev, {"status": "unknown", "t": 0})
+        # Sigue online desde que se programó
         if rec["status"] != "online" or rec["t"] < ts_mark:
             return
-        now = time.time()
-        last_sent = _last_sent_ts[dev]["online"]
-        if now - last_sent < COOLDOWN_S and _last_notified_status[dev] == "online":
-            return
-        _last_sent_ts[dev]["online"] = now
-        _last_notified_status[dev] = "online"
-        with app.app_context():
-            _device_notify(dev, "online")
+        # Notificar SOLO si el último aviso no fue "online"
+        if _last_notified_status[dev] != "online":
+            _last_notified_status[dev] = "online"
+            with app.app_context():
+                _device_notify(dev, "online")
+
+    # cancelar timer previo (si lo había) y re-programar
     t_old = _online_timers.get(dev)
     try:
-        if t_old: t_old.cancel()
+        if t_old:
+            t_old.cancel()
     except Exception:
         pass
     t = threading.Timer(ON_DEBOUNCE_S, _do)
