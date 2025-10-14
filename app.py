@@ -390,9 +390,9 @@ def _mqtt_on_message(client, userdata, msg):
 
     # Estado ONLINE/OFFLINE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-    try:
-        data = _json.loads(raw or "{}")
-    except Exception:
+        try:
+           data = _json.loads(raw or "{}")
+        except Exception:
         return
 
     dev = str(data.get("device") or "").strip()
