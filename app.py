@@ -325,7 +325,7 @@ _last_sent_ts = defaultdict(lambda: {"online": 0.0, "offline": 0.0})
 
 OFF_DEBOUNCE_S = 0
 ON_DEBOUNCE_S  = 5
-COOLDOWN_S = 30 * 60  # 30 min
+COOLDOWN_S = 0 # 30 min
 
 # Timer para notificar ONLINE tras debounce
 _online_timers = {}
