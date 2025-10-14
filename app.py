@@ -388,37 +388,37 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-    # Estado ONLINE/OFFLINE
+   # Estado ONLINE/OFFLINE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
-           data = _json.loads(raw or "{}")
+            data = _json.loads(raw or "{}")
         except Exception:
-        return
+            return
 
-    dev = str(data.get("device") or "").strip()
-    st = str(data.get("status") or "").lower().strip()
-    if not dev or st not in ("online", "offline"):
-        return
+        dev = str(data.get("device") or "").strip()
+        st = str(data.get("status") or "").lower().strip()
+        if not dev or st not in ("online", "offline"):
+            return
 
-    now = time.time()
-    last_status[dev] = {"status": st, "t": now}
-    _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
+        now = time.time()
+        last_status[dev] = {"status": st, "t": now}
+        _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-    if st == "offline":
-        # cancelar timer de ONLINE
-        t_old = _online_timers.get(dev)
-        try:
-            if t_old:
-                t_old.cancel()
-        except Exception:
-            pass
-        with app.app_context():
-            _device_notify(dev, "offline")
-        return
+        if st == "offline":
+            # cancelar timer de ONLINE
+            t_old = _online_timers.get(dev)
+            try:
+                if t_old:
+                    t_old.cancel()
+            except Exception:
+                pass
+            with app.app_context():
+                _device_notify(dev, "offline")
+            return
 
-    if st == "online":
-        _schedule_online_notify(dev, now)
-        return
+        if st == "online":
+            _schedule_online_notify(dev, now)
+            return
 
         # st == "online" -> programar notificación con debounce
         _schedule_online_notify(dev, now)
