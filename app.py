@@ -419,7 +419,7 @@ def _mqtt_on_message(client, userdata, msg):
         if st == "online":
            _last_notified_status[dev] = "offline"  # <-- fuerza a reenviar notificación
            _schedule_online_notify(dev, now)
-            return
+           return
 
     # Estado dispensa → actualizar stock si llega "done"
     try: data = _json.loads(raw or "{}")
