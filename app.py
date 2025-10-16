@@ -420,8 +420,7 @@ def _mqtt_on_message(client, userdata, msg):
              # Forzamos la notificación ONLINE cada vez que se reconecta
            _last_notified_status[dev] = "offline"  # <-- fuerza cambio
            _schedule_online_notify(dev, now)
-           app.logger.info(f"[MQTT] Forzado aviso ONLINE para 
-         {dev}")
+           app.logger.info(f"[MQTT] Forzado aviso ONLINE para {dev}")
            return
 
     # Estado dispensa → actualizar stock si llega "done"
