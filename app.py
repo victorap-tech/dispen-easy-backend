@@ -389,40 +389,39 @@ def _mqtt_on_message(client, userdata, msg):
         return
 
    # Estado ONLINE/OFFLINE
-if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-    try:
-        data = _json.loads(raw or "{}")
-    except Exception:
-        return
-
-    dev = str(data.get("device") or "").strip()
-    st = str(data.get("status") or "").lower().strip()
-    if not dev or st not in ("online", "offline"):
-        return
-
-    now = time.time()
-    last_status[dev] = {"status": st, "t": now}
-    _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
-
-    if st == "offline":
-        # cancelar timer de ONLINE
-        t_old = _online_timers.get(dev)
+    if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
-            if t_old:
-                t_old.cancel()
+            data = _json.loads(raw or "{}")
         except Exception:
-            pass
-        with app.app_context():
-            _device_notify(dev, "offline")
-        return
+            return
 
-    if st == "online":
-        # 🔥 Notificar inmediatamente, sin debounce
-        with app.app_context():
-            _device_notify(dev, "online")
-        app.logger.info(f"[MQTT] Notificación ONLINE inmediata para {dev}")
-        return
+        dev = str(data.get("device") or "").strip()
+        st = str(data.get("status") or "").lower().strip()
+        if not dev or st not in ("online", "offline"):
+            return
 
+        now = time.time()
+        last_status[dev] = {"status": st, "t": now}
+        _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
+
+        if st == "offline":
+            # cancelar timer de ONLINE
+            t_old = _online_timers.get(dev)
+            try:
+                if t_old:
+                    t_old.cancel()
+            except Exception:
+                pass
+            with app.app_context():
+                _device_notify(dev, "offline")
+            return
+
+        if st == "online":
+            # 🔥 Notificar inmediatamente, sin debounce
+            with app.app_context():
+                _device_notify(dev, "online")
+            app.logger.info(f"[MQTT] Notificación ONLINE inmediata para {dev}")
+            return
     # Estado dispensa → actualizar stock si llega "done"
     try: data = _json.loads(raw or "{}")
     except Exception: return
