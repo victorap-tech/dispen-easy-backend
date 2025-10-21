@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ingreso al Panel de Operador</title>
+  <style>
+    body {
+      background-color: #121212;
+      color: #eee;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .login-box {
+      background-color: #1f1f1f;
+      border-radius: 12px;
+      padding: 40px 50px;
+      text-align: center;
+      box-shadow: 0 0 15px rgba(0, 0, 0, 0.4);
+    }
+    h2 {
+      margin-bottom: 25px;
+      color: #00bcd4;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      margin: 10px 0 20px 0;
+      border: none;
+      border-radius: 8px;
+      background-color: #2a2a2a;
+      color: white;
+      font-size: 16px;
+      outline: none;
+    }
+    input[type="text"]::placeholder {
+      color: #aaa;
+    }
+    button {
+      background-color: #00bcd4;
+      color: white;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      transition: background-color 0.2s;
+    }
+    button:hover {
+      background-color: #009fb8;
+    }
+    .msg {
+      color: #ff5252;
+      margin-top: 15px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-box">
+    <h2>Ingreso al Panel de Operador</h2>
+    <p>Ingrese su token para acceder al panel correspondiente.</p>
+    <input type="text" id="token" placeholder="Token del operador" />
+    <button onclick="enviarToken()">Ingresar</button>
+    <div class="msg" id="msgError">Token inválido</div>
+  </div>
+
+  <script>
+    async function enviarToken() {
+      const token = document.getElementById("token").value.trim();
+      const msgError = document.getElementById("msgError");
+      msgError.style.display = "none";
+
+      if (!token) {
+        msgError.innerText = "Ingrese su token.";
+        msgError.style.display = "block";
+        return;
+      }
+
+      try {
+        const res = await fetch("/operator_login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          localStorage.setItem("operator_token", token);
+          window.location.href = data.redirect;
+        } else {
+          msgError.innerText = data.error || "Token inválido";
+          msgError.style.display = "block";
+        }
+      } catch (err) {
+        msgError.innerText = "Error de conexión con el servidor";
+        msgError.style.display = "block";
+      }
+    }
+
+    // Autoingreso si ya hay token guardado
+    window.addEventListener("load", () => {
+      const savedToken = localStorage.getItem("operator_token");
+      if (savedToken) {
+        fetch("/operator_login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: savedToken }),
+        })
+        .then(res => res.json())
+        .then(data => {
+          if (data.success) window.location.href = data.redirect;
+        });
+      }
+    });
+  </script>
+</body>
+</html>
