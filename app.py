@@ -1234,6 +1234,16 @@ def vincular_mp():
 
     return _html("Vinculación MercadoPago", html)
 
+# ============ DEBUG ADMIN SECRET ============
+@app.get("/api/_debug/admin")
+def debug_admin_secret():
+    env = _admin_env()
+    hdr = _admin_header()
+    return jsonify({
+        "ok": True,
+        "admin_env": env,
+        "header_recibido": hdr
+    })
 # ============ MQTT init ============
 
 with app.app_context():
