@@ -146,6 +146,11 @@ with app.app_context():
         db.session.commit()
     except Exception:
         db.session.rollback()
+    try:
+        db.session.execute(sqltext("ALTER TABLE operator_token ADD COLUMN IF NOT EXISTS mp_access_token VARCHAR(255)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 # ============ Serializers y utils ============
 
