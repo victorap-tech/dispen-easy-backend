@@ -1199,6 +1199,40 @@ def ui_seleccionar():
     )
     r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
+# ======================================================
+# ===  Panel de vinculación para operadores  ============
+# ======================================================
+
+@app.get("/vincular_mp")
+def vincular_mp():
+    """Panel simple donde el operador puede vincular su cuenta de MercadoPago."""
+    token = request.args.get("token") or request.headers.get("x-operator-token")
+    if not token:
+        return _html("Vinculación MercadoPago", "<p>Falta token del operador.</p>")
+
+    op = OperatorToken.query.get(token)
+    if not op:
+        return _html("Error", "<p>Operador no encontrado.</p>")
+
+    # Verificar si ya tiene una cuenta vinculada
+    if op.mp_access_token:
+        html = f"""
+        <h3>Cuenta de MercadoPago ya vinculada ✅</h3>
+        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
+        <p>Podés desvincularla si es necesario.</p>
+        """
+    else:
+        # Mostrar botón para iniciar OAuth
+        auth_url = f"{BACKEND_BASE_URL}/api/mp/oauth_start?token={token}"
+        html = f"""
+        <h3>Vincular cuenta de MercadoPago</h3>
+        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
+        <p>Actualmente no hay cuenta vinculada.</p>
+        <a href="{auth_url}" style="background:#009EE3;color:white;padding:10px 20px;text-decoration:none;border-radius:8px;">Vincular MercadoPago</a>
+        """
+
+    return _html("Vinculación MercadoPago", html)
+
 # ============ MQTT init ============
 
 with app.app_context():
