@@ -485,6 +485,70 @@ def api_set_mode():
     kv = KV.query.get("mp_mode") or KV(key="mp_mode", value=mode); kv.value = mode
     db.session.merge(kv); db.session.commit()
     return ok_json({"ok": True, "mp_mode": mode})
+# ======================================================
+# ===  Vinculación MercadoPago por operador (OAuth)  ===
+# ======================================================
+
+@app.get("/api/mp/oauth_start")
+def mp_oauth_start():
+    """Devuelve la URL de autorización de MercadoPago para vincular una cuenta."""
+    operator = _operator_from_header()
+    if not operator:
+        return json_error("Token de operador inválido", 401)
+    client_id = os.getenv("MP_CLIENT_ID", "")
+    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth_callback"
+    if not client_id:
+        return json_error("CLIENT_ID no configurado", 500)
+
+    url = (
+        f"https://auth.mercadopago.com.ar/authorization?"
+        f"response_type=code&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}&state={operator.token}"
+    )
+    return ok_json({"ok": True, "url": url})
+
+
+@app.get("/api/mp/oauth_callback")
+def mp_oauth_callback():
+    """Callback de MercadoPago que guarda el access_token del operador."""
+    code = request.args.get("code")
+    state = request.args.get("state")  # contiene el token del operador
+    if not code or not state:
+        return _html("Error", "<p>Falta código o estado en la respuesta.</p>")
+
+    client_id = os.getenv("MP_CLIENT_ID", "")
+    client_secret = os.getenv("MP_CLIENT_SECRET", "")
+    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth_callback"
+
+    try:
+        r = requests.post(
+            "https://api.mercadopago.com/oauth/token",
+            data={
+                "client_secret": client_secret,
+                "client_id": client_id,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=20,
+        )
+        data = r.json()
+    except Exception as e:
+        return _html("Error", f"<p>Error solicitando token: {e}</p>")
+
+    access_token = data.get("access_token")
+    if not access_token:
+        return _html("Error", "<p>No se recibió access_token de MercadoPago.</p>")
+
+    op = OperatorToken.query.get(state)
+    if not op:
+        return _html("Error", "<p>Operador no encontrado.</p>")
+    op.mp_access_token = access_token
+    db.session.commit()
+
+    msg = f"✅ Cuenta de MercadoPago vinculada correctamente para operador '{op.nombre or op.token[:6]}'"
+    tg_notify_all(msg, dispenser_id=op.dispenser_id)
+    return _html("Cuenta vinculada", f"<p>{msg}</p>")
 
 # ============ Dispensers/Productos CRUD ============
 
