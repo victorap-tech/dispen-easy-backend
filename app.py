@@ -1259,19 +1259,6 @@ def operator_login():
     return render_template("operator_login.html")
 
 
-# =======================
-# DEBUG ADMIN SECRET
-# =======================
-
-@app.get("/api/_debug/admin")
-def debug_admin_secret():
-    env = _admin_env()
-    hdr = _header_received()
-    return jsonify({
-        "ok": True,
-        "admin_env": env,
-        "header_recibido": hdr
-    })
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
