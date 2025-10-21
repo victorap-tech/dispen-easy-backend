@@ -1233,15 +1233,6 @@ def vincular_mp():
         """
 
     return _html("Vinculación MercadoPago", html)
-# =======================
-# Vinculación MercadoPago
-# =======================
-
-@app.route("/vincular_mp")
-def vincular_mp():
-    ...
-    return html("Vinculación MercadoPago", html)
-
 
 # =======================
 # Ingreso por Token (nuevo)
