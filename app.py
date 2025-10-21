@@ -127,6 +127,7 @@ class OperatorToken(db.Model):
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     chat_id = db.Column(db.String(40), nullable=True, default="")  # Telegram del cliente
+    mp_access_token = db.Column(db.String(255), nullable=True)  # Token propio de MercadoPago (OAuth)
 
 with app.app_context():
     db.create_all()
