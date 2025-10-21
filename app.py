@@ -251,6 +251,7 @@ def _auth_guard():
     p = request.path
     PUBLIC_PATHS = {
         "/", "/gracias", "/sin-stock",
+        "/vincular_mp",
         "/api/mp/webhook", "/webhook", "/mp/webhook",
         "/api/pagos/preferencia", "/api/pagos/pendiente",
         "/api/config", "/go", "/ui/seleccionar",
