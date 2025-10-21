@@ -1233,7 +1233,54 @@ def vincular_mp():
         """
 
     return _html("Vinculación MercadoPago", html)
+# =======================
+# Vinculación MercadoPago
+# =======================
 
+@app.route("/vincular_mp")
+def vincular_mp():
+    ...
+    return html("Vinculación MercadoPago", html)
+
+
+# =======================
+# Ingreso por Token (nuevo)
+# =======================
+
+@app.route("/operator_login", methods=["GET", "POST"])
+def operator_login():
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        token = (data.get("token") or "").strip()
+
+        op = OperatorToken.query.filter_by(token=token).first()
+        if not op:
+            return jsonify({"error": "Token inválido"}), 401
+
+        # Redirige al panel del operador correspondiente
+        return jsonify({
+            "success": True,
+            "redirect": f"/operator?token={token}",
+            "nombre": op.nombre
+        })
+
+    # Si es GET, solo muestra la página HTML de ingreso
+    return render_template("operator_login.html")
+
+
+# =======================
+# DEBUG ADMIN SECRET
+# =======================
+
+@app.get("/api/_debug/admin")
+def debug_admin_secret():
+    env = _admin_env()
+    hdr = _header_received()
+    return jsonify({
+        "ok": True,
+        "admin_env": env,
+        "header_recibido": hdr
+    })
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
