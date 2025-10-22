@@ -1028,14 +1028,25 @@ def _operator_from_header() -> OperatorToken | None:
 @app.get("/api/operator/productos")
 def operator_productos():
     t = _operator_from_header()
-    if not t or not t.activo: return json_error("token inválido o inactivo", 401)
+    if not t or not t.activo:
+        return json_error("token inválido o inactivo", 401)
+
     prods = Producto.query.filter(Producto.dispenser_id == t.dispenser_id).order_by(Producto.slot_id.asc()).all()
     out = []
     for p in prods:
-        d = serialize_producto(p)
+        d = serialise_producto(p)
         d["dispenser_nombre"] = (Dispenser.query.get(p.dispenser_id).nombre if p.dispenser_id else "")
         out.append(d)
-    return ok_json({"ok": True, "productos": out, "operator": {"nombre": t.nombre or "", "dispenser_id": t.dispenser_id}})
+
+    return ok_json({
+        "ok": True,
+        "productos": out,
+        "operator": {
+            "nombre": t.nombre,
+            "dispenser_id": t.dispenser_id,
+            "chat_id": t.telegram   # ✅ agrega el chat_id (vinculado a Telegram)
+        }
+    })
 
 @app.post("/api/operator/productos/reponer")
 def operator_reponer():
