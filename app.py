@@ -487,9 +487,9 @@ def api_set_mode():
     kv = KV.query.get("mp_mode") or KV(key="mp_mode", value=mode); kv.value = mode
     db.session.merge(kv); db.session.commit()
     return ok_json({"ok": True, "mp_mode": mode})
-# ======================================================
-# ===  Vinculación MercadoPago por operador (OAuth)  ===
-# ======================================================
+# =====================================
+# VINCULACIÓN MERCADOPAGO POR OPERADOR (OAuth)
+# =====================================
 
 @app.get("/api/mp/oauth_start")
 def mp_oauth_start():
@@ -497,10 +497,14 @@ def mp_oauth_start():
     operator = _operator_from_header()
     if not operator:
         return json_error("Token de operador inválido", 401)
+
     client_id = os.getenv("MP_CLIENT_ID", "")
-    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth_callback"
     if not client_id:
         return json_error("CLIENT_ID no configurado", 500)
+
+    # ✅ Usa BACKEND_BASE_URL si existe, o el dominio actual como respaldo
+    redirect_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    redirect_uri = f"{redirect_base}/api/mp/oauth_callback"
 
     url = (
         f"https://auth.mercadopago.com.ar/authorization?"
@@ -512,45 +516,52 @@ def mp_oauth_start():
 
 @app.get("/api/mp/oauth_callback")
 def mp_oauth_callback():
-    """Callback de MercadoPago que guarda el access_token del operador."""
+    """Callback que MercadoPago llama luego de la autorización."""
     code = request.args.get("code")
-    state = request.args.get("state")  # contiene el token del operador
+    state = request.args.get("state")  # token del operador
     if not code or not state:
-        return _html("Error", "<p>Falta código o estado en la respuesta.</p>")
+        return json_error("Faltan parámetros", 400)
+
+    op = OperatorToken.query.filter_by(token=state).first()
+    if not op:
+        return json_error("Token de operador inválido", 401)
 
     client_id = os.getenv("MP_CLIENT_ID", "")
     client_secret = os.getenv("MP_CLIENT_SECRET", "")
-    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth_callback"
+    if not client_id or not client_secret:
+        return json_error("Credenciales MP faltantes", 500)
 
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/oauth/token",
-            data={
-                "client_secret": client_secret,
-                "client_id": client_id,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            timeout=20,
-        )
-        data = r.json()
-    except Exception as e:
-        return _html("Error", f"<p>Error solicitando token: {e}</p>")
+    # ✅ Igual que arriba, usamos redirect_base para que funcione en Railway o local
+    redirect_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    redirect_uri = f"{redirect_base}/api/mp/oauth_callback"
 
-    access_token = data.get("access_token")
+    # Pedimos el access_token a MercadoPago
+    import requests
+    token_url = "https://api.mercadopago.com/oauth/token"
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+
+    r = requests.post(token_url, data=data)
+    if r.status_code != 200:
+        return json_error(f"Error al obtener token: {r.text}", 400)
+
+    mp_data = r.json()
+    access_token = mp_data.get("access_token")
+    user_id = mp_data.get("user_id")
+
     if not access_token:
-        return _html("Error", "<p>No se recibió access_token de MercadoPago.</p>")
+        return json_error("MercadoPago no devolvió access_token", 400)
 
-    op = OperatorToken.query.get(state)
-    if not op:
-        return _html("Error", "<p>Operador no encontrado.</p>")
     op.mp_access_token = access_token
+    op.mp_user_id = str(user_id)
     db.session.commit()
 
-    msg = f"✅ Cuenta de MercadoPago vinculada correctamente para operador '{op.nombre or op.token[:6]}'"
-    tg_notify_all(msg, dispenser_id=op.dispenser_id)
-    return _html("Cuenta vinculada", f"<p>{msg}</p>")
+    return ok_json({"ok": True, "mensaje": "Cuenta vinculada correctamente"})
 
 # ============ Dispensers/Productos CRUD ============
 
