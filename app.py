@@ -10,7 +10,7 @@ from collections import defaultdict
 from queue import Queue
 from threading import Lock
 
-from flask import Flask, jsonify, request, make_response, Response, render_template
+from flask import Flask, jsonify, request, make_response, Response, render_template, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1258,6 +1258,22 @@ def operator_login():
     # Si es GET, solo muestra la página HTML de ingreso
     return render_template("operator_login.html")
 
+# =====================================
+# PANEL DEL OPERADOR
+# =====================================
+@app.route("/operator")
+def operator_panel():
+    token = request.args.get("token")
+
+    # Verifica si el token existe y está activo
+    from database import OperatorToken  # importa tu modelo si no está arriba
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
+
+    if not op:
+        return jsonify({"error": "unauthorized"}), 401
+
+    # Si es válido, muestra la página del panel
+    return render_template("operator.html", token=token)
 
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
