@@ -1044,7 +1044,7 @@ def operator_productos():
         "operator": {
             "nombre": t.nombre,
             "dispenser_id": t.dispenser_id,
-            "chat_id": t.telegram   # ✅ agrega el chat_id (vinculado a Telegram)
+            "chat_id": t.chat_id   # ✅ usa el atributo correcto
         }
     })
 
