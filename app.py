@@ -1097,6 +1097,25 @@ def operator_link():
     tg_notify_all(f"🔗 Operador vinculado: '{t.nombre or t.token[:6]}' → dispenser {t.dispenser_id}", dispenser_id=t.dispenser_id)
     return ok_json({"ok": True})
 
+@app.post("/api/operator/unlink")
+def operator_unlink():
+    """Permite desvincular el chat_id (Telegram) del operador."""
+    data = request.get_json(force=True, silent=True) or {}
+    tok = (data.get("token") or "").strip()
+    if not tok:
+        return json_error("token requerido", 400)
+    t = OperatorToken.query.get(tok)
+    if not t:
+        return json_error("token inválido", 404)
+
+    t.chat_id = ""
+    db.session.commit()
+    tg_notify_all(
+        f"❌ Operador desvinculado de Telegram: '{t.nombre or t.token[:6]}' (disp {t.dispenser_id})",
+        dispenser_id=t.dispenser_id
+    )
+    return ok_json({"ok": True})
+
 # Gracias / Sin stock
 @app.get("/gracias")
 def pagina_gracias():
