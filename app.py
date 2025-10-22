@@ -1034,7 +1034,7 @@ def operator_productos():
     prods = Producto.query.filter(Producto.dispenser_id == t.dispenser_id).order_by(Producto.slot_id.asc()).all()
     out = []
     for p in prods:
-        d = serialise_producto(p)
+        d = serialize_producto(p)
         d["dispenser_nombre"] = (Dispenser.query.get(p.dispenser_id).nombre if p.dispenser_id else "")
         out.append(d)
 
