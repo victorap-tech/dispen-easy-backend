@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ingreso al Panel de Operador</title>
+  <title>Ingreso al Panel de Operador · Dispen-Easy</title>
   <style>
     body {
-      background-color: #121212;
-      color: #eee;
-      font-family: 'Segoe UI', sans-serif;
+      background-color: #0b1220;
+      color: #e5e7eb;
+      font-family: "Inter", "Segoe UI", Roboto, sans-serif;
       display: flex;
       justify-content: center;
       align-items: center;
@@ -16,107 +16,109 @@
       margin: 0;
     }
     .login-box {
-      background-color: #1f1f1f;
-      border-radius: 12px;
-      padding: 40px 50px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 32px;
+      width: 320px;
       text-align: center;
-      box-shadow: 0 0 15px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     }
     h2 {
-      margin-bottom: 25px;
-      color: #00bcd4;
+      margin-bottom: 10px;
+      color: #00b4ff;
     }
-    input[type="text"] {
+    p {
+      margin-top: 0;
+      margin-bottom: 20px;
+      font-size: 14px;
+      opacity: 0.85;
+    }
+    input {
       width: 100%;
-      padding: 12px;
-      margin: 10px 0 20px 0;
-      border: none;
+      padding: 10px;
       border-radius: 8px;
-      background-color: #2a2a2a;
-      color: white;
+      border: none;
+      text-align: center;
       font-size: 16px;
+      margin-bottom: 12px;
       outline: none;
     }
-    input[type="text"]::placeholder {
-      color: #aaa;
-    }
     button {
-      background-color: #00bcd4;
-      color: white;
+      width: 100%;
+      padding: 10px;
       border: none;
-      padding: 12px 20px;
       border-radius: 8px;
-      cursor: pointer;
+      background-color: #009ee3;
+      color: white;
       font-size: 16px;
-      transition: background-color 0.2s;
+      cursor: pointer;
+      transition: 0.2s;
     }
     button:hover {
-      background-color: #009fb8;
+      background-color: #00b7ff;
     }
-    .msg {
-      color: #ff5252;
-      margin-top: 15px;
-      display: none;
+    #msg {
+      margin-top: 14px;
+      font-size: 14px;
+      color: #fca5a5;
+    }
+    .footer {
+      margin-top: 20px;
+      font-size: 12px;
+      opacity: 0.6;
     }
   </style>
 </head>
 <body>
   <div class="login-box">
-    <h2>Ingreso al Panel de Operador</h2>
-    <p>Ingrese su token para acceder al panel correspondiente.</p>
-    <input type="text" id="token" placeholder="Token del operador" />
-    <button onclick="enviarToken()">Ingresar</button>
-    <div class="msg" id="msgError">Token inválido</div>
+    <h2>Panel del Operador</h2>
+    <p>Ingresá tu token para acceder</p>
+    <input id="token" type="text" placeholder="Token de operador" />
+    <button id="loginBtn">Ingresar</button>
+    <p id="msg"></p>
+    <div class="footer">© Dispen-Easy</div>
   </div>
 
   <script>
-    async function enviarToken() {
-      const token = document.getElementById("token").value.trim();
-      const msgError = document.getElementById("msgError");
-      msgError.style.display = "none";
+    document.addEventListener('DOMContentLoaded', () => {
+      const savedToken = localStorage.getItem('operator_token');
+      if (savedToken) {
+        // 🔁 Si ya hay token guardado, ingresar automáticamente
+        window.location.href = `/operator?token=${savedToken}`;
+        return;
+      }
 
+      const btn = document.getElementById('loginBtn');
+      if (btn) btn.addEventListener('click', login);
+    });
+
+    async function login() {
+      const token = document.getElementById('token').value.trim();
+      const msg = document.getElementById('msg');
       if (!token) {
-        msgError.innerText = "Ingrese su token.";
-        msgError.style.display = "block";
+        msg.textContent = 'Ingrese su token.';
         return;
       }
 
       try {
-        const res = await fetch("/operator_login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token }),
+        const res = await fetch('/operator_login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token })
         });
-        const data = await res.json();
-
-        if (data.success) {
-          localStorage.setItem("operator_token", token);
-          window.location.href = data.redirect;
+        const js = await res.json();
+        if (js.success && js.redirect) {
+          // ✅ Guardar token localmente
+          localStorage.setItem('operator_token', token);
+          window.location.href = js.redirect;
         } else {
-          msgError.innerText = data.error || "Token inválido";
-          msgError.style.display = "block";
+          msg.textContent = js.error || 'Token inválido';
         }
-      } catch (err) {
-        msgError.innerText = "Error de conexión con el servidor";
-        msgError.style.display = "block";
+      } catch (e) {
+        msg.textContent = 'Error de conexión con el servidor';
       }
     }
-
-    // Autoingreso si ya hay token guardado
-    window.addEventListener("load", () => {
-      const savedToken = localStorage.getItem("operator_token");
-      if (savedToken) {
-        fetch("/operator_login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: savedToken }),
-        })
-        .then(res => res.json())
-        .then(data => {
-          if (data.success) window.location.href = data.redirect;
-        });
-      }
-    });
   </script>
 </body>
 </html>
