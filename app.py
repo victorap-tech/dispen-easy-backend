@@ -1267,7 +1267,7 @@ def operator_panel():
     token = request.args.get("token")
 
     # Verifica si el token existe y está activo
-    from database import OperatorToken  # importa tu modelo si no está arriba
+    
     op = OperatorToken.query.filter_by(token=token, activo=True).first()
 
     if not op:
@@ -1289,10 +1289,9 @@ def debug_admin_secret():
 
 @app.get("/api/debug/tokens")
 def debug_tokens():
-    from models import OperatorToken
     ops = OperatorToken.query.all()
     return jsonify([
-        {"id": o.id, "nombre": o.nombre, "token": o.token}
+        {"token": o.token, "nombre": (o.nombre or ""), "dispenser_id": o.dispenser_id, "activo": bool(o.activo)}
         for o in ops
     ])
 # ============ MQTT init ============
