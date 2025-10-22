@@ -1270,22 +1270,6 @@ def operator_login():
     # Si es GET, solo muestra la página HTML de ingreso
     return render_template("operator_login.html")
 
-# =====================================
-# PANEL DEL OPERADOR
-# =====================================
-@app.route("/operator")
-def operator_panel():
-    token = request.args.get("token")
-
-    # Verifica si el token existe y está activo
-    
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-
-    if not op:
-        return jsonify({"error": "unauthorized"}), 401
-
-    # Si es válido, muestra la página del panel
-    return render_template("operator.html", token=token)
 
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
