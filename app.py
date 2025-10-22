@@ -1269,6 +1269,15 @@ def debug_admin_secret():
         "admin_env": env,
         "header_recibido": hdr
     })
+
+@app.get("/api/debug/tokens")
+def debug_tokens():
+    from models import OperatorToken
+    ops = OperatorToken.query.all()
+    return jsonify([
+        {"id": o.id, "nombre": o.nombre, "token": o.token}
+        for o in ops
+    ])
 # ============ MQTT init ============
 
 with app.app_context():
