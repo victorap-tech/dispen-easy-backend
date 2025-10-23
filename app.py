@@ -1021,9 +1021,18 @@ def admin_operator_delete(token):
 
 # Operadores (público por token)
 def _operator_from_header() -> OperatorToken | None:
-    tok = (request.headers.get("x-operator-token") or "").strip() or (request.args.get("token") or "").strip()
-    if not tok: return None
-    return OperatorToken.query.get(tok)
+    # Acepta token desde header o query param
+    tok = (
+        request.headers.get("x-operator-token")
+        or request.headers.get("X-Operator-Token")
+        or request.args.get("token")
+        or ""
+    ).strip()
+    if not tok:
+        return None
+
+    # Busca por el campo token, no por ID
+    return OperatorToken.query.filter_by(token=tok, activo=True).first()
 
 @app.get("/api/operator/productos")
 def operator_productos():
