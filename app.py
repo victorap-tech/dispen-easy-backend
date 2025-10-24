@@ -1027,7 +1027,7 @@ def _operator_from_header() -> OperatorToken | None:
     - Parámetro de query: ?token=
     - Campo JSON o form-data: {"token": "..."}
     """
-    tok = (
+tok = (
     request.headers.get("x-operator-token")
     or request.args.get("token")
     or (request.get_json(silent=True) or {}).get("token")
