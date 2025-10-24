@@ -1028,20 +1028,14 @@ def _operator_from_header() -> OperatorToken | None:
     - Campo JSON o form-data: {"token": "..."}
     """
     tok = (
-        request.headers.get("x-operator-token")
-        or request.args.get("token")
-        or (request.get_json(silent=True) or {}).get("token")
-        or request.form.get("token")
-        or ""
-    ).strip()
+    request.headers.get("x-operator-token")
+    or request.args.get("token")
+    or (request.get_json(silent=True) or {}).get("token")
+    or request.form.get("token")
+    or ""
+).strip()
 
-    if not tok:
-        return None
-
-    op = OperatorToken.query.filter_by(token=tok, activo=True).first()
-    if not op:
-        app.logger.warning(f"[AUTH] Token inválido o inactivo: {tok}")
-    return op
+app.logger.info(f"[DEBUG] Token recibido en request: {tok}")
 
 @app.get("/api/operator/productos")
 def operator_productos():
