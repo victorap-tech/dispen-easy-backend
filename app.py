@@ -1020,6 +1020,8 @@ def admin_operator_delete(token):
     return ok_json({"ok": True})
 
 # Operadores (público por token)
+from flask import has_request_context
+
 def _operator_from_header() -> OperatorToken | None:
     """
     Devuelve el operador autenticado. Acepta token desde:
@@ -1027,16 +1029,27 @@ def _operator_from_header() -> OperatorToken | None:
     - Parámetro de query: ?token=
     - Campo JSON o form-data: {"token": "..."}
     """
-tok = (
-    request.headers.get("x-operator-token")
-    or request.args.get("token")
-    or (request.get_json(silent=True) or {}).get("token")
-    or request.form.get("token")
-    or ""
-).strip()
+    if not has_request_context():
+        app.logger.warning("[AUTH] Llamada fuera de contexto de request")
+        return None
 
-app.logger.info(f"[DEBUG] Token recibido en request: {tok}")
+    tok = (
+        request.headers.get("x-operator-token")
+        or request.args.get("token")
+        or (request.get_json(silent=True) or {}).get("token")
+        or request.form.get("token")
+        or ""
+    ).strip()
 
+    app.logger.info(f"[DEBUG] Token recibido en request: {tok}")
+
+    if not tok:
+        return None
+
+    op = OperatorToken.query.filter_by(token=tok, activo=True).first()
+    if not op:
+        app.logger.warning(f"[AUTH] Token inválido o inactivo: {tok}")
+    return op
 @app.get("/api/operator/productos")
 def operator_productos():
     t = _operator_from_header()
