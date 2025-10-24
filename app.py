@@ -1021,18 +1021,27 @@ def admin_operator_delete(token):
 
 # Operadores (público por token)
 def _operator_from_header() -> OperatorToken | None:
-    # Acepta token desde header o query param
+    """
+    Devuelve el operador autenticado. Acepta token desde:
+    - Header: x-operator-token
+    - Parámetro de query: ?token=
+    - Campo JSON o form-data: {"token": "..."}
+    """
     tok = (
         request.headers.get("x-operator-token")
-        or request.headers.get("X-Operator-Token")
         or request.args.get("token")
+        or (request.get_json(silent=True) or {}).get("token")
+        or request.form.get("token")
         or ""
     ).strip()
+
     if not tok:
         return None
 
-    # Busca por el campo token, no por ID
-    return OperatorToken.query.filter_by(token=tok, activo=True).first()
+    op = OperatorToken.query.filter_by(token=tok, activo=True).first()
+    if not op:
+        app.logger.warning(f"[AUTH] Token inválido o inactivo: {tok}")
+    return op
 
 @app.get("/api/operator/productos")
 def operator_productos():
