@@ -254,6 +254,7 @@ def _auth_guard():
         "/vincular_mp", "/operator_login",
         "/operator",
         "/api/mp/webhook", "/webhook", "/mp/webhook",
+        "/api/mp/oauth_start", "/api/mp/oauth_callback",
         "/api/pagos/preferencia", "/api/pagos/pendiente",
         "/api/config", "/go", "/ui/seleccionar",
         "/api/productos/opciones",
