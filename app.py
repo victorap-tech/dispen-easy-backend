@@ -1022,35 +1022,36 @@ def admin_operator_delete(token):
     return ok_json({"ok": True})
 
 # Operadores (público por token)
-from flask import has_request_context
 
 def _operator_from_header() -> OperatorToken | None:
-    """
-    Devuelve el operador autenticado. Acepta token desde:
-    - Header: x-operator-token
+    """Devuelve el operador autenticado. Acepta token desde:
+    - Header: x-operator-token o X-Operator-Token
     - Parámetro de query: ?token=
     - Campo JSON o form-data: {"token": "..."}
     """
     from flask import request, has_request_context
+
     if not has_request_context():
         app.logger.warning("[AUTH] Llamada fuera de contexto de request")
         return None
 
-    # Intenta extraer el token desde distintos lugares
+    # 🔍 Log completo de headers
+    try:
+        app.logger.info(f"[DEBUG] HEADERS COMPLETOS: {dict(request.headers)}")
+    except Exception as e:
+        app.logger.warning(f"[DEBUG] No se pudieron loguear headers: {e}")
+
+    # Intentar extraer token desde múltiples fuentes
     tok = (
         request.headers.get("x-operator-token")
         or request.headers.get("X-Operator-Token")
         or request.args.get("token")
         or (request.get_json(silent=True) or {}).get("token")
         or request.form.get("token")
-        or (
-            request.query_string.decode("utf-8").split("token=")[-1].split("&")[0]
-            if b"token=" in request.query_string else None
-        )
         or ""
     ).strip()
 
-    app.logger.info(f"[DEBUG] Token recibido en request: {tok}")
+    app.logger.info(f"[DEBUG] Token recibido en _operator_from_header: {tok}")
 
     if not tok:
         return None
@@ -1058,6 +1059,8 @@ def _operator_from_header() -> OperatorToken | None:
     op = OperatorToken.query.filter_by(token=tok, activo=True).first()
     if not op:
         app.logger.warning(f"[AUTH] Token inválido o inactivo: {tok}")
+        return None
+
     return op
     
 @app.get("/api/operator/productos")
