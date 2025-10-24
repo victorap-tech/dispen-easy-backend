@@ -1034,14 +1034,17 @@ def _operator_from_header() -> OperatorToken | None:
         app.logger.warning("[AUTH] Llamada fuera de contexto de request")
         return None
 
-    # Intentar extraer token desde varios lugares posibles
+    # Intenta extraer el token desde distintos lugares
     tok = (
         request.headers.get("x-operator-token")
         or request.headers.get("X-Operator-Token")
-        or (request.query_string.decode("utf-8").split("token=")[-1] if b"token=" in request.query_string else None)
         or request.args.get("token")
         or (request.get_json(silent=True) or {}).get("token")
         or request.form.get("token")
+        or (
+            request.query_string.decode("utf-8").split("token=")[-1].split("&")[0]
+            if b"token=" in request.query_string else None
+        )
         or ""
     ).strip()
 
