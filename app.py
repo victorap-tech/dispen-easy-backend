@@ -493,6 +493,8 @@ def api_set_mode():
 
 @app.get("/api/mp/oauth_start")
 def mp_oauth_start():
+    app.logger.info(f"[DEBUG] Headers recibidos en /api/mp/oauth_start: {dict(request.headers)}")
+    app.logger.info(f"[DEBUG] Args recibidos: {request.args}")
     """Devuelve la URL de autorización de MercadoPago para vincular una cuenta."""
     operator = _operator_from_header()
     if not operator:
