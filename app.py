@@ -903,8 +903,18 @@ def mp_webhook_alias2(): return mp_webhook()
 @app.get("/api/dispensers/status")
 def api_disp_status():
     out = []
+
     for dev, info in last_status.items():
-        out.append({"device_id": dev, "status": info["status"]})
+        # Buscar si el dispenser tiene un operador asignado
+        op = OperatorToken.query.filter_by(dispenser_id=dev).first()
+        nombre_op = op.nombre if op else None
+
+        out.append({
+            "device_id": dev,
+            "status": info["status"],
+            "operator": nombre_op
+        })
+
     return jsonify(out)
 
 # Debug: ver mapa de status que mantiene el backend
