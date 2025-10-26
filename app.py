@@ -905,13 +905,21 @@ def api_disp_status():
     out = []
 
     for dev, info in last_status.items():
-        # Buscar si el dispenser tiene un operador asignado
-        op = OperatorToken.query.filter_by(dispenser_id=dev).first()
+        # Convertir el nombre del dispenser (ej: "dispen-01") a número entero
+        disp_id = None
+        if isinstance(dev, str) and dev.startswith("dispen-"):
+            try:
+                disp_id = int(dev.replace("dispen-", ""))
+            except:
+                disp_id = None
+
+        # Buscar operador asignado a ese dispenser (si existe)
+        op = OperatorToken.query.filter_by(dispenser_id=disp_id).first() if disp_id else None
         nombre_op = op.nombre if op else None
 
         out.append({
             "device_id": dev,
-            "status": info["status"],
+            "status": info.get("status", "offline"),
             "operator": nombre_op
         })
 
