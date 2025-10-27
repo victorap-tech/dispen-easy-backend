@@ -1357,7 +1357,50 @@ def operator_login():
     # Si es GET, solo muestra la página HTML de ingreso
     return render_template("operator_login.html")
 
+# =====================
+# EDITAR PRODUCTOS (OPERADOR)
+# =====================
+@app.post("/api/operator/productos/update")
+def operator_update_producto():
+    token = request.headers.get("x-operator-token")
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token"}), 401
 
+    op = OperatorToken.query.filter_by(token=token).first()
+    if not op:
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
+
+    data = request.get_json(force=True)
+    pid = data.get("product_id")
+    precio = data.get("precio")
+    bundle2 = data.get("bundle2")
+    bundle3 = data.get("bundle3")
+
+    producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    if not producto:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    if precio is not None:
+        try:
+            producto.precio = float(precio)
+        except:
+            return jsonify({"ok": False, "error": "Precio inválido"}), 400
+
+    if bundle2 is not None:
+        try:
+            producto.bundle2 = float(bundle2)
+        except:
+            return jsonify({"ok": False, "error": "Bundle 2L inválido"}), 400
+
+    if bundle3 is not None:
+        try:
+            producto.bundle3 = float(bundle3)
+        except:
+            return jsonify({"ok": False, "error": "Bundle 3L inválido"}), 400
+
+    db.session.commit()
+
+    return jsonify({"ok": True, "producto": producto.to_dict()})
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
