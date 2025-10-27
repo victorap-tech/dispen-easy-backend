@@ -1138,22 +1138,21 @@ def operator_reponer_producto():
     litros = data.get("litros")
 
     if not pid or litros is None:
-        return jsonify({"ok": False, "error": "Datos incompletos"}), 400
+        return jsonify({"ok": False, "error": "Faltan parámetros"}), 400
 
     producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
     if not producto:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
     try:
-        # ✅ Sumar al stock actual
+        # ✅ sumamos la cantidad sin perder bundles
         producto.cantidad = float(producto.cantidad or 0) + float(litros)
         db.session.commit()
-        db.session.refresh(producto)
-
+        db.session.refresh(producto)  # ✅ recarga todos los campos (incluye bundle_precios)
         return jsonify({"ok": True, "producto": producto.to_dict()})
     except Exception as e:
         db.session.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)})
 
 
 # ==========================================
