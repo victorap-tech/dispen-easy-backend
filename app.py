@@ -102,6 +102,22 @@ class Producto(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     __table_args__ = (UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),)
 
+def to_dict(self):
+        """Convierte el producto a diccionario JSON-friendly"""
+        return {
+            "id": self.id,
+            "dispenser_id": self.dispenser_id,
+            "nombre": self.nombre,
+            "precio": self.precio,
+            "cantidad": self.cantidad,
+            "porcion_litros": self.porcion_litros,
+            "habilitado": self.habilitado,
+            # Si bundle_precios es JSON tipo {"2": 1800, "3": 2600}, lo convertimos directo
+            "bundle_precios": self.bundle_precios or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
 class Pago(db.Model):
     __tablename__ = "pago"
     id = db.Column(db.Integer, primary_key=True)
