@@ -18,6 +18,27 @@ from sqlalchemy import UniqueConstraint, text as sqltext, and_
 from datetime import datetime
 import paho.mqtt.client as mqtt
 
+# --- FUNCIÓN PARA ENVIAR MENSAJES POR TELEGRAM ---
+def send_telegram_message(chat_id, text):
+    """
+    Envía un mensaje simple por Telegram al chat_id indicado.
+    Usa el BOT_TOKEN definido en las variables de entorno.
+    """
+    import os, requests
+    TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN or not chat_id:
+        print("⚠️ No hay BOT_TOKEN o chat_id definido, no se envía mensaje.")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10
+        )
+        print(f"📨 Mensaje enviado a {chat_id}: {text}")
+    except Exception as e:
+        print("❌ Error al enviar mensaje de Telegram:", e)
+
 # ============ Helpers ============
 
 def ok_json(data, status=200): return jsonify(data), status
