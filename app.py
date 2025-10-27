@@ -1401,6 +1401,87 @@ def operator_update_producto():
     db.session.commit()
 
     return jsonify({"ok": True, "producto": producto.to_dict()})
+
+# ===============================
+# 📦 Generar link QR desde panel del operador
+# ===============================
+@app.get("/api/operator/productos/qr/<int:product_id>")
+def operator_generar_qr(product_id):
+    """Genera un link de pago (QR) desde la cuenta MercadoPago del operador vinculado"""
+    token = request.headers.get("x-operator-token", "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "Token requerido"}), 401
+
+    op = OperatorToken.query.filter_by(token=token).first()
+    if not op:
+        return jsonify({"ok": False, "error": "Operador no encontrado"}), 401
+
+    prod = Producto.query.get(product_id)
+    if not prod:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    # Verificamos que el producto pertenezca al dispenser del operador
+    if prod.dispenser_id != op.dispenser_id:
+        return jsonify({"ok": False, "error": "No autorizado para este producto"}), 403
+
+    # Verificamos que el operador tenga cuenta MP vinculada
+    if not op.mp_access_token:
+        return jsonify({"ok": False, "error": "Cuenta de MercadoPago no vinculada"}), 400
+
+    # ===============================
+    # 🧾 Creamos la preferencia de pago
+    # ===============================
+    import requests
+
+    headers = {
+        "Authorization": f"Bearer {op.mp_access_token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "items": [
+            {
+                "title": prod.nombre,
+                "quantity": 1,
+                "unit_price": float(prod.precio),
+                "currency_id": "ARS",
+            }
+        ],
+        "metadata": {
+            "product_id": prod.id,
+            "dispenser_id": prod.dispenser_id,
+            "operator_id": op.id,
+        },
+        "back_urls": {
+            "success": "https://dispen-easy-web-production.up.railway.app/success",
+            "failure": "https://dispen-easy-web-production.up.railway.app/failure",
+            "pending": "https://dispen-easy-web-production.up.railway.app/pending",
+        },
+        "auto_return": "approved",
+    }
+
+    resp = requests.post("https://api.mercadopago.com/checkout/preferences", 
+                         headers=headers, json=payload)
+
+    if resp.status_code != 201:
+        return jsonify({
+            "ok": False,
+            "error": f"Error al generar preferencia: {resp.text}"
+        }), 500
+
+    data = resp.json()
+    init_point = data.get("init_point")
+
+    return jsonify({
+        "ok": True,
+        "url": init_point,
+        "producto": {
+            "id": prod.id,
+            "nombre": prod.nombre,
+            "precio": prod.precio
+        }
+    })
+    
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
