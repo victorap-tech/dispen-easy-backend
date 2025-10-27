@@ -1120,24 +1120,45 @@ def operator_productos():
         }
     })
 
+# ==========================================
+# ✅ REPOENER PRODUCTO (sumar stock)
+# ==========================================
 @app.post("/api/operator/productos/reponer")
-def operator_reponer():
-    t = _operator_from_header()
-    if not t or not t.activo: return json_error("token inválido o inactivo", 401)
-    data = request.get_json(force=True, silent=True) or {}
-    pid = _to_int(data.get("product_id") or 0); litros = _to_int(data.get("litros") or 0)
-    if litros <= 0: return json_error("Litros inválidos", 400)
-    p = Producto.query.get_or_404(pid)
-    if p.dispenser_id != t.dispenser_id: return json_error("no autorizado", 403)
+def operator_reponer_producto():
+    token = request.headers.get("x-operator-token")
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token"}), 401
+
+    op = OperatorToken.query.filter_by(token=token).first()
+    if not op:
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
+
+    data = request.get_json(force=True)
+    pid = data.get("product_id")
+    litros = data.get("litros")
+
+    if not pid or litros is None:
+        return jsonify({"ok": False, "error": "Datos incompletos"}), 400
+
+    producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    if not producto:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
     try:
-        p.cantidad = max(0, int(p.cantidad or 0) + litros)
-        _post_stock_change_hook(p, motivo="reponer (operator)", operator_name=t.nombre or t.token[:6])
+        # ✅ Sumar al stock actual
+        producto.cantidad = float(producto.cantidad or 0) + float(litros)
         db.session.commit()
-        return ok_json({"ok": True, "producto": serialize_producto(p)})
+        db.session.refresh(producto)
+
+        return jsonify({"ok": True, "producto": producto.to_dict()})
     except Exception as e:
         db.session.rollback()
-        return json_error("Error reponiendo", 500, str(e))
+        return jsonify({"ok": False, "error": str(e)}), 500
 
+
+# ==========================================
+# ✅ RESETEAR PRODUCTO (setear stock exacto)
+# ==========================================
 @app.post("/api/operator/productos/reset")
 def operator_reset_producto():
     token = request.headers.get("x-operator-token")
@@ -1160,21 +1181,16 @@ def operator_reset_producto():
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
     try:
-        # Actualizamos solo el stock
+        # ✅ Seteamos el stock manualmente
         producto.cantidad = float(litros)
-
-        # Refrescamos fecha de actualización
         db.session.commit()
-
-        # 🔥 Importante: refrescar desde la DB para tener todo actualizado
         db.session.refresh(producto)
 
-        # ✅ Devolvemos todos los datos completos (incluye bundle_precios)
         return jsonify({"ok": True, "producto": producto.to_dict()})
-
     except Exception as e:
         db.session.rollback()
         return jsonify({"ok": False, "error": str(e)}), 500
+        
 @app.post("/api/operator/link")
 def operator_link():
     data = request.get_json(force=True, silent=True) or {}
