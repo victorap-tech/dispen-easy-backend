@@ -1123,44 +1123,54 @@ def operator_productos():
 # ==========================================
 # ✅ REPOENER PRODUCTO (sumar stock)
 # ==========================================
+# --- REPOSICIÓN DE PRODUCTO POR OPERADOR ---
 @app.post("/api/operator/productos/reponer")
 def operator_reponer_producto():
+    data = request.get_json(force=True)
     token = request.headers.get("x-operator-token")
+    litros = data.get("litros")
+    product_id = data.get("product_id")
+
     if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
+        return jsonify({"ok": False, "error": "Token faltante"}), 401
 
     op = OperatorToken.query.filter_by(token=token).first()
     if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
+        return jsonify({"ok": False, "error": "Operador no autorizado"}), 401
 
-    data = request.get_json(force=True)
-    pid = data.get("product_id")
-    litros = data.get("litros")
-
-    producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    producto = Producto.query.filter_by(id=product_id, dispenser_id=op.dispenser_id).first()
     if not producto:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
     try:
-        # ✅ Antes de modificar, guardamos los bundles actuales
-        bundles_previos = dict(producto.bundle_precios or {})
+        litros = float(litros)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Valor de litros inválido"}), 400
 
-        # ✅ Sumamos litros sin tocar los bundles
-        cantidad_actual = float(producto.cantidad or 0)
-        producto.cantidad = cantidad_actual + float(litros or 0)
+    # Actualizamos el stock
+    producto.cantidad = (producto.cantidad or 0) + litros
+    db.session.commit()
 
-        # ✅ Reasignamos los bundles antiguos si SQLAlchemy los borra
-        if not producto.bundle_precios or producto.bundle_precios == {}:
-            producto.bundle_precios = bundles_previos
-
-        db.session.commit()
-        db.session.refresh(producto)
-
-        return jsonify({"ok": True, "producto": producto.to_dict()})
-
+    # --- 📢 ALERTA TELEGRAM POR BAJO STOCK ---
+    try:
+        # Umbral configurable
+        MINIMO_LITROS = 2
+        if producto.cantidad < MINIMO_LITROS:
+            if op.chat_id:
+                send_telegram_message(
+                    op.chat_id,
+                    f"⚠️ Bajo stock en tu dispenser #{op.dispenser_id}\n"
+                    f"Producto: {producto.nombre}\n"
+                    f"Cantidad actual: {producto.cantidad} L\n"
+                    f"Por favor reponé el stock."
+                )
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"ok": False, "error": str(e)})
+        print("Error al enviar alerta de stock:", e)
+
+    return jsonify({
+        "ok": True,
+        "producto": producto.to_dict()
+    })
 
 # ==========================================
 # ✅ RESETEAR PRODUCTO (setear stock exacto)
