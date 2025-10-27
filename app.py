@@ -1137,28 +1137,26 @@ def operator_reponer_producto():
     pid = data.get("product_id")
     litros = data.get("litros")
 
-    # ✅ buscamos el producto exacto
     producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
     if not producto:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
     try:
-        # ✅ sumamos litros pero sin tocar los bundles
+        # ✅ Antes de modificar, guardamos los bundles actuales
+        bundles_previos = dict(producto.bundle_precios or {})
+
+        # ✅ Sumamos litros sin tocar los bundles
         cantidad_actual = float(producto.cantidad or 0)
         producto.cantidad = cantidad_actual + float(litros or 0)
 
-        # ✅ importante: no sobreescribas bundle_precios si no se enviaron
-        if not producto.bundle_precios:
-            producto.bundle_precios = {}
+        # ✅ Reasignamos los bundles antiguos si SQLAlchemy los borra
+        if not producto.bundle_precios or producto.bundle_precios == {}:
+            producto.bundle_precios = bundles_previos
 
         db.session.commit()
-        db.session.refresh(producto)  # 🔄 asegura que bundle_precios esté presente
+        db.session.refresh(producto)
 
-        # ✅ devolvemos el producto completo con bundles incluidos
-        return jsonify({
-            "ok": True,
-            "producto": producto.to_dict()
-        })
+        return jsonify({"ok": True, "producto": producto.to_dict()})
 
     except Exception as e:
         db.session.rollback()
