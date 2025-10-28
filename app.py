@@ -1459,68 +1459,68 @@ def operator_login():
 # =====================
 @app.post("/api/operator/productos/update")
 def operator_update_producto():
+    """Permite al operador actualizar precios, bundles y habilitación"""
     token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    data = request.get_json(force=True)
+    data = request.get_json() or {}
     pid = data.get("product_id")
+    precio = data.get("precio")
+    bundle2 = data.get("bundle2")
+    bundle3 = data.get("bundle3")
+    habilitado = data.get("habilitado")
 
     p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
     if not p:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # ✅ Actualización condicional (solo campos enviados)
-    if "precio" in data and data["precio"] is not None:
+    # 🔹 Actualizamos los campos recibidos
+    if precio is not None:
         try:
-            p.precio = float(data["precio"])
-        except ValueError:
-            return jsonify({"ok": False, "error": "Precio inválido"}), 400
-
-    # ✅ Actualización segura de bundles
-    bundle2 = data.get("bundle2")
-    bundle3 = data.get("bundle3")
-
-    if not p.bundle_precios:
-        p.bundle_precios = {}
-
-    if bundle2 is not None and bundle2 != "":
-        try:
-            p.bundle_precios["2"] = float(bundle2)
+            p.precio = float(precio)
         except ValueError:
             pass
 
-    if bundle3 is not None and bundle3 != "":
-        try:
-            p.bundle_precios["3"] = float(bundle3)
-        except ValueError:
-            pass
+    if habilitado is not None:
+        p.habilitado = bool(habilitado)
 
-    # ✅ Actualizar habilitado (si viene)
-    if "habilitado" in data:
-        p.habilitado = bool(data["habilitado"])
+    # 🔹 Actualizamos bundles sin borrar los existentes
+    bp = p.bundle_precios or {}
+    if bundle2 is not None:
+        if str(bundle2).strip() == "":
+            bp.pop("2", None)
+        else:
+            bp["2"] = float(bundle2)
+    if bundle3 is not None:
+        if str(bundle3).strip() == "":
+            bp.pop("3", None)
+        else:
+            bp["3"] = float(bundle3)
+    p.bundle_precios = bp
 
     db.session.commit()
 
-    # ✅ Aviso por Telegram (solo si el producto está activo)
-    if op.chat_id and p.habilitado:
-        try:
+    # 🔹 Notificación opcional a Telegram
+    try:
+        chat_id = getattr(op, "chat_id", None)
+        if chat_id:
             msg = (
-                f"⚙️ Producto actualizado en tu dispenser #{p.dispenser_id}\n\n"
+                f"🧴 *Producto actualizado en tu dispenser #{op.dispenser_id}*\n\n"
                 f"Nombre: {p.nombre}\n"
-                f"Precio: ${p.precio:.2f} / L\n"
-                f"Bundle 2L: {p.bundle_precios.get('2', '-')} | "
-                f"Bundle 3L: {p.bundle_precios.get('3', '-')}"
+                f"Precio: ${p.precio:.2f}/L\n"
+                f"Bundle 2L: {bp.get('2', '-')}\n"
+                f"Bundle 3L: {bp.get('3', '-')}"
             )
-            send_telegram_message(op.chat_id, msg)
-        except Exception as e:
-            print("Error enviando Telegram:", e)
+            send_telegram_message(chat_id, msg)
+    except Exception as e:
+        print("Error enviando mensaje Telegram:", e)
 
-    return jsonify({"ok": True, "producto": p.to_dict()})
+    return jsonify({
+        "ok": True,
+        "producto": p.to_dict(),
+    })
 
 # ===============================
 # 📦 Generar link QR desde panel del operador
