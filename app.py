@@ -1120,27 +1120,38 @@ def _operator_from_header() -> OperatorToken | None:
     
 @app.get("/api/operator/productos")
 def operator_productos():
-    t = _operator_from_header()
-    if not t or not t.activo:
-        return json_error("token inválido o inactivo", 401)
+    """Devuelve productos visibles para el panel del operador"""
+    token = request.headers.get("x-operator-token")
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
 
-    prods = Producto.query.filter(Producto.dispenser_id == t.dispenser_id).order_by(Producto.slot_id.asc()).all()
-    out = []
-    for p in prods:
-        d = serialize_producto(p)
-        d["dispenser_nombre"] = (Dispenser.query.get(p.dispenser_id).nombre if p.dispenser_id else "")
-        out.append(d)
+    if not op:
+        return jsonify({"ok": False, "error": "Token inválido o inactivo"}), 401
 
-    return ok_json({
+    productos = Producto.query.filter_by(dispenser_id=op.dispenser_id).all()
+
+    return jsonify({
         "ok": True,
-        "productos": out,
         "operator": {
-            "nombre": t.nombre,
-            "dispenser_id": t.dispenser_id,
-            "chat_id": t.chat_id   # ✅ usa el atributo correcto
-        }
+            "id": op.id,
+            "nombre": op.nombre,
+            "dispenser_id": op.dispenser_id,
+            "chat_id": op.chat_id,
+        },
+        "productos": [
+            {
+                "id": p.id,
+                "nombre": p.nombre,
+                "slot": p.slot_id,
+                "precio": p.precio,
+                "cantidad": p.cantidad,
+                "habilitado": p.habilitado,
+                # ✅ Incluye los bundles para mantenerlos entre sesiones
+                "bundle2": (p.bundle_precios or {}).get("2"),
+                "bundle3": (p.bundle_precios or {}).get("3"),
+            }
+            for p in productos
+        ],
     })
-
 # ==========================================
 # ✅ REPOENER PRODUCTO (sumar stock)
 # ==========================================
