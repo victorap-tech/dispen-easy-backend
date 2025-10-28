@@ -1601,7 +1601,58 @@ def operator_generar_qr(product_id):
             "precio": prod.precio
         }
     })
-    
+
+    #-----PANEL CONTABLE-----#
+
+@app.route('/api/contabilidad/resumen', methods=['GET'])
+def contabilidad_resumen():
+    """
+    Devuelve resumen de ventas agrupadas por operador, con totales de monto, litros y comisiones.
+    """
+    desde = request.args.get('desde')
+    hasta = request.args.get('hasta')
+
+    if not desde or not hasta:
+        hasta = datetime.now().strftime("%Y-%m-%d")
+        desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    # Leer comisión editable de tabla configuracion
+    cfg = Configuracion.query.filter_by(clave='comision_porcentaje').first()
+    COMISION_PORCENTAJE = float(cfg.valor) if cfg else 10
+
+    query = text("""
+        SELECT 
+            operator_token AS operador,
+            SUM(monto) AS total_ventas,
+            SUM(litros) AS litros_vendidos,
+            COUNT(*) AS cantidad_transacciones
+        FROM pago
+        WHERE estado = 'approved'
+          AND fecha BETWEEN :desde AND :hasta
+        GROUP BY operator_token
+        ORDER BY total_ventas DESC
+    """)
+    result = db.session.execute(query, {'desde': desde, 'hasta': hasta}).fetchall()
+
+    resumen = []
+    for r in result:
+        comision = round(r.total_ventas * COMISION_PORCENTAJE / 100, 2)
+        neto = round(r.total_ventas - comision, 2)
+        resumen.append({
+            "operador": r.operador or "Sin asignar",
+            "ventas_totales": round(r.total_ventas, 2),
+            "litros_vendidos": round(r.litros_vendidos or 0, 2),
+            "comision": comision,
+            "neto_operador": neto,
+            "transacciones": r.cantidad_transacciones
+        })
+
+    return ok_json({
+        "desde": desde,
+        "hasta": hasta,
+        "comision_porcentaje": COMISION_PORCENTAJE,
+        "resumen": resumen
+    })    
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
