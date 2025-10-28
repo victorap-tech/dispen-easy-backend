@@ -1184,31 +1184,39 @@ def operator_reponer():
 # ✅ RESETEAR PRODUCTO (setear stock exacto)
 # ==========================================
 @app.post("/api/operator/productos/reset")
-def operator_reset_producto():
+def operator_reset():
     token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
+    op = Operator.query.filter_by(token=token).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    data = request.get_json(force=True)
+    data = request.get_json()
     pid = data.get("product_id")
-    litros = data.get("litros")
+    litros = float(data.get("litros", 0))
 
-    producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not producto:
+    p = Producto.query.get(pid)
+    if not p:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    try:
-        producto.cantidad = float(litros)
-        db.session.commit()
-        db.session.refresh(producto)  # ✅ importante: refresca todos los campos
-        return jsonify({"ok": True, "producto": producto.to_dict()})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"ok": False, "error": str(e)})
+    # ✅ Reset directo
+    p.cantidad = litros
+
+    # ✅ Mantener bundles actuales
+    if not p.bundle_precios:
+        p.bundle_precios = {}
+
+    db.session.commit()
+
+    # ✅ Aviso Telegram
+    if op.chat_id:
+        try:
+            msg = f"🔄 Stock reiniciado en tu dispenser #{p.dispenser_id}\n\n" \
+                  f"Producto: {p.nombre}\nNuevo stock: {litros} L"
+            send_telegram_message(op.chat_id, msg)
+        except Exception as e:
+            print("Error enviando notificación Telegram:", e)
+
+    return jsonify({"ok": True, "producto": p.to_dict()})
         
 @app.post("/api/operator/link")
 def operator_link():
