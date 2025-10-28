@@ -1652,7 +1652,55 @@ def contabilidad_resumen():
         "hasta": hasta,
         "comision_porcentaje": COMISION_PORCENTAJE,
         "resumen": resumen
-    })    
+    })  
+
+@app.route('/api/contabilidad/ranking_productos', methods=['GET'])
+def ranking_productos():
+    """
+    Devuelve ranking de productos más y menos vendidos por monto.
+    """
+    desde = request.args.get('desde')
+    hasta = request.args.get('hasta')
+
+    if not desde or not hasta:
+        hasta = datetime.now().strftime("%Y-%m-%d")
+        desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    query = text("""
+        SELECT 
+            pr.nombre AS producto,
+            SUM(pg.litros) AS litros_totales,
+            SUM(pg.monto) AS monto_total,
+            COUNT(pg.id) AS transacciones
+        FROM pago pg
+        JOIN producto pr ON pg.id_producto = pr.id
+        WHERE pg.estado = 'approved'
+          AND pg.fecha BETWEEN :desde AND :hasta
+        GROUP BY pr.nombre
+        ORDER BY monto_total DESC
+    """)
+    result = db.session.execute(query, {'desde': desde, 'hasta': hasta}).fetchall()
+
+    data = [
+        {
+            "producto": r.producto,
+            "litros_totales": float(r.litros_totales or 0),
+            "monto_total": float(r.monto_total or 0),
+            "transacciones": int(r.transacciones)
+        }
+        for r in result
+    ]
+
+    top = data[:5]
+    low = list(reversed(data[-5:]))
+
+    return ok_json({
+        "desde": desde,
+        "hasta": hasta,
+        "top": top,
+        "low": low
+    })
+    
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
