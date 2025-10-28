@@ -1120,7 +1120,7 @@ def _operator_from_header() -> OperatorToken | None:
     
 @app.get("/api/operator/productos")
 def operator_productos():
-    """Devuelve productos visibles para el panel del operador"""
+    """Devuelve los productos visibles para el panel del operador"""
     token = request.headers.get("x-operator-token")
     op = OperatorToken.query.filter_by(token=token, activo=True).first()
 
@@ -1132,10 +1132,10 @@ def operator_productos():
     return jsonify({
         "ok": True,
         "operator": {
-            "id": op.id,
-            "nombre": op.nombre,
+            "token": op.token,
+            "nombre": getattr(op, "nombre", ""),
             "dispenser_id": op.dispenser_id,
-            "chat_id": op.chat_id,
+            "chat_id": getattr(op, "chat_id", None),
         },
         "productos": [
             {
@@ -1145,7 +1145,7 @@ def operator_productos():
                 "precio": p.precio,
                 "cantidad": p.cantidad,
                 "habilitado": p.habilitado,
-                # ✅ Incluye los bundles para mantenerlos entre sesiones
+                # ✅ Mantiene los bundles
                 "bundle2": (p.bundle_precios or {}).get("2"),
                 "bundle3": (p.bundle_precios or {}).get("3"),
             }
