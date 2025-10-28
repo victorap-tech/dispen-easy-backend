@@ -1148,35 +1148,35 @@ def operator_productos():
 @app.post("/api/operator/productos/reponer")
 def operator_reponer():
     token = request.headers.get("x-operator-token")
-    op = Operator.query.filter_by(token=token).first()
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token"}), 401
+
+    op = OperatorToken.query.filter_by(token=token).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    data = request.get_json()
+    data = request.get_json(force=True)
     pid = data.get("product_id")
     litros = float(data.get("litros", 0))
 
-    p = Producto.query.get(pid)
+    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
     if not p:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # ✅ Sumar litros (reposiciona, no resetea)
+    # ✅ sumar litros
     p.cantidad = (p.cantidad or 0) + litros
-
-    # ✅ Mantener bundles actuales
     if not p.bundle_precios:
         p.bundle_precios = {}
 
     db.session.commit()
 
-    # ✅ Enviar notificación por Telegram
+    # ✅ notificar por Telegram si está vinculado
     if op.chat_id:
         try:
-            msg = f"📦 Reposición realizada en tu dispenser #{p.dispenser_id}\n\n" \
-                  f"Producto: {p.nombre}\nCantidad repuesta: {litros} L\nStock actual: {p.cantidad} L"
+            msg = f"📦 Reposición realizada\n\nProducto: {p.nombre}\nCantidad: {litros} L\nStock actual: {p.cantidad} L"
             send_telegram_message(op.chat_id, msg)
         except Exception as e:
-            print("Error enviando notificación Telegram:", e)
+            print("Error enviando Telegram:", e)
 
     return jsonify({"ok": True, "producto": p.to_dict()})
 
@@ -1186,35 +1186,35 @@ def operator_reponer():
 @app.post("/api/operator/productos/reset")
 def operator_reset():
     token = request.headers.get("x-operator-token")
-    op = Operator.query.filter_by(token=token).first()
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token"}), 401
+
+    op = OperatorToken.query.filter_by(token=token).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    data = request.get_json()
+    data = request.get_json(force=True)
     pid = data.get("product_id")
     litros = float(data.get("litros", 0))
 
-    p = Producto.query.get(pid)
+    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
     if not p:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # ✅ Reset directo
+    # ✅ set directo
     p.cantidad = litros
-
-    # ✅ Mantener bundles actuales
     if not p.bundle_precios:
         p.bundle_precios = {}
 
     db.session.commit()
 
-    # ✅ Aviso Telegram
+    # ✅ notificación Telegram
     if op.chat_id:
         try:
-            msg = f"🔄 Stock reiniciado en tu dispenser #{p.dispenser_id}\n\n" \
-                  f"Producto: {p.nombre}\nNuevo stock: {litros} L"
+            msg = f"🔄 Stock reiniciado\n\nProducto: {p.nombre}\nNuevo stock: {litros} L"
             send_telegram_message(op.chat_id, msg)
         except Exception as e:
-            print("Error enviando notificación Telegram:", e)
+            print("Error enviando Telegram:", e)
 
     return jsonify({"ok": True, "producto": p.to_dict()})
         
