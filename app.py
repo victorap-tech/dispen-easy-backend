@@ -1146,52 +1146,39 @@ def operator_productos():
 # ==========================================
 # --- REPOSICIÓN DE PRODUCTO POR OPERADOR ---
 @app.post("/api/operator/productos/reponer")
-def operator_reponer_producto():
-    data = request.get_json(force=True)
+def operator_reponer():
     token = request.headers.get("x-operator-token")
-    litros = data.get("litros")
-    product_id = data.get("product_id")
-
-    if not token:
-        return jsonify({"ok": False, "error": "Token faltante"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
+    op = Operator.query.filter_by(token=token).first()
     if not op:
-        return jsonify({"ok": False, "error": "Operador no autorizado"}), 401
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    producto = Producto.query.filter_by(id=product_id, dispenser_id=op.dispenser_id).first()
-    if not producto:
+    data = request.get_json()
+    pid = data.get("product_id")
+    litros = float(data.get("litros", 0))
+
+    p = Producto.query.get(pid)
+    if not p:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    try:
-        litros = float(litros)
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "Valor de litros inválido"}), 400
+    # ✅ Sumar litros (reposiciona, no resetea)
+    p.cantidad = (p.cantidad or 0) + litros
 
-    # Actualizamos el stock
-    producto.cantidad = (producto.cantidad or 0) + litros
+    # ✅ Mantener bundles actuales
+    if not p.bundle_precios:
+        p.bundle_precios = {}
+
     db.session.commit()
 
-    # --- 📢 ALERTA TELEGRAM POR BAJO STOCK ---
-    try:
-        # Umbral configurable
-        MINIMO_LITROS = 2
-        if producto.cantidad < MINIMO_LITROS:
-            if op.chat_id:
-                send_telegram_message(
-                    op.chat_id,
-                    f"⚠️ Bajo stock en tu dispenser #{op.dispenser_id}\n"
-                    f"Producto: {producto.nombre}\n"
-                    f"Cantidad actual: {producto.cantidad} L\n"
-                    f"Por favor reponé el stock."
-                )
-    except Exception as e:
-        print("Error al enviar alerta de stock:", e)
+    # ✅ Enviar notificación por Telegram
+    if op.chat_id:
+        try:
+            msg = f"📦 Reposición realizada en tu dispenser #{p.dispenser_id}\n\n" \
+                  f"Producto: {p.nombre}\nCantidad repuesta: {litros} L\nStock actual: {p.cantidad} L"
+            send_telegram_message(op.chat_id, msg)
+        except Exception as e:
+            print("Error enviando notificación Telegram:", e)
 
-    return jsonify({
-        "ok": True,
-        "producto": producto.to_dict()
-    })
+    return jsonify({"ok": True, "producto": p.to_dict()})
 
 # ==========================================
 # ✅ RESETEAR PRODUCTO (setear stock exacto)
