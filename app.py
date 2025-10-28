@@ -1169,7 +1169,9 @@ def operator_reponer():
         p.bundle_precios = {}
 
     db.session.commit()
-
+    
+    check_stock_alert(p, op)
+    
     # ✅ notificar por Telegram si está vinculado
     if op.chat_id:
         try:
@@ -1207,7 +1209,9 @@ def operator_reset():
         p.bundle_precios = {}
 
     db.session.commit()
-
+   
+    check_stock_alert(p, op)
+    
     # ✅ notificación Telegram
     if op.chat_id:
         try:
@@ -1600,6 +1604,26 @@ def debug_tokens():
         {"token": o.token, "nombre": (o.nombre or ""), "dispenser_id": o.dispenser_id, "activo": bool(o.activo)}
         for o in ops
     ])
+
+# ===================== ALERTA DE BAJO STOCK =====================
+
+def check_stock_alert(producto, operador):
+    """Envia alerta por Telegram si el stock cae por debajo del umbral"""
+    try:
+        import os
+        umbral = float(os.getenv("STOCK_RESERVA_LTS", 2))
+        if producto.cantidad <= umbral and operador.chat_id:
+            msg = (
+                f"⚠️ *Alerta de bajo stock*\n\n"
+                f"Dispenser #{producto.dispenser_id}\n"
+                f"Producto: {producto.nombre}\n"
+                f"Stock actual: {producto.cantidad} L\n\n"
+                f"Recomendación: reponer el producto cuanto antes 🧴"
+            )
+            send_telegram_message(operador.chat_id, msg)
+    except Exception as e:
+        print("Error al enviar alerta de bajo stock:", e)
+    
 # ============ MQTT init ============
 
 with app.app_context():
