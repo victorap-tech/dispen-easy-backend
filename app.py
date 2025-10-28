@@ -1127,7 +1127,12 @@ def operator_productos():
     if not op:
         return jsonify({"ok": False, "error": "Token inválido o inactivo"}), 401
 
-    productos = Producto.query.filter_by(dispenser_id=op.dispenser_id).all()
+    # 🔹 Ordenamos por número de slot (como en el gabinete físico)
+    productos = (
+        Producto.query.filter_by(dispenser_id=op.dispenser_id)
+        .order_by(Producto.slot_id.asc())
+        .all()
+    )
 
     return jsonify({
         "ok": True,
@@ -1145,7 +1150,7 @@ def operator_productos():
                 "precio": p.precio,
                 "cantidad": p.cantidad,
                 "habilitado": p.habilitado,
-                # ✅ Mantiene los bundles
+                # ✅ Conserva los bundles definidos
                 "bundle2": (p.bundle_precios or {}).get("2"),
                 "bundle3": (p.bundle_precios or {}).get("3"),
             }
