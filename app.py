@@ -1449,35 +1449,58 @@ def operator_update_producto():
 
     data = request.get_json(force=True)
     pid = data.get("product_id")
-    precio = data.get("precio")
+
+    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    if not p:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    # ✅ Actualización condicional (solo campos enviados)
+    if "precio" in data and data["precio"] is not None:
+        try:
+            p.precio = float(data["precio"])
+        except ValueError:
+            return jsonify({"ok": False, "error": "Precio inválido"}), 400
+
+    # ✅ Actualización segura de bundles
     bundle2 = data.get("bundle2")
     bundle3 = data.get("bundle3")
 
-    producto = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not producto:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+    if not p.bundle_precios:
+        p.bundle_precios = {}
 
-    if precio is not None:
+    if bundle2 is not None and bundle2 != "":
         try:
-            producto.precio = float(precio)
-        except:
-            return jsonify({"ok": False, "error": "Precio inválido"}), 400
+            p.bundle_precios["2"] = float(bundle2)
+        except ValueError:
+            pass
 
-    if bundle2 is not None:
+    if bundle3 is not None and bundle3 != "":
         try:
-            producto.bundle2 = float(bundle2)
-        except:
-            return jsonify({"ok": False, "error": "Bundle 2L inválido"}), 400
+            p.bundle_precios["3"] = float(bundle3)
+        except ValueError:
+            pass
 
-    if bundle3 is not None:
-        try:
-            producto.bundle3 = float(bundle3)
-        except:
-            return jsonify({"ok": False, "error": "Bundle 3L inválido"}), 400
+    # ✅ Actualizar habilitado (si viene)
+    if "habilitado" in data:
+        p.habilitado = bool(data["habilitado"])
 
     db.session.commit()
 
-    return jsonify({"ok": True, "producto": producto.to_dict()})
+    # ✅ Aviso por Telegram (solo si el producto está activo)
+    if op.chat_id and p.habilitado:
+        try:
+            msg = (
+                f"⚙️ Producto actualizado en tu dispenser #{p.dispenser_id}\n\n"
+                f"Nombre: {p.nombre}\n"
+                f"Precio: ${p.precio:.2f} / L\n"
+                f"Bundle 2L: {p.bundle_precios.get('2', '-')} | "
+                f"Bundle 3L: {p.bundle_precios.get('3', '-')}"
+            )
+            send_telegram_message(op.chat_id, msg)
+        except Exception as e:
+            print("Error enviando Telegram:", e)
+
+    return jsonify({"ok": True, "producto": p.to_dict()})
 
 # ===============================
 # 📦 Generar link QR desde panel del operador
