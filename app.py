@@ -203,9 +203,15 @@ def serialize_producto(p: Producto) -> dict:
 
 def serialize_dispenser(d: Dispenser) -> dict:
     return {
-        "id": d.id, "device_id": d.device_id, "nombre": d.nombre or "",
-        "activo": bool(d.activo),
-        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "id": d.id,
+        "device_id": d.device_id,
+        "nombre": d.nombre or "",
+        "estado": getattr(d, "estado", None),
+        "ubicacion": getattr(d, "ubicacion", None),
+        "operator": getattr(d, "operator", None),
+        "activo": bool(getattr(d, "activo", True)),
+        "created_at": d.created_at.isoformat() if getattr(d, "created_at", None) else None,
+        "updated_at": d.updated_at.isoformat() if getattr(d, "updated_at", None) else None,
     }
 
 def get_thresholds():
