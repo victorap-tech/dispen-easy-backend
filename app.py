@@ -774,22 +774,64 @@ def compute_total_price_ars(prod: Producto, litros: int) -> int:
 @app.get("/api/pagos")
 def pagos_list():
     try:
-        limit = int(request.args.get("limit", 50)); limit = max(1, min(limit, 200))
-    except Exception: limit = 50
+        limit = int(request.args.get("limit", 50))
+        limit = max(1, min(limit, 200))
+    except Exception:
+        limit = 50
+
     estado = (request.args.get("estado") or "").strip()
     qsearch = (request.args.get("q") or "").strip()
+    dispenser_id = request.args.get("dispenser_id", type=str)
+    desde = request.args.get("desde")
+    hasta = request.args.get("hasta")
+
     q = Pago.query
-    if estado: q = q.filter(Pago.estado == estado)
-    if qsearch: q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
+
+    # 🔹 Filtrar por estado
+    if estado:
+        q = q.filter(Pago.estado == estado)
+
+    # 🔹 Filtrar por texto libre
+    if qsearch:
+        q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
+
+    # 🔹 Filtrar por dispenser (clave)
+    if dispenser_id:
+        q = q.filter(Pago.device_id == dispenser_id)
+
+    # 🔹 Filtrar por rango de fechas (opcional)
+    if desde:
+        try:
+            desde_dt = datetime.fromisoformat(desde)
+            q = q.filter(Pago.created_at >= desde_dt)
+        except Exception:
+            pass
+    if hasta:
+        try:
+            hasta_dt = datetime.fromisoformat(hasta)
+            q = q.filter(Pago.created_at <= hasta_dt)
+        except Exception:
+            pass
+
     pagos = q.order_by(Pago.id.desc()).limit(limit).all()
-    return jsonify([{
-        "id": p.id, "mp_payment_id": p.mp_payment_id, "estado": p.estado,
-        "producto": p.producto, "product_id": p.product_id,
-        "dispenser_id": p.dispenser_id, "device_id": p.device_id,
-        "slot_id": p.slot_id, "litros": p.litros, "monto": p.monto,
-        "dispensado": bool(p.dispensado),
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-    } for p in pagos])
+
+    return jsonify([
+        {
+            "id": p.id,
+            "mp_payment_id": p.mp_payment_id,
+            "estado": p.estado,
+            "producto": p.producto,
+            "product_id": p.product_id,
+            "dispenser_id": p.dispenser_id,
+            "device_id": p.device_id,
+            "slot_id": p.slot_id,
+            "litros": p.litros,
+            "monto": p.monto,
+            "dispensado": bool(p.dispensado),
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in pagos
+    ])
 
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
