@@ -607,7 +607,26 @@ def mp_oauth_callback():
 @app.get("/api/dispensers")
 def dispensers_list():
     ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
-    return jsonify([serialize_dispenser(d) for d in ds])
+    data = []
+    for d in ds:
+        # Buscar operador asignado (si existe)
+        operator_name = None
+        if getattr(d, "operator_token_id", None):
+            op = OperatorToken.query.filter_by(id=d.operator_token_id).first()
+            if op:
+                operator_name = getattr(op, "nombre", None) or getattr(op, "usuario", None) or "Operador asignado"
+
+        data.append({
+            "id": d.id,
+            "nombre": getattr(d, "nombre", None),
+            "device_id": getattr(d, "device_id", None),
+            "ubicacion": getattr(d, "ubicacion", None),
+            "estado": getattr(d, "estado", None),
+            "stock": getattr(d, "stock", None),
+            "operator": operator_name,  # 🔹 agregado
+        })
+
+    return jsonify(data)
 
 def require_admin():
     env = _admin_env()
