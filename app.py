@@ -206,14 +206,12 @@ def serialize_dispenser(d: Dispenser) -> dict:
         "id": d.id,
         "device_id": d.device_id,
         "nombre": d.nombre or "",
-        "estado": getattr(d, "estado", None),
-        "ubicacion": getattr(d, "ubicacion", None),
         "operator": getattr(d, "operator", None),
-        "activo": bool(getattr(d, "activo", True)),
-        "created_at": d.created_at.isoformat() if getattr(d, "created_at", None) else None,
-        "updated_at": d.updated_at.isoformat() if getattr(d, "updated_at", None) else None,
+        "ubicacion": getattr(d, "ubicacion", None),
+        "activo": bool(d.activo),
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "updated_at": d.updated_at.isoformat() if d.updated_at else None,
     }
-
 def get_thresholds():
     reserva = max(0, int(os.getenv("STOCK_RESERVA_LTS", "1") or 1))
     umbral_cfg = max(0, int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3))
