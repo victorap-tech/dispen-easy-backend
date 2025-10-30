@@ -806,31 +806,32 @@ def pagos_list():
 
     estado = (request.args.get("estado") or "").strip()
     qsearch = (request.args.get("q") or "").strip()
-    dispenser_id = request.args.get("dispenser_id", type=str)
+    dispenser_id = (request.args.get("dispenser_id") or "").strip()
     desde = request.args.get("desde")
     hasta = request.args.get("hasta")
 
     q = Pago.query
 
-    # 🔹 Filtrar por estado
+    # 🔹 Filtro por dispenser (usa el campo correcto)
+    if dispenser_id:
+        q = q.filter((Pago.dispenser_id == dispenser_id) | (Pago.device_id == dispenser_id))
+
+    # 🔹 Filtro por estado
     if estado:
         q = q.filter(Pago.estado == estado)
 
-    # 🔹 Filtrar por texto libre
+    # 🔹 Filtro por texto libre
     if qsearch:
         q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
 
-    # 🔹 Filtrar por dispenser (clave)
-    if dispenser_id:
-        q = q.filter(Pago.device_id == dispenser_id)
-
-    # 🔹 Filtrar por rango de fechas (opcional)
+    # 🔹 Filtros opcionales de fecha
     if desde:
         try:
             desde_dt = datetime.fromisoformat(desde)
             q = q.filter(Pago.created_at >= desde_dt)
         except Exception:
             pass
+
     if hasta:
         try:
             hasta_dt = datetime.fromisoformat(hasta)
