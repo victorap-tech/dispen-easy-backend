@@ -1833,14 +1833,41 @@ def check_stock_alert(producto, operador):
         print("Error al enviar alerta de bajo stock:", e)
 
 
-@app.post("/api/enviar_telegram")
+# ==========================================
+# 📤 Enviar reporte por Telegram (seguro con variables)
+# ==========================================
+import requests, os
+
+@app.route("/api/enviar_telegram", methods=["POST"])
 def enviar_telegram():
-    data = request.get_json()
-    mensaje = data.get("mensaje", "")
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
-    r = requests.post(url, json=payload)
-    return jsonify({"ok": True}) if r.status_code == 200 else ({"error": "telegram error"}, 500)
+    try:
+        data = request.get_json(force=True)
+        mensaje = data.get("mensaje", "")
+        if not mensaje:
+            return jsonify({"error": "mensaje vacío"}), 400
+
+        TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+        TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return jsonify({"error": "faltan variables TELEGRAM_*"}), 500
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": mensaje,
+            "parse_mode": "Markdown",
+        }
+
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            return jsonify({"ok": True})
+        else:
+            print("Error Telegram:", r.text)
+            return jsonify({"error": "telegram error"}), 500
+    except Exception as e:
+        print("Error enviando telegram:", e)
+        return jsonify({"error": str(e)}), 500
     
 # ============ MQTT init ============
 
