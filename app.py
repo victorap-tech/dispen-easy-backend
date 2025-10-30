@@ -654,19 +654,33 @@ def dispensers_update(did):
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
 
- try:
-    if "activo" in data:
-        d.activo = bool(data["activo"])
-    if "nombre" in data:
-        d.nombre = data["nombre"]
+    try:
+        # Actualiza solo los campos presentes en el JSON
+        if "activo" in data:
+            d.activo = bool(data["activo"])
+        if "estado" in data:
+            d.estado = data["estado"]
+        if "nombre" in data:
+            d.nombre = data["nombre"]
+        if "ubicacion" in data:
+            d.ubicacion = data["ubicacion"]
+        if "operator" in data:
+            d.operator = data["operator"]
 
-    db.session.commit()
-    return jsonify(serialize_dispenser(d))
-except Exception as e:
-    print("ERROR DISPENSER UPDATE:", e)
-    db.session.rollback()
-    return jsonify({"error": str(e)}), 500
+        # Mantener valores previos si no se enviaron
+        if "operator" not in data and hasattr(d, "operator"):
+            d.operator = d.operator
+        if "nombre" not in data and hasattr(d, "nombre"):
+            d.nombre = d.nombre
 
+        db.session.commit()
+        return jsonify(serialize_dispenser(d))
+
+    except Exception as e:
+        print("ERROR DISPENSER UPDATE:", e)
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+        
 @app.get("/api/productos")
 def productos_list():
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
