@@ -1833,27 +1833,14 @@ def check_stock_alert(producto, operador):
         print("Error al enviar alerta de bajo stock:", e)
 
 
-TELEGRAM_TOKEN = "TU_TOKEN_DE_BOT"
-CHAT_ID = "TU_CHAT_ID"  # tuyo o del grupo donde se envía
-
 @app.post("/api/enviar_telegram")
 def enviar_telegram():
     data = request.get_json()
     mensaje = data.get("mensaje", "")
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": mensaje,
-            "parse_mode": "Markdown"
-        }
-        r = requests.post(url, json=payload)
-        if r.status_code == 200:
-            return jsonify({"ok": True})
-        else:
-            return jsonify({"error": "Telegram error"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
+    r = requests.post(url, json=payload)
+    return jsonify({"ok": True}) if r.status_code == 200 else ({"error": "telegram error"}, 500)
     
 # ============ MQTT init ============
 
