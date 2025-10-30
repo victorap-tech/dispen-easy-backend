@@ -643,27 +643,39 @@ def require_admin():
 @app.put("/api/dispensers/<int:did>")
 def dispensers_update(did):
     ra = require_admin()
-    if ra: 
+    if ra:
         return ra
+
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
 
-    # Actualizar solo los campos presentes
-    if "activo" in data:
-        d.activo = bool(data["activo"])
-    if "estado" in data:
-        d.estado = data["estado"]
-    if "operator" in data:
-        d.operator = data["operator"]
-    if "ubicacion" in data:
-        d.ubicacion = data["ubicacion"]
-    
-    # 👉 Nueva línea importante: mantener los campos previos si no vienen en data
-    if "operator" not in data and hasattr(d, "operator"):
-        d.operator = d.operator  # mantiene el valor existente
+    try:
+        # Solo actualiza campos presentes en el JSON recibido
+        if "activo" in data:
+            d.activo = bool(data["activo"])
+        if "estado" in data:
+            d.estado = data["estado"]
+        if "nombre" in data:
+            d.nombre = data["nombre"]
+        if "ubicacion" in data:
+            d.ubicacion = data["ubicacion"]
+        if "operator" in data:
+            d.operator = data["operator"]
 
-    db.session.commit()
-    return jsonify(serialize_dispenser(d))
+        # ⚙️ Mantener valores previos si no se enviaron
+        if "operator" not in data and hasattr(d, "operator"):
+            d.operator = d.operator
+        if "nombre" not in data and hasattr(d, "nombre"):
+            d.nombre = d.nombre
+
+        db.session.commit()
+        return jsonify(serialize_dispenser(d))
+
+    except Exception as e:
+        print("ERROR DISPENSER UPDATE:", e)
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 @app.get("/api/productos")
 def productos_list():
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
