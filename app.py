@@ -202,16 +202,21 @@ def serialize_producto(p: Producto) -> dict:
     }
 
 def serialize_dispenser(d: Dispenser) -> dict:
+    # Buscar el operador activo asociado
+    op = OperatorToken.query.filter_by(dispenser_id=d.id, activo=True).first()
+    operator_name = op.nombre if op else None
+
     return {
         "id": d.id,
         "device_id": d.device_id,
         "nombre": d.nombre or "",
-        "estado": getattr(d, "estado", None),
+        "estado": "Activo" if d.activo else "Suspendido",
         "ubicacion": getattr(d, "ubicacion", None),
-        "operator": getattr(d, "operator", None),
-        "activo": bool(getattr(d, "activo", True)),
+        "operator": operator_name,
+        "activo": bool(d.activo),
         "created_at": d.created_at.isoformat() if getattr(d, "created_at", None) else None,
     }
+    
 def get_thresholds():
     reserva = max(0, int(os.getenv("STOCK_RESERVA_LTS", "1") or 1))
     umbral_cfg = max(0, int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3))
