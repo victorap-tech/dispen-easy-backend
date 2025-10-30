@@ -654,7 +654,7 @@ def dispensers_update(did):
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
 
-    try:
+ try:
     if "activo" in data:
         d.activo = bool(data["activo"])
     if "nombre" in data:
