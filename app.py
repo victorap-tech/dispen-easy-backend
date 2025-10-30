@@ -643,21 +643,27 @@ def require_admin():
 @app.put("/api/dispensers/<int:did>")
 def dispensers_update(did):
     ra = require_admin()
-    if ra: return ra
+    if ra: 
+        return ra
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
-    if "nombre" in data: d.nombre = str(data["nombre"]).strip()
-    if "activo" in data: d.activo = bool(data["activo"])
-    if "device_id" in data:
-        nid = str(data["device_id"]).strip()
-        if nid and nid != d.device_id:
-            if Dispenser.query.filter(Dispenser.device_id == nid, Dispenser.id != d.id).first():
-                return json_error("device_id ya usado", 409)
-            d.device_id = nid
-    db.session.commit()
-    # (si querés) _tg_send(f"🟢 Dispenser {d.nombre} ONLINE ✅")
-    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)})
 
+    # Actualizar solo los campos presentes
+    if "activo" in data:
+        d.activo = bool(data["activo"])
+    if "estado" in data:
+        d.estado = data["estado"]
+    if "operator" in data:
+        d.operator = data["operator"]
+    if "ubicacion" in data:
+        d.ubicacion = data["ubicacion"]
+    
+    # 👉 Nueva línea importante: mantener los campos previos si no vienen en data
+    if "operator" not in data and hasattr(d, "operator"):
+        d.operator = d.operator  # mantiene el valor existente
+
+    db.session.commit()
+    return jsonify(serialize_dispenser(d))
 @app.get("/api/productos")
 def productos_list():
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
