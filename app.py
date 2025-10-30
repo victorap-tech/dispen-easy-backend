@@ -655,15 +655,18 @@ def dispensers_update(did):
     data = request.get_json(force=True, silent=True) or {}
 
     try:
-        # Actualiza solo los campos presentes en el JSON
+        # --- Actualiza solo los campos presentes en el JSON recibido ---
         if "activo" in data:
             d.activo = bool(data["activo"])
-        if "estado" in data:
-            d.estado = data["estado"]
+            d.estado = "Activo" if d.activo else "Suspendido"
+            app.logger.info(f"🟢 Dispenser {d.id} {'activado' if d.activo else 'suspendido'}")
+
         if "nombre" in data:
             d.nombre = data["nombre"]
+
         if "ubicacion" in data:
             d.ubicacion = data["ubicacion"]
+
         if "operator" in data:
             d.operator = data["operator"]
 
@@ -674,11 +677,12 @@ def dispensers_update(did):
             d.nombre = d.nombre
 
         db.session.commit()
+        app.logger.info(f"✅ Dispenser {d.id} actualizado correctamente.")
         return jsonify(serialize_dispenser(d))
 
     except Exception as e:
-        print("ERROR DISPENSER UPDATE:", e)
         db.session.rollback()
+        app.logger.error(f"❌ Error al actualizar dispenser {d.id}: {e}")
         return jsonify({"error": str(e)}), 500
         
 @app.get("/api/productos")
