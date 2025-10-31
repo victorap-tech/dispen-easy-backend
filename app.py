@@ -356,20 +356,34 @@ def _sse_broadcast(data: dict):
 @app.get("/api/events/stream")
 def sse_stream():
     env = _admin_env()
-    if env and (request.args.get("secret") or "") != env:
+    # 🔧 Aceptar tanto ?secret como headers
+    secret = (
+        request.args.get("secret")
+        or request.headers.get("x-admin-secret")
+        or request.headers.get("x-admin-token")
+        or ""
+    )
+
+    if not env or secret != env:
         return json_error("unauthorized", 401)
+
     q = Queue(maxsize=100)
-    with _sse_lock: _sse_clients.append(q)
+    with _sse_lock:
+        _sse_clients.append(q)
+
     def gen():
         yield "retry: 5000\n\n"
         try:
             while True:
                 data = q.get()
-                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
         except GeneratorExit:
             with _sse_lock:
-                try: _sse_clients.remove(q)
-                except Exception: pass
+                try:
+                    _sse_clients.remove(q)
+                except Exception:
+                    pass
+
     return Response(gen(), mimetype="text/event-stream")
 
 # ===================== Control de estados ONLINE / OFFLINE =====================
