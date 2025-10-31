@@ -355,8 +355,10 @@ def _sse_broadcast(data: dict):
 
 @app.get("/api/events/stream")
 def sse_stream():
-    env = _admin_env()
-    # 🔧 Aceptar tanto ?secret como headers
+    # Obtener secreto válido del entorno
+    env = os.getenv("ADMIN_SECRET", "adm123")
+    
+    # Aceptar tanto query como headers
     secret = (
         request.args.get("secret")
         or request.headers.get("x-admin-secret")
@@ -364,7 +366,8 @@ def sse_stream():
         or ""
     )
 
-    if not env or secret != env:
+    # Validar
+    if secret != env:
         return json_error("unauthorized", 401)
 
     q = Queue(maxsize=100)
