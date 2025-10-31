@@ -355,10 +355,12 @@ def _sse_broadcast(data: dict):
 
 @app.get("/api/events/stream")
 def sse_stream():
-    # Obtener secreto válido del entorno
-    env = os.getenv("ADMIN_SECRET", "adm123")
-    
-    # Aceptar tanto query como headers
+    import os
+
+    # 🧩 Tomamos el secreto desde variable de entorno o valor por defecto
+    env_secret = os.getenv("ADMIN_SECRET", "adm123")
+
+    # 🧩 Aceptamos tanto ?secret como headers
     secret = (
         request.args.get("secret")
         or request.headers.get("x-admin-secret")
@@ -366,14 +368,17 @@ def sse_stream():
         or ""
     )
 
-    # Validar
-    if secret != env:
+    # 🧠 Verificamos que el secreto sea correcto
+    if secret.strip() != env_secret.strip():
+        print(f"⚠️ SSE rechazado. Recibido: {secret} | Esperado: {env_secret}")
         return json_error("unauthorized", 401)
 
+    # 🧱 Creamos la cola para eventos
     q = Queue(maxsize=100)
     with _sse_lock:
         _sse_clients.append(q)
 
+    # 🔁 Función generadora que envía los datos
     def gen():
         yield "retry: 5000\n\n"
         try:
