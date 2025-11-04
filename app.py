@@ -701,6 +701,16 @@ def dispensers_update(did):
 
         db.session.commit()
         app.logger.info(f"✅ Dispenser {d.id} actualizado correctamente.")
+        # --- Enviar evento SSE de cambio de estado ---
+try:
+    msg = {
+        "type": "device_status",
+        "device_id": d.device_id,
+        "status": "online" if d.activo else "suspended",
+    }
+    broadcast_event(msg)
+except Exception as e:
+    print(f"⚠️ Error enviando evento SSE: {e}")
         return jsonify(serialize_dispenser(d))
 
     except Exception as e:
