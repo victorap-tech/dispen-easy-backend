@@ -307,7 +307,6 @@ def _auth_guard():
         "/api/operator/productos/reset", "/api/operator/link",
         "/api/_debug/admin", "/api/debug/last_status",
         "/api/dispensers/status",
-        "/api/events/stream",
     }
     if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")) or p.startswith("/api/operator/"):
         return None
@@ -701,16 +700,6 @@ def dispensers_update(did):
 
         db.session.commit()
         app.logger.info(f"✅ Dispenser {d.id} actualizado correctamente.")
-        # --- Enviar evento SSE de cambio de estado ---
-try:
-    msg = {
-        "type": "device_status",
-        "device_id": d.device_id,
-        "status": "online" if d.activo else "suspended",
-    }
-    broadcast_event(msg)
-except Exception as e:
-    print(f"⚠️ Error enviando evento SSE: {e}")
         return jsonify(serialize_dispenser(d))
 
     except Exception as e:
@@ -983,7 +972,6 @@ def crear_preferencia_api():
     link = pref.get("init_point") or pref.get("sandbox_init_point")
     if not link: return json_error("preferencia_sin_link", 502, pref)
     return ok_json({"ok": True, "link": link, "raw": pref, "precio_final": monto_final})
-
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
