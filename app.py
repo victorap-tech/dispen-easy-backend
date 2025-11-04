@@ -307,6 +307,7 @@ def _auth_guard():
         "/api/operator/productos/reset", "/api/operator/link",
         "/api/_debug/admin", "/api/debug/last_status",
         "/api/dispensers/status",
+        "/api/events/stream",
     }
     if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")) or p.startswith("/api/operator/"):
         return None
