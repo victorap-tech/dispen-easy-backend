@@ -640,7 +640,6 @@ def dispensers_list():
     ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
     data = []
     for d in ds:
-        # Buscar operador asignado (si existe)
         operator_name = None
         if getattr(d, "operator_token_id", None):
             op = OperatorToken.query.filter_by(id=d.operator_token_id).first()
@@ -652,13 +651,12 @@ def dispensers_list():
             "nombre": getattr(d, "nombre", None),
             "device_id": getattr(d, "device_id", None),
             "ubicacion": getattr(d, "ubicacion", None),
-            "estado": getattr(d, "estado", None),
-            "stock": getattr(d, "stock", None),
-            "operator": operator_name,  # 🔹 agregado
+            "estado": "Activo" if d.activo else "Suspendido",  # ✅ CORRECTO
+            "activo": bool(d.activo),                         # ✅ NUEVO CAMPO EXPLÍCITO
+            "operator": operator_name,
         })
-
     return jsonify(data)
-
+    
 def require_admin():
     env = _admin_env()
     hdr = _admin_header()
