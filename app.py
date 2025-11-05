@@ -1271,6 +1271,35 @@ def operator_productos():
             for p in productos
         ],
     })
+
+@app.get("/api/operator/estado")
+def operator_estado():
+    """Devuelve el estado actual del dispenser asociado al operador."""
+    token = request.args.get("token") or request.headers.get("x-operator-token", "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token"}), 400
+
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
+    if not op:
+        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
+
+    disp = Dispenser.query.get(op.dispenser_id)
+    if not disp:
+        return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
+
+    return jsonify({
+        "ok": True,
+        "dispenser": {
+            "id": disp.id,
+            "device_id": disp.device_id,
+            "nombre": disp.nombre,
+            "activo": bool(disp.activo)
+        },
+        "operator": {
+            "token": op.token,
+            "nombre": op.nombre
+        }
+    })
 # ==========================================
 # ✅ REPOENER PRODUCTO (sumar stock)
 # ==========================================
