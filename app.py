@@ -1475,7 +1475,7 @@ precio_3 = float(precios.get("3", precio_1 * 3))
     # ================================
     # 🧭 HTML con los botones de selección
     # ================================
-    html = f"""
+html = f"""
     <html>
     <head>
         <meta charset="utf-8">
