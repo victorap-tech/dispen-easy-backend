@@ -1441,102 +1441,94 @@ def _html(title: str, body_html: str):
 # QR de selección
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
-    pid = _to_int(request.args.get("pid") or 0)
+    """Página de selección de litros (1L, 2L, 3L) para generar el pago"""
+    pid = request.args.get("pid", type=int)
+    op_token = request.args.get("op_token", "").strip()  # 🔹 Nuevo: token del operador si viene del QR
+
     if not pid:
         return _html("Producto no encontrado", "<p>Falta parámetro <code>pid</code>.</p>")
+
     prod = Producto.query.get(pid)
     if not prod or not prod.habilitado:
         return _html("No disponible", "<p>Producto sin stock o deshabilitado.</p>")
+
     disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
     if not disp or not disp.activo:
         return _html("No disponible", "<p>Dispenser no disponible.</p>")
 
-    backend = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    tmpl = """
-<!doctype html>
-<html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Seleccionar litros</title>
-<style>
-  body{margin:0;background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto}
-  .box{max-width:720px;margin:12vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px}
-  h1{margin:0 0 6px} .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
-  .opt{flex:1;min-width:170px;background:#111827;border:1px solid #374151;border-radius:12px;padding:14px;text-align:center;cursor:pointer}
-  .opt[aria-disabled="true"]{opacity:.5;cursor:not-allowed}
-  .name{opacity:.8;margin-bottom:4px}
-  .L{font-size:28px;font-weight:800}
-  .price{margin-top:6px;font-size:18px;font-weight:700;color:#10b981}
-  .note{opacity:.75;font-size:12px;margin-top:10px}
-  .err{color:#fca5a5}
-</style>
-</head><body>
-<div class="box">
-  <h1>__NOMBRE__</h1>
-  <div class="name">Dispenser <code>__DEVICE__</code> · Slot <b>__SLOT__</b></div>
-  <div id="row" class="row"></div>
-  <div id="msg" class="note"></div>
-</div>
-<script>
-  const fmt = n => new Intl.NumberFormat('es-AR',{style:'currency',currency:'ARS'}).format(n);
-  async function load(){
-    const res = await fetch('__BACKEND__/api/productos/__PID__/opciones');
-    const js = await res.json();
-    const row = document.getElementById('row');
-    const msg = document.getElementById('msg');
-    row.innerHTML = '';
+    precios = json.loads(prod.bundle_precios or "{}")
+    precio_1 = precios.get("1", prod.precio)
+    precio_2 = precios.get("2", precio_1 * 2)
+    precio_3 = precios.get("3", precio_1 * 3)
 
-    if(!js.ok){
-      msg.innerHTML = '<span class="err">Disculpe, producto sin stock o en reserva crítica.</span>';
-      return;
-    }
+    # ================================
+    # 🧭 HTML con los botones de selección
+    # ================================
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Seleccionar cantidad</title>
+        <style>
+            body {{
+                background-color: #111;
+                color: white;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                margin-top: 100px;
+            }}
+            button {{
+                font-size: 22px;
+                margin: 10px;
+                padding: 15px 30px;
+                border: none;
+                border-radius: 12px;
+                cursor: pointer;
+                background-color: #007bff;
+                color: white;
+            }}
+            button:hover {{
+                background-color: #0056b3;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>{prod.nombre}</h2>
+        <p>Seleccioná la cantidad a comprar:</p>
 
-    let disponibles = 0;
-    js.opciones.forEach(o=>{
-      const d = document.createElement('div');
-      d.className='opt';
-      if(!o.disponible) d.setAttribute('aria-disabled','true'); else disponibles++;
+        <button onclick="pagar(1)">1 L — ${precio_1}</button>
+        <button onclick="pagar(2)">2 L — ${precio_2}</button>
+        <button onclick="pagar(3)">3 L — ${precio_3}</button>
 
-      d.innerHTML = `
-        <div class="L">${o.litros} L</div>
-        <div class="price">${o.precio_final ? fmt(o.precio_final) : '—'}</div>`;
+        <script>
+        async function pagar(bundle) {{
+            const body = {{
+                product_id: {pid},
+                bundle: bundle,
+                op_token: "{op_token}"  // 🔹 Enviamos token del operador
+            }};
+            try {{
+                const resp = await fetch('/api/pagos/preferencia', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(body)
+                }});
+                const data = await resp.json();
+                if (data.ok && data.url) {{
+                    window.location.href = data.url;
+                }} else {{
+                    alert('Error al generar el pago: ' + (data.error || 'Desconocido'));
+                }}
+            }} catch (err) {{
+                alert('Error de conexión: ' + err);
+            }}
+        }}
+        </script>
+    </body>
+    </html>
+    """
 
-      d.onclick = async ()=>{
-        if(!o.disponible) return;
-        d.style.opacity=.6;
-        try{
-          const r = await fetch('__BACKEND__/api/pagos/preferencia',{
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ product_id:__PID__, litros:o.litros })
-          });
-          const jr = await r.json();
-          if(jr.ok && jr.link) window.location.href = jr.link;
-          else alert(jr.error || 'No se pudo crear el pago');
-        }catch(e){ alert('Error de red'); }
-        d.style.opacity=1;
-      };
-      row.appendChild(d);
-    });
-
-    if(disponibles === 0){
-      msg.innerHTML = '<span class="err">Disculpe, producto sin stock. Vuelva a intentar más tarde.</span>';
-    } else {
-      msg.innerHTML = 'Elegí la cantidad a dispensar.';
-    }
-  }
-  load();
-</script>
-</body></html>
-"""
-    html = (
-        tmpl
-        .replace("__BACKEND__", backend)
-        .replace("__PID__", str(pid))
-        .replace("__NOMBRE__", prod.nombre)
-        .replace("__DEVICE__", disp.device_id or "")
-        .replace("__SLOT__", str(prod.slot_id))
-    )
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
-
+    return _html("Seleccionar cantidad", html)
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
