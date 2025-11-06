@@ -1673,7 +1673,8 @@ def operator_update_producto():
 # ===============================
 @app.get("/api/operator/productos/qr/<int:product_id>")
 def operator_generar_qr(product_id):
-    """Genera un QR con selector de litros, reflejo del Admin pero usando la cuenta MercadoPago del operador"""
+    """Genera y muestra el QR estático del producto para el operador, 
+    que lleva al selector de litros (/ui/seleccionar) usando su cuenta MercadoPago"""
     token = request.headers.get("x-operator-token", "").strip()
     if not token:
         return jsonify({"ok": False, "error": "Token requerido"}), 401
@@ -1690,29 +1691,57 @@ def operator_generar_qr(product_id):
     if not disp or not disp.activo:
         return jsonify({"ok": False, "error": "Dispenser no disponible"}), 400
 
-    # ✅ Generar link igual que el admin, pero incluyendo el token del operador
+    # ✅ El QR debe apuntar al selector de litros, incluyendo el token del operador
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     link = f"{backend_base}/ui/seleccionar?pid={product_id}&op_token={token}"
 
-    # (Opcional) generar QR base64 si el frontend quiere mostrar la imagen directamente
+    # 🧾 Generar imagen QR (base64)
     import qrcode
     import io, base64
     qr_buffer = io.BytesIO()
     qrcode.make(link).save(qr_buffer, format="PNG")
     qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode("utf-8")
 
-    return jsonify({
-        "ok": True,
-        "url": link,
-        "qr": qr_base64,
-        "producto": {
-            "id": prod.id,
-            "nombre": prod.nombre,
-            "precio": prod.precio,
-            "dispenser_id": prod.dispenser_id,
-            "dispenser_nombre": disp.nombre
-        }
-    })
+    # 🖥️ Devolver HTML que muestra el QR y link (para imprimir o pegar)
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>QR del producto</title>
+        <style>
+            body {{
+                background-color: #111;
+                color: white;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                margin-top: 60px;
+            }}
+            img {{
+                margin-top: 30px;
+                width: 300px;
+                height: 300px;
+                border: 6px solid #007bff;
+                border-radius: 16px;
+                background-color: white;
+                padding: 10px;
+            }}
+            a {{
+                color: #00bfff;
+                font-size: 18px;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>QR del producto: {prod.nombre}</h2>
+        <p>📍 Escaneá este código para abrir el selector de litros</p>
+        <img src="data:image/png;base64,{qr_base64}" alt="QR del producto"><br>
+        <p><a href="{link}" target="_blank">{link}</a></p>
+        <p>💳 Pagás con la cuenta MercadoPago vinculada al operador: <b>{op.nombre if hasattr(op, 'nombre') else 'Operador'}</b></p>
+    </body>
+    </html>
+    """
+
+    return make_response(html)
     #-----PANEL CONTABLE-----#
 
 @app.route('/api/contabilidad/resumen', methods=['GET'])
