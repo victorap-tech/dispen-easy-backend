@@ -1457,6 +1457,9 @@ def ui_seleccionar():
     if not disp or not disp.activo:
         return _html("No disponible", "<p>Dispenser no disponible.</p>")
 
+    if isinstance(prod.bundle_precios, dict):
+    precios = prod.bundle_precios
+else:
     precios = json.loads(prod.bundle_precios or "{}")
     precio_1 = precios.get("1", prod.precio)
     precio_2 = precios.get("2", precio_1 * 2)
