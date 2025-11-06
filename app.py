@@ -1690,10 +1690,8 @@ def operator_generar_qr(product_id):
         return jsonify({"ok": False, "error": "Cuenta de MercadoPago no vinculada"}), 400
 
     # ===============================
-    # 🧾 Creamos la preferencia de pago
+    # 🧾 Crear preferencia de pago en MercadoPago
     # ===============================
-    import requests
-
     headers = {
         "Authorization": f"Bearer {op.mp_access_token}",
         "Content-Type": "application/json",
@@ -1711,38 +1709,54 @@ def operator_generar_qr(product_id):
         "metadata": {
             "product_id": prod.id,
             "dispenser_id": prod.dispenser_id,
-            "operator_id": op.id,
+            "operator_token": op.token,
         },
         "back_urls": {
-            "success": "https://dispen-easy-web-production.up.railway.app/success",
-            "failure": "https://dispen-easy-web-production.up.railway.app/failure",
-            "pending": "https://dispen-easy-web-production.up.railway.app/pending",
+            "success": "https://dispen-easy-web-production.up.railway.app/gracias?status=success",
+            "failure": "https://dispen-easy-web-production.up.railway.app/gracias?status=failure",
+            "pending": "https://dispen-easy-web-production.up.railway.app/gracias?status=pending",
         },
         "auto_return": "approved",
     }
 
-    resp = requests.post("https://api.mercadopago.com/checkout/preferences", 
-                         headers=headers, json=payload)
+    try:
+        resp = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers=headers, json=payload, timeout=15
+        )
+        if resp.status_code != 201:
+            try:
+                data = resp.json()
+                detalle = data.get("message", resp.text)
+            except Exception:
+                detalle = resp.text[:200]
+            return jsonify({
+                "ok": False,
+                "error": f"MercadoPago devolvió error ({resp.status_code})",
+                "detalle": detalle
+            }), 400
 
-    if resp.status_code != 201:
+        data = resp.json()
+        init_point = data.get("init_point") or data.get("sandbox_init_point")
+        if not init_point:
+            return jsonify({"ok": False, "error": "Respuesta sin init_point"}), 400
+
+        return jsonify({
+            "ok": True,
+            "url": init_point,
+            "producto": {
+                "id": prod.id,
+                "nombre": prod.nombre,
+                "precio": prod.precio
+            }
+        })
+
+    except Exception as e:
         return jsonify({
             "ok": False,
-            "error": f"Error al generar preferencia: {resp.text}"
+            "error": "Error al conectar con MercadoPago",
+            "detalle": str(e)
         }), 500
-
-    data = resp.json()
-    init_point = data.get("init_point")
-
-    return jsonify({
-        "ok": True,
-        "url": init_point,
-        "producto": {
-            "id": prod.id,
-            "nombre": prod.nombre,
-            "precio": prod.precio
-        }
-    })
-
     #-----PANEL CONTABLE-----#
 
 @app.route('/api/contabilidad/resumen', methods=['GET'])
