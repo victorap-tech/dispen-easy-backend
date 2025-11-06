@@ -1539,7 +1539,7 @@ html = f"""
     </html>
     """
 
-    return _html("Seleccionar cantidad", html)
+return _html("Seleccionar cantidad", html)
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
