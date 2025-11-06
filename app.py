@@ -1668,95 +1668,46 @@ def operator_update_producto():
 # ===============================
 @app.get("/api/operator/productos/qr/<int:product_id>")
 def operator_generar_qr(product_id):
-    """Genera un link de pago (QR) desde la cuenta MercadoPago del operador vinculado"""
+    """Genera un QR con selector de litros, reflejo del Admin pero usando la cuenta MercadoPago del operador"""
     token = request.headers.get("x-operator-token", "").strip()
     if not token:
         return jsonify({"ok": False, "error": "Token requerido"}), 401
 
-    op = OperatorToken.query.filter_by(token=token).first()
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
     if not op:
-        return jsonify({"ok": False, "error": "Operador no encontrado"}), 401
+        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
 
     prod = Producto.query.get(product_id)
-    if not prod:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+    if not prod or prod.dispenser_id != op.dispenser_id:
+        return jsonify({"ok": False, "error": "Producto no autorizado o inexistente"}), 404
 
-    # Verificamos que el producto pertenezca al dispenser del operador
-    if prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "No autorizado para este producto"}), 403
+    disp = Dispenser.query.get(prod.dispenser_id)
+    if not disp or not disp.activo:
+        return jsonify({"ok": False, "error": "Dispenser no disponible"}), 400
 
-    # Verificamos que el operador tenga cuenta MP vinculada
-    if not op.mp_access_token:
-        return jsonify({"ok": False, "error": "Cuenta de MercadoPago no vinculada"}), 400
+    # ✅ Generar link igual que el admin, pero incluyendo el token del operador
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    link = f"{backend_base}/ui/seleccionar?pid={product_id}&op_token={token}"
 
-    # ===============================
-    # 🧾 Crear preferencia de pago en MercadoPago
-    # ===============================
-    headers = {
-        "Authorization": f"Bearer {op.mp_access_token}",
-        "Content-Type": "application/json",
-    }
+    # (Opcional) generar QR base64 si el frontend quiere mostrar la imagen directamente
+    import qrcode
+    import io, base64
+    qr_buffer = io.BytesIO()
+    qrcode.make(link).save(qr_buffer, format="PNG")
+    qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode("utf-8")
 
-    payload = {
-        "items": [
-            {
-                "title": prod.nombre,
-                "quantity": 1,
-                "unit_price": float(prod.precio),
-                "currency_id": "ARS",
-            }
-        ],
-        "metadata": {
-            "product_id": prod.id,
+    return jsonify({
+        "ok": True,
+        "url": link,
+        "qr": qr_base64,
+        "producto": {
+            "id": prod.id,
+            "nombre": prod.nombre,
+            "precio": prod.precio,
             "dispenser_id": prod.dispenser_id,
-            "operator_token": op.token,
-        },
-        "back_urls": {
-            "success": "https://dispen-easy-web-production.up.railway.app/gracias?status=success",
-            "failure": "https://dispen-easy-web-production.up.railway.app/gracias?status=failure",
-            "pending": "https://dispen-easy-web-production.up.railway.app/gracias?status=pending",
-        },
-        "auto_return": "approved",
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.mercadopago.com/checkout/preferences",
-            headers=headers, json=payload, timeout=15
-        )
-        if resp.status_code != 201:
-            try:
-                data = resp.json()
-                detalle = data.get("message", resp.text)
-            except Exception:
-                detalle = resp.text[:200]
-            return jsonify({
-                "ok": False,
-                "error": f"MercadoPago devolvió error ({resp.status_code})",
-                "detalle": detalle
-            }), 400
-
-        data = resp.json()
-        init_point = data.get("init_point") or data.get("sandbox_init_point")
-        if not init_point:
-            return jsonify({"ok": False, "error": "Respuesta sin init_point"}), 400
-
-        return jsonify({
-            "ok": True,
-            "url": init_point,
-            "producto": {
-                "id": prod.id,
-                "nombre": prod.nombre,
-                "precio": prod.precio
-            }
-        })
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "Error al conectar con MercadoPago",
-            "detalle": str(e)
-        }), 500
+            "dispenser_nombre": disp.nombre
+        }
+    })
     #-----PANEL CONTABLE-----#
 
 @app.route('/api/contabilidad/resumen', methods=['GET'])
