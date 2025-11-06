@@ -1444,7 +1444,7 @@ def _html(title: str, body_html: str):
 def ui_seleccionar():
     """Página de selección de litros (1L, 2L, 3L) para generar el pago"""
     pid = request.args.get("pid", type=int)
-    op_token = request.args.get("op_token", "").strip()  # 🔹 Nuevo: token del operador si viene del QR
+    op_token = request.args.get("op_token", "").strip()  # 🔹 Token del operador si viene del QR
 
     if not pid:
         return _html("Producto no encontrado", "<p>Falta parámetro <code>pid</code>.</p>")
@@ -1457,25 +1457,26 @@ def ui_seleccionar():
     if not disp or not disp.activo:
         return _html("No disponible", "<p>Dispenser no disponible.</p>")
 
-   # 🔧 Cargar precios de bundle_precios (acepta dict o texto JSON)
-try:
-    if isinstance(prod.bundle_precios, dict):
-        precios = prod.bundle_precios
-    else:
-        precios = json.loads(prod.bundle_precios or "{}")
-except Exception as e:
-    precios = {}
+    # 🔧 Cargar precios de bundle_precios (acepta dict o texto JSON)
+    try:
+        if isinstance(prod.bundle_precios, dict):
+            precios = prod.bundle_precios
+        else:
+            precios = json.loads(prod.bundle_precios or "{}")
+    except Exception as e:
+        precios = {}
 
-# Si por alguna razón no hay precios configurados, usar el precio base
-precio_base = float(prod.precio or 0)
+    # Si por alguna razón no hay precios configurados, usar el precio base
+    precio_base = float(prod.precio or 0)
 
-precio_1 = float(precios.get("1", precio_base))
-precio_2 = float(precios.get("2", precio_1 * 2))
-precio_3 = float(precios.get("3", precio_1 * 3))
+    precio_1 = float(precios.get("1", precio_base))
+    precio_2 = float(precios.get("2", precio_1 * 2))
+    precio_3 = float(precios.get("3", precio_1 * 3))
+
     # ================================
     # 🧭 HTML con los botones de selección
     # ================================
-html = f"""
+    html = f"""
     <html>
     <head>
         <meta charset="utf-8">
@@ -1505,6 +1506,7 @@ html = f"""
     </head>
     <body>
         <h2>{prod.nombre}</h2>
+        <p>💳 Pagás con la cuenta MercadoPago vinculada al operador</p>
         <p>Seleccioná la cantidad a comprar:</p>
 
         <button onclick="pagar(1)">1 L — ${precio_1}</button>
@@ -1516,7 +1518,7 @@ html = f"""
             const body = {{
                 product_id: {pid},
                 bundle: bundle,
-                op_token: "{op_token}"  // 🔹 Enviamos token del operador
+                op_token: "{op_token}"  // Enviamos token del operador
             }};
             try {{
                 const resp = await fetch('/api/pagos/preferencia', {{
@@ -1539,7 +1541,7 @@ html = f"""
     </html>
     """
 
-        return _html("Seleccionar cantidad", html)
+    return _html("Seleccionar cantidad", html)
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
