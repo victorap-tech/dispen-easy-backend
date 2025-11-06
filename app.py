@@ -1457,14 +1457,21 @@ def ui_seleccionar():
     if not disp or not disp.activo:
         return _html("No disponible", "<p>Dispenser no disponible.</p>")
 
+   # 🔧 Cargar precios de bundle_precios (acepta dict o texto JSON)
+try:
     if isinstance(prod.bundle_precios, dict):
-       precios = prod.bundle_precios
+        precios = prod.bundle_precios
     else:
-       precios = json.loads(prod.bundle_precios or "{}")
-       precio_1 = precios.get("1", prod.precio)
-       precio_2 = precios.get("2", precio_1 * 2)
-       precio_3 = precios.get("3", precio_1 * 3)
+        precios = json.loads(prod.bundle_precios or "{}")
+except Exception as e:
+    precios = {}
 
+# Si por alguna razón no hay precios configurados, usar el precio base
+precio_base = float(prod.precio or 0)
+
+precio_1 = float(precios.get("1", precio_base))
+precio_2 = float(precios.get("2", precio_1 * 2))
+precio_3 = float(precios.get("3", precio_1 * 3))
     # ================================
     # 🧭 HTML con los botones de selección
     # ================================
