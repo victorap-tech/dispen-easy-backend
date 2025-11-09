@@ -19,7 +19,12 @@ from sqlalchemy import UniqueConstraint, text as sqltext, and_
 from datetime import datetime
 import paho.mqtt.client as mqtt
 
-# --- FUNCIÓN PARA ENVIAR MENSAJES POR TELEGRAM ---
+# --- FUNCIÓN PAR# === CONFIGURACIÓN BASE ===
+import os
+
+# URL base del frontend (React) que usa el sistema
+FRONT_BASE = os.getenv("FRONT_BASE", "https://dispen-easy-web-production.up.railway.app")A ENVIAR MENSAJES POR TELEGRAM ---
+
 def send_telegram_message(chat_id, text):
     """
     Envía un mensaje simple por Telegram al chat_id indicado.
