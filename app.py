@@ -917,7 +917,7 @@ def api_pagos_preferencia():
         print("🟢 Datos recibidos:", data)
 
         # Validar operador
-        op = Operator.query.filter_by(token=op_token).first()
+        op = OperatorToken.query.filter_by(token=op_token).first()
         if not op:
             print("❌ Operador no válido")
             return jsonify(ok=False, error="Operador no válido")
