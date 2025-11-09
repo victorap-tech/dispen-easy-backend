@@ -20,7 +20,8 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 
 # URL base del frontend (React) que usa el sistema
-FRONT_BASE = os.getenv("FRONT_BASE", "https://dispen-easy-web-production.up.railway.app")A ENVIAR MENSAJES POR TELEGRAM ---
+FRONT_BASE = os.getenv("FRONT_BASE", 
+"https://dispen-easy-web-production.up.railway.app")
 
 def send_telegram_message(chat_id, text):
     """
