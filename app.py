@@ -986,7 +986,8 @@ def api_pagos_preferencia():
 
     except Exception as e:
         print("💥 Error generando preferencia:", e)
-        return jsonify(ok=False, error=str(e)))
+        return jsonify(ok=False, error=str(e))
+
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
