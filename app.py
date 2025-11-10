@@ -1864,7 +1864,56 @@ def ranking_productos():
         "top": top,
         "low": low
     })
-    
+
+@app.route("/api/admin/productos/qr/<int:pid>")
+def api_admin_qr(pid):
+    from flask import jsonify
+    token = request.headers.get("x-admin-token") or request.args.get("token")
+    if token != os.getenv("ADMIN_TOKEN"):
+        return jsonify({"ok": False, "error": "Token inválido"}), 403
+
+    prod = Producto.query.get(pid)
+    if not prod:
+        return _html("QR", "<p>Producto no encontrado</p>")
+
+    url = f"{FRONT_BASE}/ui/seleccionar?pid={pid}&op_token=admin_global"
+
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>QR del producto: {prod.nombre}</title>
+        <style>
+            body {{
+                background-color: #0b1220;
+                color: #e5e7eb;
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding-top: 50px;
+            }}
+            img {{
+                border: 6px solid #3b82f6;
+                border-radius: 20px;
+                background: white;
+                padding: 10px;
+                margin: 20px auto;
+            }}
+            a {{
+                color: #60a5fa;
+                text-decoration: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>QR del producto: {prod.nombre}</h2>
+        <p>📍 Escaneá este código para abrir el selector de litros</p>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={url}">
+        <p><a href="{url}">{url}</a></p>
+        <p style="margin-top:30px;opacity:.8">Pagás con la cuenta MercadoPago del administrador</p>
+    </body>
+    </html>
+    """
+    return _html("QR", html)    
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
