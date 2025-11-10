@@ -1530,7 +1530,7 @@ def ui_seleccionar():
     </head>
     <body>
         <h2>{prod.nombre}</h2>
-        <p>💳 Pagás con la cuenta MercadoPago vinculada al operador</p>
+        <p>💳 Pagás con la cuenta MercadoPago vinculada al {{ tipo_cuenta }}</p>
         <p>Seleccioná la cantidad a comprar:</p>
 
         <button onclick="pagar(1)">1 L — ${precio_1}</button>
