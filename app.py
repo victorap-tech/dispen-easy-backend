@@ -1467,105 +1467,93 @@ def _html(title: str, body_html: str):
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
     """Página de selección de litros (1L, 2L, 3L) para generar el pago"""
-    pid = request.args.get("pid", type=int)
-    op_token = request.args.get("op_token", "").strip()  # 🔹 Token del operador si viene del QR
+    pid = request.args.get("pid", "").strip()
+    op_token = request.args.get("op_token", "").strip()  # Token del operador si viene del QR
 
     if not pid:
-        return _html("Producto no encontrado", "<p>Falta parámetro <code>pid</code>.</p>")
+        return "<p>Falta parámetro <code>pid</code>.</p>"
 
     prod = Producto.query.get(pid)
     if not prod or not prod.habilitado:
-        return _html("No disponible", "<p>Producto sin stock o deshabilitado.</p>")
+        return "<p>Producto sin stock o deshabilitado.</p>"
 
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+    disp = Dispenser.query.get(prod.dispenser_id)
     if not disp or not disp.activo:
-        return _html("No disponible", "<p>Dispenser no disponible.</p>")
+        return "<p>Dispenser no disponible.</p>"
 
-    # 🔧 Cargar precios de bundle_precios (acepta dict o texto JSON)
-    try:
-        if isinstance(prod.bundle_precios, dict):
-            precios = prod.bundle_precios
-        else:
-            precios = json.loads(prod.bundle_precios or "{}")
-    except Exception as e:
-        precios = {}
+    # 🔹 Determinar si el QR pertenece a un operador o al admin
+    tipo_cuenta = "administrador" if not op_token else "operador"
 
-    # Si por alguna razón no hay precios configurados, usar el precio base
-    precio_base = float(prod.precio or 0)
+    # Construir bundles (1L, 2L, 3L)
+    precios = []
+    if prod.precio:
+        precios.append((1, prod.precio))
+    if "2" in (prod.bundle_precios or {}):
+        precios.append((2, prod.bundle_precios["2"]))
+    if "3" in (prod.bundle_precios or {}):
+        precios.append((3, prod.bundle_precios["3"]))
 
-    precio_1 = float(precios.get("1", precio_base))
-    precio_2 = float(precios.get("2", precio_1 * 2))
-    precio_3 = float(precios.get("3", precio_1 * 3))
-
-    # ================================
-    # 🧭 HTML con los botones de selección
-    # ================================
+    # Render HTML
     html = f"""
     <html>
     <head>
-        <meta charset="utf-8">
+        <meta charset='utf-8'>
         <title>Seleccionar cantidad</title>
         <style>
             body {{
-                background-color: #111;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                margin-top: 100px;
+                background-color: #0b1220;
+                color: #e5e7eb;
+                font-family: 'Inter', sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
             }}
-            button {{
-                font-size: 22px;
-                margin: 10px;
-                padding: 15px 30px;
-                border: none;
+            .card {{
+                background: rgba(255,255,255,0.05);
+                padding: 24px;
                 border-radius: 12px;
-                cursor: pointer;
-                background-color: #007bff;
-                color: white;
+                text-align: center;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             }}
-            button:hover {{
-                background-color: #0056b3;
+            h1 {{ font-size: 22px; margin-bottom: 6px; }}
+            h2 {{ font-size: 18px; margin: 0 0 16px 0; }}
+            p {{ margin: 6px 0 16px 0; opacity: 0.9; }}
+            a {{
+                display: inline-block;
+                background: #3b82f6;
+                color: #fff;
+                text-decoration: none;
+                padding: 10px 18px;
+                border-radius: 10px;
+                font-weight: bold;
+                margin: 6px;
             }}
+            a:hover {{ background: #2563eb; }}
         </style>
     </head>
     <body>
-        <h2>{prod.nombre}</h2>
-        <p>💳 Pagás con la cuenta MercadoPago vinculada al {{ tipo_cuenta }}</p>
-        <p>Seleccioná la cantidad a comprar:</p>
+        <div class="card">
+            <h1>Seleccionar cantidad</h1>
+            <h2>{prod.nombre}</h2>
+            <p>💳 Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
+            <p>Seleccioná la cantidad a comprar:</p>
+    """
 
-        <button onclick="pagar(1)">1 L — ${precio_1}</button>
-        <button onclick="pagar(2)">2 L — ${precio_2}</button>
-        <button onclick="pagar(3)">3 L — ${precio_3}</button>
+    for litros, precio in precios:
+        html += f"""
+            <a href="/api/pagos/preferencia?pid={prod.id}&litros={litros}{f'&op_token={op_token}' if op_token else ''}">
+                {litros} L — ${precio}
+            </a>
+        """
 
-        <script>
-        async function pagar(bundle) {{
-            const body = {{
-                product_id: {pid},
-                bundle: bundle,
-                op_token: "{op_token}"  // Enviamos token del operador
-            }};
-            try {{
-                const resp = await fetch('/api/pagos/preferencia', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify(body)
-                }});
-                const data = await resp.json();
-                if (data.ok && data.url) {{
-                    window.location.href = data.url;
-                }} else {{
-                    alert('Error al generar el pago: ' + (data.error || 'Desconocido'));
-                }}
-            }} catch (err) {{
-                alert('Error de conexión: ' + err);
-            }}
-        }}
-        </script>
+    html += """
+        </div>
     </body>
     </html>
     """
 
-    return _html("Seleccionar cantidad", html)
+    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
