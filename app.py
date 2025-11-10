@@ -912,96 +912,112 @@ def pagos_list():
 
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
-def crear_preferencia_api():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = _to_int(data.get("product_id") or 0)
-    litros = _to_int(data.get("litros") or 0) or 1
-
-    # --- Determinar si es operador o admin ---
-    op_token = (request.headers.get("x-operator-token") or "").strip()
-    if not op_token:
-        # → ADMIN: usa automáticamente el token test/live configurado
-        mp_access_token, base_api = get_mp_token_and_base()
-        tipo_cuenta = "admin"
-        print(f"🧩 Generando pago con cuenta del ADMINISTRADOR (modo={get_mp_mode()})")
-    else:
-        # → OPERADOR
-        op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-        if not op:
-            return json_error("operator_invalid", 401, "Token de operador inválido o inactivo")
-        mp_access_token = getattr(op, "mp_access_token", "") or ""
-        base_api = "https://api.mercadopago.com"
-        tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
-        print(f"🧩 Generando pago con cuenta del OPERADOR {op.nombre or '(sin nombre)'}")
-
-    if not mp_access_token:
-        return json_error("MP access_token no configurado", 500, {"tipo_cuenta": tipo_cuenta})
-
-    # --- Validaciones de producto/dispenser ---
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return json_error("producto no disponible", 400)
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return json_error("dispenser no disponible", 400)
-
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) < reserva:
-        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
-
-    monto_final = compute_total_price_ars(prod, litros)
-
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": f"{prod.nombre} · {litros} L",
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final),
-        }],
-        "description": f"{prod.nombre} · {litros} L",
-        "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
-            "producto": prod.nombre,
-            "litros": int(litros),
-            "dispenser_id": int(disp.id),
-            "device_id": disp.device_id,
-            "precio_final": int(monto_final),
-        },
-        "external_reference": external_ref,
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
-        },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
-    }
-
+def api_pagos_preferencia():
+    """
+    Genera una preferencia de pago en MercadoPago usando el token del operador si el dispenser tiene uno asignado,
+    o la cuenta del administrador en caso contrario.
+    """
     try:
-        r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={"Authorization": f"Bearer {mp_access_token}", "Content-Type": "application/json"},
-            json=body, timeout=20
-        )
-        r.raise_for_status()
+        data = request.get_json(force=True)
+        pid = _to_int(data.get("product_id") or data.get("pid") or 0)
+        bundle = _to_int(data.get("bundle") or data.get("litros") or 1)
+        op_token = (data.get("op_token") or "").strip()
+
+        print("📦 Datos recibidos:", data)
+
+        # --- Obtener producto y dispenser ---
+        prod = Producto.query.get(pid)
+        if not prod or not prod.habilitado:
+            return jsonify(ok=False, error="producto no disponible")
+
+        disp = Dispenser.query.get(prod.dispenser_id)
+        if not disp or not disp.activo:
+            return jsonify(ok=False, error="dispenser no disponible")
+
+        # --- Determinar qué token usar ---
+        mp_access_token = None
+        tipo_cuenta = None
+
+        if op_token:
+            # 🔹 Caso: operador logueado genera el pago
+            op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
+            if not op:
+                return jsonify(ok=False, error="Operador no válido")
+            if not getattr(op, "mp_access_token", None):
+                return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
+            mp_access_token = op.mp_access_token
+            tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
+            print(f"🟢 Generando pago con cuenta del OPERADOR: {op.nombre or '(sin nombre)'}")
+
+        else:
+            # 🔹 Caso: admin genera QR desde panel
+            op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
+            if op and getattr(op, "mp_access_token", None):
+                # Si el dispenser tiene operador asignado, usar su cuenta
+                mp_access_token = op.mp_access_token
+                tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
+                print(f"🟠 Admin generando QR usando cuenta del OPERADOR: {op.nombre or '(sin nombre)'}")
+            else:
+                # Si no hay operador, usar la del admin
+                mp_access_token, _ = get_mp_token_and_base()
+                tipo_cuenta = "administrador"
+                print(f"🔵 Admin generando QR con cuenta del ADMINISTRADOR")
+
+        if not mp_access_token:
+            return jsonify(ok=False, error="No se encontró un access_token válido")
+
+        # --- Validar stock ---
+        _, reserva = get_thresholds()
+        if (int(prod.cantidad) - bundle) < reserva:
+            return jsonify(ok=False, error="Producto en nivel de reserva")
+
+        # --- Calcular precio ---
+        litros = str(bundle)
+        if litros == "1":
+            precio = prod.precio
+        else:
+            precio = (prod.bundle_precios or {}).get(litros)
+        if not precio:
+            return jsonify(ok=False, error="Precio no definido para ese volumen")
+
+        # --- Crear preferencia en MercadoPago ---
+        import mercadopago
+        sdk = mercadopago.SDK(mp_access_token)
+
+        pref_data = {
+            "items": [{
+                "title": f"{prod.nombre} ({litros}L)",
+                "quantity": 1,
+                "currency_id": "ARS",
+                "unit_price": float(precio)
+            }],
+            "metadata": {
+                "product_id": prod.id,
+                "litros": litros,
+                "slot_id": prod.slot_id,
+                "dispenser_id": disp.id,
+                "device_id": disp.device_id,
+                "tipo_cuenta": tipo_cuenta
+            },
+            "back_urls": {
+                "success": f"{WEB_URL}/gracias?status=success",
+                "failure": f"{WEB_URL}/gracias?status=failure",
+                "pending": f"{WEB_URL}/gracias?status=pending"
+            },
+            "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
+            "auto_return": "approved",
+            "statement_descriptor": "DISPEN-EASY"
+        }
+
+        pref = sdk.preference().create(pref_data)
+        init_point = pref["response"].get("init_point") or pref["response"].get("sandbox_init_point")
+
+        print(f"✅ Preferencia creada para {tipo_cuenta}: {init_point}")
+        return jsonify(ok=True, url=init_point)
+
     except Exception as e:
-        detail = getattr(r, "text", str(e))[:600]
-        app.logger.error(f"[MP] Error generando preferencia ({tipo_cuenta}): {detail}")
-        return json_error("mp_preference_failed", 502, detail)
-
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-
-    print(f"✅ Preferencia generada correctamente para {tipo_cuenta}: {link}")
-    return ok_json({"ok": True, "link": link, "raw": pref, "precio_final": monto_final})
+        print("❌ Error generando preferencia:", e)
+        return jsonify(ok=False, error=str(e))
 
 # Webhook MP
 @app.post("/api/mp/webhook")
