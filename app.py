@@ -920,94 +920,86 @@ def pagos_list():
 
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
-def generar_preferencia_pago():
+def api_pagos_preferencia():
+    """Genera una preferencia de pago en MercadoPago usando el token del operador o la cuenta del administrador."""
     try:
         data = request.get_json(force=True)
-        pid = data.get("product_id")
-        litros = data.get("litros", 1)
-        op_token = data.get("op_token", "").strip()
+        pid = data.get("product_id") or data.get("pid")
+        bundle = data.get("bundle") or data.get("litros", 1)
+        op_token = (data.get("op_token") or "").strip()
 
-        if not pid:
-            return jsonify({"ok": False, "error": "Falta product_id"}), 400
+        print("🧾 Datos recibidos:", data)
 
+        # ===========================
+        # Determinar tipo de cuenta
+        # ===========================
+        if not op_token:
+            # Es el admin (no operador)
+            tipo_cuenta = "admin"
+            mp_access_token = os.getenv("MP_ACCESS_TOKEN_PROD")
+            print("✅ Generando pago con cuenta del ADMINISTRADOR")
+        else:
+            # Es un operador (validar token)
+            op = OperatorToken.query.filter_by(token=op_token).first()
+            if not op:
+                print("❌ Operador no válido")
+                return jsonify(ok=False, error="Operador no válido")
+
+            # Antes no se usaba access_token, así que mantenemos compatibilidad
+            tipo_cuenta = "operador"
+            mp_access_token = os.getenv("MP_ACCESS_TOKEN_PROD")
+            print(f"✅ Generando pago con cuenta del OPERADOR asignado (usando token global)")
+
+        # ===========================
+        # Validar producto
+        # ===========================
         prod = Producto.query.get(pid)
         if not prod or not prod.habilitado:
-            return jsonify({"ok": False, "error": "Producto no disponible"}), 404
+            return jsonify(ok=False, error="Producto no disponible")
 
-        disp = Dispenser.query.get(prod.dispenser_id)
-        if not disp:
-            return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
-
-        # ───────────────────────────────────────────────
-        # Determinar el token de acceso de MercadoPago
-        mp_access_token = None
-        tipo_cuenta = "administrador"
-
-        # Si hay token de operador → usarlo
-        if op_token:
-            operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-            if operador and operador.access_token:
-                mp_access_token = operador.access_token
-                tipo_cuenta = "operador"
-            else:
-                return jsonify({"ok": False, "error": "Operador no válido o sin token activo"}), 403
-
-        # Si no hay token de operador → usar token del admin principal
+        # ===========================
+        # Precio según litros
+        # ===========================
+        litros = str(bundle)
+        if litros == "1":
+            precio = prod.precio
         else:
-            operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
-            if operador_asignado:
-                return jsonify({
-                    "ok": False,
-                    "error": "Dispenser asignado a operador. No se puede generar QR desde el administrador."
-                }), 403
-            mp_access_token = os.getenv("MP_ACCESS_TOKEN_PROD")
+            precio = (prod.bundle_precios or {}).get(litros)
+        if not precio:
+            return jsonify(ok=False, error="Precio no definido para ese volumen")
 
-        if not mp_access_token:
-            return jsonify({"ok": False, "error": "Token de MercadoPago no configurado"}), 500
-
-        # ───────────────────────────────────────────────
-        # Calcular precio según volumen
-        precio_unitario = float(prod.precio or 0)
-        bundle = prod.bundle_precios or {}
-        precio = bundle.get(str(litros)) or (precio_unitario * float(litros))
-
-        if precio <= 0:
-            return jsonify({"ok": False, "error": "Precio inválido"}), 400
-
-        # ───────────────────────────────────────────────
+        # ===========================
         # Crear preferencia MercadoPago
-        mp_url = "https://api.mercadopago.com/checkout/preferences"
-        headers = {"Authorization": f"Bearer {mp_access_token}", "Content-Type": "application/json"}
-        body = {
-            "items": [{
-                "title": f"{prod.nombre} ({litros}L)",
-                "quantity": 1,
-                "unit_price": precio
-            }],
+        # ===========================
+        mp = mercadopago.SDK(mp_access_token)
+        pref_data = {
+            "items": [
+                {
+                    "title": f"{prod.nombre} - {litros}L",
+                    "quantity": 1,
+                    "unit_price": float(precio),
+                }
+            ],
             "back_urls": {
-                "success": f"{request.host_url}ui/success",
-                "failure": f"{request.host_url}ui/failure",
-                "pending": f"{request.host_url}ui/pending"
+                "success": f"{FRONT_BASE}/pago_exitoso",
+                "failure": f"{FRONT_BASE}/pago_fallido",
+                "pending": f"{FRONT_BASE}/pago_pendiente",
             },
             "auto_return": "approved",
-            "notification_url": f"{request.host_url}webhook",
-            "metadata": {
-                "product_id": prod.id,
-                "litros": litros,
-                "tipo_cuenta": tipo_cuenta
-            }
         }
 
-        r = requests.post(mp_url, headers=headers, json=body)
-        if r.status_code != 201:
-            return jsonify({"ok": False, "error": f"MercadoPago error {r.status_code}: {r.text}"}), 500
+        pref = mp.preference().create(pref_data)
+        print("🪙 Preferencia creada:", pref)
+        init_point = pref["response"].get("init_point")
 
-        pref = r.json()
-        return jsonify({"ok": True, "link": pref.get("init_point")})
+        if not init_point:
+            return jsonify(ok=False, error="No se pudo generar el link de pago")
+
+        return jsonify(ok=True, url=init_point)
 
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
+        print("⚠️ Error en /api/pagos/preferencia:", e)
+        return jsonify(ok=False, error=str(e))
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
