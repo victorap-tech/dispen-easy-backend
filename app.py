@@ -302,6 +302,7 @@ def _auth_guard():
         "/", "/gracias", "/sin-stock",
         "/vincular_mp", "/operator_login",
         "/operator",
+        "/ui/qr_admin",
         "/api/mp/webhook", "/webhook", "/mp/webhook",
         "/api/mp/oauth_start", "/api/mp/oauth_callback",
         "/api/pagos/preferencia", "/api/pagos/pendiente",
