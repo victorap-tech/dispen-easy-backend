@@ -1660,7 +1660,7 @@ def ui_seleccionar():
             </div>
             <script>
                 function iniciarPago(litros) {{
-                    const online = "{str(disp.online).lower()}";
+                    const online = "{str(disp.activo).lower()}";
                     if (online !== "true") {{
                         document.body.innerHTML = `
                             <div style="text-align:center;font-family:sans-serif;margin-top:80px;">
