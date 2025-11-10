@@ -920,87 +920,70 @@ def pagos_list():
 
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
-def crear_preferencia_api():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = int(data.get("product_id") or data.get("pid") or 0)
-    litros = int(data.get("litros") or 1)
-    op_token = (data.get("op_token") or "").strip()
-
-    # Buscar el producto
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return jsonify(ok=False, error="Producto no disponible")
-
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp or not disp.activo:
-        return jsonify(ok=False, error="Dispenser no disponible")
-
-    # Si viene un token de operador, validarlo
-    mp_access_token = None
-    if op_token:
-        op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-        if not op:
-            return jsonify(ok=False, error="Operador no válido o inactivo")
-
-        # Si el operador tiene su token propio, lo usamos
-        if getattr(op, "mp_access_token", None):
-            mp_access_token = op.mp_access_token
-            print(f"🟢 Generando QR con token del operador {op.nombre}")
-        else:
-            # Si no tiene, usamos el token global
-            mp_access_token = os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST")
-            print(f"🟡 Operador {op.nombre} sin token propio; usando token global")
-
-    else:
-        # Caso admin → solo si el dispenser NO está asignado
-        assigned = OperatorToken.query.filter_by(dispenser_id=prod.dispenser_id, activo=True).first()
-        if assigned:
-            return _html_raw(f"""
-            <h3 style='color:#ff5050'>🚫 Este dispenser está asignado al operador <b>{assigned.nombre}</b>.</h3>
-            <p>No es posible generar el QR desde la cuenta del administrador.</p>
-            """)
-        mp_access_token = os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST")
-        print("🔵 Generando QR con token global (admin)")
-
-    # Calcular precio
-    precio_final = compute_total_price_ars(prod, litros)
-    if not precio_final:
-        return jsonify(ok=False, error="Precio inválido")
-
-    # Crear preferencia MercadoPago
-    mp = mercadopago.SDK(str(mp_access_token))
-    body = {
-        "items": [{
-            "title": f"{prod.nombre} · {litros} L",
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(precio_final),
-        }],
-        "metadata": {
-            "product_id": prod.id,
-            "litros": litros,
-            "dispenser_id": disp.id,
-            "device_id": disp.device_id,
-        },
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending",
-        },
-        "notification_url": f"{BACKEND_BASE_URL or request.url_root.rstrip('/')}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY"
-    }
-
+def api_pagos_preferencia():
     try:
-        r = mp.preference().create(body)
-        if r.get("status") != 201:
-            return jsonify(ok=False, error=f"MercadoPago error: {r}")
-        link = r["response"].get("init_point") or r["response"].get("sandbox_init_point")
-        return jsonify(ok=True, link=link)
+        data = request.get_json()
+        pid = data.get("product_id")
+        litros = data.get("litros")
+        op_token = data.get("op_token", "").strip()
+
+        prod = Producto.query.get(pid)
+        if not prod or not prod.habilitado:
+            return jsonify({"ok": False, "error": "Producto no disponible"})
+
+        disp = Dispenser.query.get(prod.dispenser_id)
+        if not disp:
+            return jsonify({"ok": False, "error": "Dispenser no encontrado"})
+
+        # Determinar si tiene operador asignado
+        operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
+
+        # Si el dispenser tiene operador asignado pero se intenta usar token global → error
+        if operador_asignado and not op_token:
+            return jsonify({
+                "ok": False,
+                "error": f"El dispenser '{disp.nombre}' pertenece al operador '{operador_asignado.nombre}', no se puede generar QR desde la cuenta global."
+            })
+
+        # Decidir el token correcto
+        if op_token:
+            operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
+            if not operador:
+                return jsonify({"ok": False, "error": "Token de operador inválido o inactivo"})
+            sdk = mercadopago.SDK(operador.access_token)
+            print(f"[MP] Generando pago con cuenta del OPERADOR ({operador.nombre})")
+        else:
+            sdk = mercadopago.SDK(ACCESS_TOKEN_MP)
+            print("[MP] Generando pago con cuenta GLOBAL (modo producción/test)")
+
+        # Crear preferencia de pago
+        nombre_item = f"{prod.nombre} - {litros}L"
+        precio = float(prod.bundle_precios.get(str(litros), prod.precio))
+        preference_data = {
+            "items": [{
+                "title": nombre_item,
+                "quantity": 1,
+                "unit_price": precio
+            }],
+            "back_urls": {
+                "success": f"{FRONT_BASE}/success",
+                "failure": f"{FRONT_BASE}/failure",
+                "pending": f"{FRONT_BASE}/pending"
+            },
+            "auto_return": "approved"
+        }
+
+        result = sdk.preference().create(preference_data)
+        if result["status"] != 201:
+            return jsonify({"ok": False, "error": "No se pudo generar el link de pago", "details": result})
+
+        link_pago = result["response"]["init_point"]
+        return jsonify({"ok": True, "link": link_pago})
+
     except Exception as e:
-        print("❌ Error creando preferencia:", e)
-        return jsonify(ok=False, error=str(e))
+        print(f"[ERROR preferencia]: {e}")
+        return jsonify({"ok": False, "error": str(e)})
+
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
