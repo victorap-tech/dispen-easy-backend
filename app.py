@@ -1608,43 +1608,104 @@ def ui_seleccionar():
         """
 
         html = f"""
-        <!doctype html>
-        <html lang="es">
-        <head>
-            <meta charset="utf-8"/>
-            <meta name="viewport" content="width=device-width,initial-scale=1"/>
-            <title>{prod.nombre}</title>
-        </head>
-        <body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-            <div style="max-width:480px;margin:10vh auto;padding:20px;
-                background:rgba(255,255,255,.05);border-radius:16px;">
-                <h1 style="margin:0 0 10px;">{prod.nombre}</h1>
-                <p>Pagás con la cuenta MercadoPago vinculada al administrador</p>
-                {estado_html}
-                <p>Seleccioná la cantidad a comprar:</p>
-                {opciones_html}
-            </div>
-            <script>
-                function iniciarPago(litros) {{
-                    if (!{str(is_online).lower()}) {{
-                        alert('Este dispenser está sin conexión, no podrá dispensar el producto.');
-                    }}
-                    fetch('/api/pagos/preferencia', {{
-                        method:'POST',
-                        headers:{{'Content-Type':'application/json'}},
-                        body:JSON.stringify({{product_id:{prod.id}, litros:litros}})
-                    }}).then(r=>r.json()).then(d=>{
-                        if(d.ok && d.url) window.location=d.url;
-                        else alert('Error al generar el pago: '+(d.error||'desconocido'));
-                    });
+    <!doctype html>
+    <html lang="es">
+    <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1"/>
+        <title>Seleccionar cantidad</title>
+        <style>
+            body {{
+                background-color: #0b1220;
+                color: #e5e7eb;
+                font-family: Inter, system-ui, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }}
+            .card {{
+                background: rgba(255,255,255,0.05);
+                border-radius: 12px;
+                padding: 24px 40px;
+                text-align: center;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+            }}
+            h1 {{
+                color: #3b82f6;
+                margin-bottom: 10px;
+            }}
+            p {{
+                opacity: 0.9;
+                margin-bottom: 14px;
+            }}
+            button {{
+                display: block;
+                width: 100%;
+                background: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px;
+                margin-top: 8px;
+                font-size: 18px;
+                font-weight: bold;
+                cursor: pointer;
+            }}
+            button:hover {{
+                background: #2563eb;
+            }}
+            footer {{
+                margin-top: 20px;
+                font-size: 12px;
+                opacity: 0.6;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>{prod.nombre}</h1>
+            <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
+            <p>Seleccioná la cantidad a comprar:</p>
+    """
+
+    # Generar botones según los precios disponibles
+    for litros, precio in precios:
+        html += f"""<button onclick="iniciarPago({litros})">{litros} L – ${precio}</button>"""
+
+    html += f"""
+            <footer>Sistema Dispen-Easy © 2025</footer>
+        </div>
+        <script>
+            function iniciarPago(litros) {{
+                // Avisar si el dispenser está sin conexión
+                if (!{str(disp.activo).lower()}) {{
+                    alert('Este dispenser está sin conexión, no podrá dispensar el producto.');
                 }}
-            </script>
-        </body>
-        </html>
-        """
-        return _html_raw(html)
-    except Exception as e:
-        return _html("Error", f"<p>{e}</p>")
+                fetch('/api/pagos/preferencia', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{ product_id: {prod.id}, litros: litros }})
+                }})
+                .then(r => r.json())
+                .then(d => {{
+                    if (d.ok && d.url) {{
+                        window.location = d.url;
+                    }} else {{
+                        alert('Error al generar el pago: ' + (d.error || 'desconocido'));
+                    }}
+                }})
+                .catch(err => {{
+                    alert('Error de red o servidor: ' + err);
+                }});
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+    return _html_raw(html)
 
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
