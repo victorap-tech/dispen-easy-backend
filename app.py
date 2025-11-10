@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import UniqueConstraint, text as sqltext, and_
 from datetime import datetime
 import paho.mqtt.client as mqtt
+import mercadopago
 
 # URL base del frontend (React) que usa el sistema
 FRONT_BASE = os.getenv("FRONT_BASE", 
