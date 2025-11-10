@@ -1548,7 +1548,7 @@ def ui_qr_admin():
 def ui_seleccionar():
     """Página de selección de litros (1L, 2L, 3L) para generar el pago"""
     pid = request.args.get("pid", "").strip()
-    op_token = request.args.get("op_token", "").strip()  # Token del operador si viene del QR
+    op_token = request.args.get("op_token", "").strip()  # token si viene del operador
 
     if not pid:
         return "<p>Falta parámetro <code>pid</code>.</p>"
@@ -1561,7 +1561,6 @@ def ui_seleccionar():
     if not disp or not disp.activo:
         return "<p>Dispenser no disponible.</p>"
 
-    # 🔹 Determinar si el QR pertenece a un operador o al admin
     tipo_cuenta = "administrador" if not op_token else "operador"
 
     # Construir bundles (1L, 2L, 3L)
@@ -1577,63 +1576,91 @@ def ui_seleccionar():
     html = f"""
     <html>
     <head>
-        <meta charset='utf-8'>
-        <title>Seleccionar cantidad</title>
-        <style>
-            body {{
-                background-color: #0b1220;
-                color: #e5e7eb;
-                font-family: 'Inter', sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-            }}
-            .card {{
-                background: rgba(255,255,255,0.05);
-                padding: 24px;
-                border-radius: 12px;
-                text-align: center;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            }}
-            h1 {{ font-size: 22px; margin-bottom: 6px; }}
-            h2 {{ font-size: 18px; margin: 0 0 16px 0; }}
-            p {{ margin: 6px 0 16px 0; opacity: 0.9; }}
-            a {{
-                display: inline-block;
-                background: #3b82f6;
-                color: #fff;
-                text-decoration: none;
-                padding: 10px 18px;
-                border-radius: 10px;
-                font-weight: bold;
-                margin: 6px;
-            }}
-            a:hover {{ background: #2563eb; }}
-        </style>
+      <meta charset="utf-8">
+      <title>Seleccionar cantidad</title>
+      <style>
+        body {{
+          background-color: #0b1220;
+          color: #e5e7eb;
+          font-family: 'Inter', sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }}
+        .card {{
+          background: rgba(255,255,255,0.05);
+          border-radius: 12px;
+          padding: 28px 40px;
+          text-align: center;
+          box-shadow: 0 0 20px rgba(0,0,0,0.3);
+        }}
+        h1 {{ color: #3b82f6; margin-bottom: 6px; }}
+        p {{ opacity: 0.9; margin-bottom: 14px; }}
+        button {{
+          display: block;
+          width: 100%;
+          background: #3b82f6;
+          color: white;
+          border: none;
+          border-radius: 8px;
+          padding: 12px;
+          font-size: 18px;
+          font-weight: bold;
+          margin-top: 10px;
+          cursor: pointer;
+        }}
+        button:hover {{ background: #2563eb; }}
+      </style>
     </head>
     <body>
-        <div class="card">
-            <h1>Seleccionar cantidad</h1>
-            <h2>{prod.nombre}</h2>
-            <p>💳 Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
-            <p>Seleccioná la cantidad a comprar:</p>
+      <div class="card">
+        <h1>Seleccionar cantidad</h1>
+        <h2>{prod.nombre}</h2>
+        <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
+        <p>Seleccioná la cantidad a comprar:</p>
     """
 
+    # Generar botones dinámicamente
     for litros, precio in precios:
         html += f"""
-            <a href="/api/pagos/preferencia?pid={prod.id}&litros={litros}{f'&op_token={op_token}' if op_token else ''}">
-                {litros} L — ${precio}
-            </a>
+        <button onclick="pagar({litros})">{litros} L – ${precio}</button>
         """
 
-    html += """
-        </div>
+    # Agregar el script que hace POST al backend
+    html += f"""
+        <script>
+        async function pagar(litros) {{
+          const body = {{
+            pid: {prod.id},
+            litros: litros,
+            op_token: "{op_token}"
+          }};
+          try {{
+            const resp = await fetch("/api/pagos/preferencia", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify(body)
+            }});
+            const data = await resp.json();
+            if (data.ok && data.url) {{
+              window.location.href = data.url;
+            }} else {{
+              alert("Error al generar el pago: " + (data.error || "Desconocido"));
+            }}
+          }} catch (err) {{
+            alert("Error de conexión: " + err);
+          }}
+        }}
+        </script>
+      </div>
     </body>
     </html>
     """
 
     return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
