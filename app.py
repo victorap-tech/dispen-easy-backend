@@ -919,71 +919,72 @@ def api_pagos_preferencia():
         bundle = data.get("bundle") or data.get("litros", 1)
         op_token = (data.get("op_token") or "").strip()
 
-        print("📦 Datos recibidos:", data)
+        print("✅ Datos recibidos:", data)
 
-       # Determinar tipo de cuenta
-if not op_token:
-    # Es el admin (no operador)
-    tipo_cuenta = "admin"
-    mp_access_token = str(os.getenv("MP_ACCESS_TOKEN") or "").strip()  # Token global del admin
-    print(f"✅ Generando pago con cuenta del ADMINISTRADOR: {mp_access_token[:8]}...")
-else:
-    # Es un operador (validar)
-    op = OperatorToken.query.filter_by(token=op_token).first()
-    if not op:
-        print("❌ Operador no válido")
-        return jsonify(ok=False, error="Operador no válido")
+        # ==========================
+        # Determinar tipo de cuenta
+        # ==========================
+        if not op_token:
+            # Es el admin (no operador)
+            tipo_cuenta = "admin"
+            mp_access_token = str(os.getenv("MP_ACCESS_TOKEN") or "").strip()  # Token global del admin
+            print(f"✅ Generando pago con cuenta del ADMINISTRADOR: {mp_access_token[:8]}...")
+        else:
+            # Es un operador (validar)
+            op = OperatorToken.query.filter_by(token=op_token).first()
+            if not op:
+                print("❌ Operador no válido")
+                return jsonify(ok=False, error="Operador no válido")
 
-    if not op.mp_access_token:
-        print("❌ Operador sin cuenta MercadoPago vinculada")
-        return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
+            if not op.mp_access_token:
+                print("❌ Operador sin cuenta MercadoPago vinculada")
+                return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
 
-    mp_access_token = str(op.mp_access_token).strip()
-    tipo_cuenta = "operador"
-    print(f"✅ Generando pago con cuenta del OPERADOR: {op.nombre}")
-        # ===========================
-        # 🔹 Validar producto
-        # ===========================
+            mp_access_token = str(op.mp_access_token).strip()
+            tipo_cuenta = "operador"
+            print(f"✅ Generando pago con cuenta del OPERADOR: {op.nombre}")
+
+        # ==========================
+        # Validar producto
+        # ==========================
         prod = Producto.query.get(pid)
         if not prod or not prod.habilitado:
             return jsonify(ok=False, error="Producto no disponible")
 
-        # Precio según litros
         litros = str(bundle)
-        if litros == "1":
-            precio = prod.precio
-        else:
-            precio = (prod.bundle_precios or {}).get(litros)
+        precio = prod.precio if litros == "1" else (prod.bundle_precios or {}).get(litros)
         if not precio:
             return jsonify(ok=False, error="Precio no definido para ese volumen")
 
-        # ===========================
-        # 🔹 Crear preferencia MercadoPago
-        # ===========================
+        # ==========================
+        # Crear preferencia MercadoPago
+        # ==========================
+        import mercadopago
         mp = mercadopago.SDK(mp_access_token)
+
         pref_data = {
-            "items": [{
-                "title": f"{prod.nombre} ({litros}L)",
-                "quantity": 1,
-                "currency_id": "ARS",
-                "unit_price": float(precio)
-            }],
-            "notification_url": f"{request.host_url.rstrip('/')}/webhook",
+            "items": [
+                {
+                    "title": f"{prod.nombre} - {litros}L",
+                    "quantity": 1,
+                    "unit_price": float(precio)
+                }
+            ],
             "back_urls": {
-                "success": f"{request.host_url.rstrip('/')}/gracias",
-                "failure": f"{request.host_url.rstrip('/')}/gracias",
-                "pending": f"{request.host_url.rstrip('/')}/gracias"
+                "success": f"{request.host_url}gracias",
+                "failure": f"{request.host_url}error"
             },
             "auto_return": "approved"
         }
+
         pref = mp.preference().create(pref_data)
-        init_point = pref["response"]["init_point"]
+        init_point = pref["response"].get("init_point", "")
 
         print(f"✅ Preferencia creada para {tipo_cuenta}: {init_point}")
         return jsonify(ok=True, url=init_point)
 
     except Exception as e:
-        print("💥 Error generando preferencia:", e)
+        print("❌ Error generando preferencia:", e)
         return jsonify(ok=False, error=str(e))
 
 # Webhook MP
