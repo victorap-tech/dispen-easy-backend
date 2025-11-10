@@ -1476,60 +1476,72 @@ def ui_qr_admin():
     if not prod:
         return "<p>Producto no encontrado.</p>"
 
+    # link al selector de cantidad
     link = f"/ui/seleccionar?pid={pid}"
     full_url = request.host_url.rstrip("/") + link
-
-    qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={full_url}"
+    qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={full_url}"
 
     html = f"""
     <html>
     <head>
-        <meta charset='utf-8'>
-        <title>QR del producto</title>
-        <style>
-            body {{
-                background-color: #0b1220;
-                color: #e5e7eb;
-                font-family: 'Inter', sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-            }}
-            .card {{
-                background: rgba(255,255,255,0.05);
-                padding: 24px;
-                border-radius: 12px;
-                text-align: center;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            }}
-            h1 {{ font-size: 20px; margin-bottom: 6px; }}
-            p {{ opacity: 0.9; margin-bottom: 10px; }}
-            a {{
-                display: inline-block;
-                background: #3b82f6;
-                color: #fff;
-                text-decoration: none;
-                padding: 10px 18px;
-                border-radius: 10px;
-                font-weight: bold;
-                margin-top: 10px;
-            }}
-            a:hover {{ background: #2563eb; }}
-        </style>
+      <meta charset="utf-8">
+      <title>QR de {prod.nombre}</title>
+      <style>
+        body {{
+          background-color: #0b1220;
+          color: #e5e7eb;
+          font-family: 'Inter', sans-serif;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }}
+        .card {{
+          text-align: center;
+          background: rgba(255,255,255,0.05);
+          border-radius: 12px;
+          padding: 24px 40px;
+          box-shadow: 0 0 20px rgba(0,0,0,0.3);
+        }}
+        img {{
+          width: 220px;
+          height: 220px;
+          margin: 15px 0;
+        }}
+        h1 {{
+          color: #3b82f6;
+          margin-bottom: 6px;
+        }}
+        p {{
+          opacity: 0.8;
+          margin-top: 0;
+        }}
+        a {{
+          background: #3b82f6;
+          color: white;
+          text-decoration: none;
+          padding: 10px 18px;
+          border-radius: 8px;
+          margin-top: 16px;
+          display: inline-block;
+        }}
+        a:hover {{ background: #2563eb; }}
+      </style>
     </head>
     <body>
-        <div class="card">
-            <h1>{prod.nombre}</h1>
-            <img src="{qr_api}" alt="QR" style="width:200px;height:200px;border-radius:8px;" />
-            <p>Escaneá este código QR para acceder a la compra.</p>
-            <p style="font-size:12px;word-break:break-all;">{full_url}</p>
-            <a href="{link}" target="_blank">Abrir página</a>
-        </div>
+      <div class="card">
+        <img src="https://i.ibb.co/XXZgD2Q/dispen-logo.png" width="80" style="margin-bottom:10px;">
+        <h1>Dispen-Easy</h1>
+        <h2>{prod.nombre}</h2>
+        <img src="{qr_api}" alt="QR">
+        <p>Escaneá este código para acceder a la compra.</p>
+        <a href="{full_url}" target="_blank">Abrir página de pago</a>
+      </div>
     </body>
     </html>
     """
-
     return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 # QR de selección
 @app.get("/ui/seleccionar")
