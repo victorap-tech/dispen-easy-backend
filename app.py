@@ -1567,21 +1567,19 @@ def ui_seleccionar():
         if not disp or not disp.activo:
             return _html_raw("<p>Dispenser no disponible o deshabilitado.</p>")
 
-        # ───────────────────────────────────────────────
         # Detectar si el dispenser tiene operador asignado
         operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
         if not op_token and operador_asignado:
             return _html_raw(f"""
-                <p style='color:#e5e7eb;font-family:Inter,sans-serif;text-align:center;margin-top:20vh'>
-                    🚫 Este dispenser está asignado al operador <b>{operador_asignado.nombre or '(sin nombre)'}</b>.<br>
-                    No es posible generar el QR desde la cuenta del administrador.
-                </p>
+            <p style="color:#e57e7b;font-family:Inter,sans-serif;text-align:center;margin-top:20vh;">
+                🚫 Este dispenser está asignado al operador <b>{operador_asignado.nombre or '(sin nombre)'}</b>.<br>
+                No es posible generar el QR desde la cuenta del administrador.
+            </p>
             """)
 
         tipo_cuenta = "operador" if op_token else "administrador"
 
-        # ───────────────────────────────────────────────
-        # Construir lista de precios (bundle)
+        # Construir lista de precios
         precios = []
         if prod.precio:
             precios.append((1, prod.precio))
@@ -1589,14 +1587,12 @@ def ui_seleccionar():
         for litros, valor in bundle.items():
             precios.append((int(litros), valor))
 
-        # ───────────────────────────────────────────────
-        # Generar HTML
+        # Generar HTML completo
         html = f"""
-        <!doctype html>
         <html lang="es">
         <head>
             <meta charset="utf-8"/>
-            <meta name="viewport" content="width=device-width,initial-scale=1"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
             <title>{prod.nombre}</title>
             <style>
                 body {{
@@ -1612,9 +1608,9 @@ def ui_seleccionar():
                 .card {{
                     background: rgba(255,255,255,0.05);
                     border-radius: 12px;
-                    padding: 24px 40px;
-                    text-align: center;
+                    padding: 24px 48px;
                     box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+                    text-align: center;
                 }}
                 h1 {{
                     color: #3b82f6;
@@ -1631,8 +1627,8 @@ def ui_seleccionar():
                     color: white;
                     border: none;
                     border-radius: 8px;
-                    padding: 12px;
                     margin-top: 8px;
+                    padding: 12px;
                     font-size: 18px;
                     font-weight: bold;
                     cursor: pointer;
@@ -1654,29 +1650,44 @@ def ui_seleccionar():
                 <p>Seleccioná la cantidad a comprar:</p>
         """
 
+        # Botones de precios
         for litros, precio in precios:
             html += f"""<button onclick="iniciarPago({litros})">{litros} L – ${precio}</button>"""
 
+        # Footer y script
         html += f"""
                 <footer>Sistema Dispen-Easy © 2025</footer>
             </div>
             <script>
                 function iniciarPago(litros) {{
-                    // Avisar si el dispenser está sin conexión
-                    const online = {str(disp.activo).lower()};
-                    if (!online) {{
-                        alert('⚠️ Este dispenser está sin conexión, no podrá dispensar el producto.');
+                    const online = "{str(disp.online).lower()}";
+                    if (online !== "true") {{
+                        document.body.innerHTML = `
+                            <div style="text-align:center;font-family:sans-serif;margin-top:80px;">
+                                <h2 style="color:#ff5050;">⚠️ Dispenser sin conexión</h2>
+                                <p>El dispenser <b>{disp.nombre}</b> no está conectado en este momento.<br>
+                                Por favor, intente nuevamente cuando esté online.</p>
+                                <button onclick="window.location.reload()" 
+                                    style="margin-top:20px;padding:10px 20px;font-size:16px;background:#007bff;color:white;border:none;border-radius:8px;">
+                                    Reintentar
+                                </button>
+                            </div>`;
                         return;
                     }}
+
                     fetch('/api/pagos/preferencia', {{
                         method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{ product_id: {prod.id}, litros: litros, 'op_token': '{op_token}' }})
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{
+                            product_id: {prod.id},
+                            litros: litros,
+                            op_token: '{op_token}'
+                        }})
                     }})
                     .then(r => r.json())
                     .then(d => {{
-                        if (d.ok && d.link) {{
-                            window.location = d.link;
+                        if (d.ok && d.url) {{
+                            window.location = d.url;
                         }} else {{
                             alert('Error al generar el pago: ' + (d.error || 'desconocido'));
                         }}
