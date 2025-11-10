@@ -921,29 +921,26 @@ def api_pagos_preferencia():
 
         print("📦 Datos recibidos:", data)
 
-        # ===========================
-        # 🔹 Determinar tipo de cuenta
-        # ===========================
-        if not op_token:
-            # 👉 Es el admin (no operador)
-            tipo_cuenta = "admin"
-            mp_access_token = os.getenv("MP_ACCESS_TOKEN")  # Token global del admin
-            print("→ Generando pago con cuenta del ADMINISTRADOR")
-        else:
-            # 👉 Es un operador (validar)
-            op = OperadorToken.query.filter_by(token=op_token).first()
-            if not op:
-                print("❌ Operador no válido")
-                return jsonify(ok=False, error="Operador no válido")
+       # Determinar tipo de cuenta
+if not op_token:
+    # Es el admin (no operador)
+    tipo_cuenta = "admin"
+    mp_access_token = str(os.getenv("MP_ACCESS_TOKEN") or "").strip()  # Token global del admin
+    print(f"✅ Generando pago con cuenta del ADMINISTRADOR: {mp_access_token[:8]}...")
+else:
+    # Es un operador (validar)
+    op = OperatorToken.query.filter_by(token=op_token).first()
+    if not op:
+        print("❌ Operador no válido")
+        return jsonify(ok=False, error="Operador no válido")
 
-            if not op.mp_access_token:
-                print("❌ Operador sin cuenta MercadoPago vinculada")
-                return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
+    if not op.mp_access_token:
+        print("❌ Operador sin cuenta MercadoPago vinculada")
+        return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
 
-            mp_access_token = op.mp_access_token
-            tipo_cuenta = "operador"
-            print(f"→ Generando pago con cuenta del OPERADOR: {op.nombre}")
-
+    mp_access_token = str(op.mp_access_token).strip()
+    tipo_cuenta = "operador"
+    print(f"✅ Generando pago con cuenta del OPERADOR: {op.nombre}")
         # ===========================
         # 🔹 Validar producto
         # ===========================
