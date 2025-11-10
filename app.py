@@ -1463,6 +1463,73 @@ def _html(title: str, body_html: str):
 </div></body></html>"""
     r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
+# ================== QR fijo del administrador ==================
+@app.get("/ui/qr_admin")
+def ui_qr_admin():
+    """Muestra el QR del admin para un producto específico"""
+    pid = request.args.get("pid", "").strip()
+    if not pid:
+        return "<p>Falta parámetro <code>pid</code>.</p>"
+
+    prod = Producto.query.get(pid)
+    if not prod:
+        return "<p>Producto no encontrado.</p>"
+
+    link = f"/ui/seleccionar?pid={pid}"
+    full_url = request.host_url.rstrip("/") + link
+
+    qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={full_url}"
+
+    html = f"""
+    <html>
+    <head>
+        <meta charset='utf-8'>
+        <title>QR del producto</title>
+        <style>
+            body {{
+                background-color: #0b1220;
+                color: #e5e7eb;
+                font-family: 'Inter', sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+            }}
+            .card {{
+                background: rgba(255,255,255,0.05);
+                padding: 24px;
+                border-radius: 12px;
+                text-align: center;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            }}
+            h1 {{ font-size: 20px; margin-bottom: 6px; }}
+            p {{ opacity: 0.9; margin-bottom: 10px; }}
+            a {{
+                display: inline-block;
+                background: #3b82f6;
+                color: #fff;
+                text-decoration: none;
+                padding: 10px 18px;
+                border-radius: 10px;
+                font-weight: bold;
+                margin-top: 10px;
+            }}
+            a:hover {{ background: #2563eb; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>{prod.nombre}</h1>
+            <img src="{qr_api}" alt="QR" style="width:200px;height:200px;border-radius:8px;" />
+            <p>Escaneá este código QR para acceder a la compra.</p>
+            <p style="font-size:12px;word-break:break-all;">{full_url}</p>
+            <a href="{link}" target="_blank">Abrir página</a>
+        </div>
+    </body>
+    </html>
+    """
+
+    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 # QR de selección
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
