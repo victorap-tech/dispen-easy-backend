@@ -920,68 +920,56 @@ def pagos_list():
 
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
-def api_pagos_preferencia():
+def generar_preferencia():
     try:
         data = request.get_json()
         pid = data.get("product_id")
         litros = data.get("litros")
-        op_token = data.get("op_token", "").strip()
+        op_token = data.get("op_token")
 
         prod = Producto.query.get(pid)
-        if not prod or not prod.habilitado:
-            return jsonify({"ok": False, "error": "Producto no disponible"})
+        if not prod:
+            return jsonify({"ok": False, "error": "Producto no encontrado"})
 
         disp = Dispenser.query.get(prod.dispenser_id)
         if not disp:
             return jsonify({"ok": False, "error": "Dispenser no encontrado"})
 
-        # Determinar si tiene operador asignado
-        operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
-
-        # Si el dispenser tiene operador asignado pero se intenta usar token global → error
-        if operador_asignado and not op_token:
-            return jsonify({
-                "ok": False,
-                "error": f"El dispenser '{disp.nombre}' pertenece al operador '{operador_asignado.nombre}', no se puede generar QR desde la cuenta global."
-            })
-
-        # Decidir el token correcto
+        # Token: si tiene operador, usa su token; si no, usa global
+        token = None
         if op_token:
             operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
             if not operador:
-                return jsonify({"ok": False, "error": "Token de operador inválido o inactivo"})
-            sdk = mercadopago.SDK(operador.access_token)
-            print(f"[MP] Generando pago con cuenta del OPERADOR ({operador.nombre})")
+                return jsonify({"ok": False, "error": "Operador inválido"})
+            token = operador.token  # ← campo correcto según tu base
         else:
-            sdk = mercadopago.SDK(ACCESS_TOKEN_MP)
-            print("[MP] Generando pago con cuenta GLOBAL (modo producción/test)")
+            token = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
 
-        # Crear preferencia de pago
-        nombre_item = f"{prod.nombre} - {litros}L"
-        precio = float(prod.bundle_precios.get(str(litros), prod.precio))
+        if not token:
+            return jsonify({"ok": False, "error": "Token de MercadoPago no encontrado"})
+
+        sdk = mercadopago.SDK(token)
+
+        item_title = f"{prod.nombre} - {litros} L"
+        unit_price = prod.precio if litros == 1 else (prod.bundle_precios or {}).get(str(litros), 0)
         preference_data = {
-            "items": [{
-                "title": nombre_item,
-                "quantity": 1,
-                "unit_price": precio
-            }],
+            "items": [{"title": item_title, "quantity": 1, "unit_price": float(unit_price)}],
             "back_urls": {
-                "success": f"{FRONT_BASE}/success",
-                "failure": f"{FRONT_BASE}/failure",
-                "pending": f"{FRONT_BASE}/pending"
+                "success": "https://dispen-easy-web-production.up.railway.app/success",
+                "failure": "https://dispen-easy-web-production.up.railway.app/failure",
             },
             "auto_return": "approved"
         }
 
-        result = sdk.preference().create(preference_data)
-        if result["status"] != 201:
-            return jsonify({"ok": False, "error": "No se pudo generar el link de pago", "details": result})
+        preference = sdk.preference().create(preference_data)
+        link = preference["response"].get("init_point")
 
-        link_pago = result["response"]["init_point"]
-        return jsonify({"ok": True, "link": link_pago})
+        if not link:
+            return jsonify({"ok": False, "error": "No se pudo generar el link de pago."})
+
+        return jsonify({"ok": True, "link": link})
 
     except Exception as e:
-        print(f"[ERROR preferencia]: {e}")
         return jsonify({"ok": False, "error": str(e)})
 
 # Webhook MP
