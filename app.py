@@ -20,6 +20,14 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 import mercadopago
 
+# ───────────────────────────────────────────────
+# Función auxiliar para devolver HTML crudo
+from flask import Response
+
+def _html_raw(html: str):
+    """Devuelve HTML plano (sin plantilla) para respuestas simples."""
+    return Response(html, mimetype="text/html")
+# ───────────────────────────────────────────────
 # URL base del frontend (React) que usa el sistema
 FRONT_BASE = os.getenv("FRONT_BASE", 
 "https://dispen-easy-web-production.up.railway.app")
