@@ -1535,11 +1535,12 @@ def ui_qr_admin():
     """
     return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 # QR de selección
+
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
-    """Página de selección de litros (1L, 2L, 3L) para generar el pago"""
-    pid = request.args.get("pid", "").strip()
-    op_token = request.args.get("op_token", "").strip()  # token si viene del operador
+    """Página visual para seleccionar cantidad y generar pago (admin u operador)."""
+    pid = request.args.get("pid")
+    op_token = request.args.get("op_token", "").strip()
 
     if not pid:
         return "<p>Falta parámetro <code>pid</code>.</p>"
@@ -1554,7 +1555,7 @@ def ui_seleccionar():
 
     tipo_cuenta = "administrador" if not op_token else "operador"
 
-    # Construir bundles (1L, 2L, 3L)
+    # Construir precios (1L, 2L, 3L)
     precios = []
     if prod.precio:
         precios.append((1, prod.precio))
@@ -1563,89 +1564,98 @@ def ui_seleccionar():
     if "3" in (prod.bundle_precios or {}):
         precios.append((3, prod.bundle_precios["3"]))
 
-    # Render HTML
     html = f"""
     <html>
     <head>
-      <meta charset="utf-8">
-      <title>Seleccionar cantidad</title>
-      <style>
-        body {{
-          background-color: #0b1220;
-          color: #e5e7eb;
-          font-family: 'Inter', sans-serif;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          height: 100vh;
-          margin: 0;
-        }}
-        .card {{
-          background: rgba(255,255,255,0.05);
-          border-radius: 12px;
-          padding: 28px 40px;
-          text-align: center;
-          box-shadow: 0 0 20px rgba(0,0,0,0.3);
-        }}
-        h1 {{ color: #3b82f6; margin-bottom: 6px; }}
-        p {{ opacity: 0.9; margin-bottom: 14px; }}
-        button {{
-          display: block;
-          width: 100%;
-          background: #3b82f6;
-          color: white;
-          border: none;
-          border-radius: 8px;
-          padding: 12px;
-          font-size: 18px;
-          font-weight: bold;
-          margin-top: 10px;
-          cursor: pointer;
-        }}
-        button:hover {{ background: #2563eb; }}
-      </style>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Seleccionar cantidad</title>
+        <style>
+            body {{
+                background-color: #0b122e;
+                color: #e5e7eb;
+                font-family: 'Inter', sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }}
+            .card {{
+                background: rgba(255, 255, 255, 0.05);
+                padding: 28px;
+                border-radius: 16px;
+                text-align: center;
+                box-shadow: 0 0 25px rgba(0,0,0,0.2);
+                width: 90%;
+                max-width: 350px;
+            }}
+            h1 {{ color: #2cc2ff; margin-bottom: 8px; }}
+            h2 {{ color: white; margin-top: 0; }}
+            p {{ opacity: 0.9; margin-bottom: 18px; }}
+            button {{
+                display: block;
+                width: 100%;
+                background: #2cc2ff;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 14px;
+                font-size: 18px;
+                font-weight: bold;
+                margin: 8px 0;
+                cursor: pointer;
+                transition: 0.2s;
+            }}
+            button:hover {{ background: #1b99d8; }}
+            .footer {{
+                margin-top: 20px;
+                font-size: 13px;
+                opacity: 0.7;
+            }}
+        </style>
     </head>
     <body>
-      <div class="card">
-        <h1>Seleccionar cantidad</h1>
-        <h2>{prod.nombre}</h2>
-        <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
-        <p>Seleccioná la cantidad a comprar:</p>
+        <div class="card">
+            <h1>Seleccionar cantidad</h1>
+            <h2>{prod.nombre}</h2>
+            <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
+            <p>Seleccioná la cantidad a comprar:</p>
     """
 
-    # Generar botones dinámicamente
     for litros, precio in precios:
         html += f"""
-        <button onclick="pagar({litros})">{litros} L – ${precio}</button>
+            <button onclick="pagar({litros})">{litros} L – ${precio}</button>
         """
 
-    # Agregar el script que hace POST al backend
     html += f"""
+            <div class="footer">Sistema Dispen-Easy © 2025</div>
+        </div>
+
         <script>
         async function pagar(litros) {{
-          const body = {{
-            pid: {prod.id},
-            litros: litros,
-            op_token: "{op_token}"
-          }};
-          try {{
-            const resp = await fetch("/api/pagos/preferencia", {{
-              method: "POST",
-              headers: {{ "Content-Type": "application/json" }},
-              body: JSON.stringify(body)
-            }});
-            const data = await resp.json();
-            if (data.ok && data.url) {{
-              window.location.href = data.url;
-            }} else {{
-              alert("Error al generar el pago: " + (data.error || "Desconocido"));
+            try {{
+                const body = {{
+                    pid: "{prod.id}",
+                    bundle: litros,
+                    op_token: "{op_token}"
+                }};
+                const resp = await fetch("/api/pagos/preferencia", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify(body)
+                }});
+                const data = await resp.json();
+                if (data.ok && data.url) {{
+                    window.location.href = data.url;
+                }} else {{
+                    alert("Error al generar el pago: " + (data.error || "Desconocido"));
+                }}
+            }} catch (err) {{
+                alert("Error de conexión: " + err);
             }}
-          }} catch (err) {{
-            alert("Error de conexión: " + err);
-          }}
         }}
         </script>
-      </div>
     </body>
     </html>
     """
