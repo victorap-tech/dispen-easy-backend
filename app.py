@@ -916,7 +916,7 @@ def api_pagos_preferencia():
     """
     Genera una preferencia de pago en MercadoPago:
     - Si viene op_token → usa la cuenta del operador.
-    - Si el dispenser tiene operador activo vinculado → usa su cuenta.
+    - Si el dispenser tiene operador activo vinculado → bloquea generación desde admin.
     - Si no → usa el token global del administrador.
     """
     try:
@@ -941,7 +941,7 @@ def api_pagos_preferencia():
         tipo_cuenta = None
 
         if op_token:
-            # Caso: el operador está generando la preferencia desde su panel
+            # Caso: el operador genera desde su panel
             op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
             if not op:
                 return jsonify(ok=False, error="Operador no válido o inactivo")
@@ -954,20 +954,17 @@ def api_pagos_preferencia():
             print(f"🟢 Usando cuenta de OPERADOR: {op.nombre or '(sin nombre)'}")
 
         else:
-            # Caso: el admin genera el QR desde su panel
+            # Caso: el admin genera desde su panel
             op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
 
-            if op and getattr(op, "mp_access_token", None):
-                # El dispenser tiene un operador activo con cuenta vinculada
-                mp_access_token = op.mp_access_token
-                tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
-                print(f"🟠 Admin generando QR usando cuenta del operador {op.nombre or '(sin nombre)'}")
+            if op:
+                # 🚫 Bloquear si el dispenser tiene operador asignado
+                return jsonify(ok=False, error="No es posible generar QR: el dispenser está asignado a un operador activo.")
 
-            else:
-                # No hay operador asignado → usar token global de producción/test
-                mp_access_token, _ = get_mp_token_and_base()
-                tipo_cuenta = "administrador"
-                print(f"🔵 Admin generando QR con cuenta del ADMINISTRADOR")
+            # ⚙️ Si no hay operador asignado → usar token global del admin
+            mp_access_token, _ = get_mp_token_and_base()
+            tipo_cuenta = "administrador"
+            print(f"🔵 Admin generando QR con cuenta del ADMINISTRADOR")
 
         if not mp_access_token:
             return jsonify(ok=False, error="No se encontró token válido de MercadoPago")
