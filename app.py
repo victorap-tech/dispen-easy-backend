@@ -1571,7 +1571,7 @@ def ui_seleccionar():
             operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
             if not operador:
                 return _html("Token inválido", "<p>El token del operador es inválido o está inactivo.</p>")
-            token, _base = operador.access_token, "https://api.mercadopago.com"
+            token, _base = operador.mp_token, "https://api.mercadopago.com"
             cuenta = f"Operador: {operador.nombre}"
         else:
             token, _base = get_mp_token_and_base()
