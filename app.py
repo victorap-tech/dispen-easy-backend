@@ -914,71 +914,71 @@ def pagos_list():
 @app.post("/api/pagos/preferencia")
 def api_pagos_preferencia():
     """
-    Genera una preferencia de pago en MercadoPago usando el token del operador si el dispenser tiene uno asignado,
-    o la cuenta del administrador en caso contrario.
+    Genera una preferencia de pago en MercadoPago:
+    - Si viene op_token → usa la cuenta del operador.
+    - Si el dispenser tiene operador activo vinculado → usa su cuenta.
+    - Si no → usa el token global del administrador.
     """
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True) or {}
         pid = _to_int(data.get("product_id") or data.get("pid") or 0)
         bundle = _to_int(data.get("bundle") or data.get("litros") or 1)
         op_token = (data.get("op_token") or "").strip()
 
-        print("📦 Datos recibidos:", data)
+        print("📦 Datos recibidos en /api/pagos/preferencia:", data)
 
-        # --- Obtener producto y dispenser ---
+        # --- Buscar producto y dispenser ---
         prod = Producto.query.get(pid)
         if not prod or not prod.habilitado:
-            return jsonify(ok=False, error="producto no disponible")
+            return jsonify(ok=False, error="Producto no disponible")
 
         disp = Dispenser.query.get(prod.dispenser_id)
         if not disp or not disp.activo:
-            return jsonify(ok=False, error="dispenser no disponible")
+            return jsonify(ok=False, error="Dispenser no disponible")
 
-        # --- Determinar qué token usar ---
+        # --- Determinar cuenta de MercadoPago ---
         mp_access_token = None
         tipo_cuenta = None
 
         if op_token:
-            # 🔹 Caso: operador logueado genera el pago
+            # Caso: el operador está generando la preferencia desde su panel
             op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
             if not op:
-                return jsonify(ok=False, error="Operador no válido")
+                return jsonify(ok=False, error="Operador no válido o inactivo")
+
             if not getattr(op, "mp_access_token", None):
                 return jsonify(ok=False, error="Operador sin cuenta MercadoPago vinculada")
+
             mp_access_token = op.mp_access_token
             tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
-            print(f"🟢 Generando pago con cuenta del OPERADOR: {op.nombre or '(sin nombre)'}")
+            print(f"🟢 Usando cuenta de OPERADOR: {op.nombre or '(sin nombre)'}")
 
         else:
-            # 🔹 Caso: admin genera QR desde panel
+            # Caso: el admin genera el QR desde su panel
             op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
+
             if op and getattr(op, "mp_access_token", None):
-                # Si el dispenser tiene operador asignado, usar su cuenta
+                # El dispenser tiene un operador activo con cuenta vinculada
                 mp_access_token = op.mp_access_token
                 tipo_cuenta = f"operador ({op.nombre or 'sin nombre'})"
-                print(f"🟠 Admin generando QR usando cuenta del OPERADOR: {op.nombre or '(sin nombre)'}")
+                print(f"🟠 Admin generando QR usando cuenta del operador {op.nombre or '(sin nombre)'}")
+
             else:
-                # Si no hay operador, usar la del admin
+                # No hay operador asignado → usar token global de producción/test
                 mp_access_token, _ = get_mp_token_and_base()
                 tipo_cuenta = "administrador"
                 print(f"🔵 Admin generando QR con cuenta del ADMINISTRADOR")
 
         if not mp_access_token:
-            return jsonify(ok=False, error="No se encontró un access_token válido")
+            return jsonify(ok=False, error="No se encontró token válido de MercadoPago")
 
-        # --- Validar stock ---
+        # --- Verificar stock ---
         _, reserva = get_thresholds()
         if (int(prod.cantidad) - bundle) < reserva:
             return jsonify(ok=False, error="Producto en nivel de reserva")
 
         # --- Calcular precio ---
-        litros = str(bundle)
-        if litros == "1":
-            precio = prod.precio
-        else:
-            precio = (prod.bundle_precios or {}).get(litros)
-        if not precio:
-            return jsonify(ok=False, error="Precio no definido para ese volumen")
+        monto_final = compute_total_price_ars(prod, bundle)
 
         # --- Crear preferencia en MercadoPago ---
         import mercadopago
@@ -986,14 +986,14 @@ def api_pagos_preferencia():
 
         pref_data = {
             "items": [{
-                "title": f"{prod.nombre} ({litros}L)",
+                "title": f"{prod.nombre} ({bundle}L)",
                 "quantity": 1,
                 "currency_id": "ARS",
-                "unit_price": float(precio)
+                "unit_price": float(monto_final)
             }],
             "metadata": {
                 "product_id": prod.id,
-                "litros": litros,
+                "litros": bundle,
                 "slot_id": prod.slot_id,
                 "dispenser_id": disp.id,
                 "device_id": disp.device_id,
@@ -1010,13 +1010,16 @@ def api_pagos_preferencia():
         }
 
         pref = sdk.preference().create(pref_data)
-        init_point = pref["response"].get("init_point") or pref["response"].get("sandbox_init_point")
+        link = pref["response"].get("init_point") or pref["response"].get("sandbox_init_point")
 
-        print(f"✅ Preferencia creada para {tipo_cuenta}: {init_point}")
-        return jsonify(ok=True, url=init_point)
+        if not link:
+            return jsonify(ok=False, error="No se recibió link de preferencia desde MercadoPago")
+
+        print(f"✅ Preferencia creada correctamente ({tipo_cuenta}): {link}")
+        return jsonify(ok=True, url=link, tipo_cuenta=tipo_cuenta)
 
     except Exception as e:
-        print("❌ Error generando preferencia:", e)
+        print("❌ Error en /api/pagos/preferencia:", e)
         return jsonify(ok=False, error=str(e))
 
 # Webhook MP
