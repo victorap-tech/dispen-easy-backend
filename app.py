@@ -1570,129 +1570,81 @@ def ui_qr_admin():
 
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
-    """Página visual para seleccionar cantidad y generar pago (admin u operador)."""
-    pid = request.args.get("pid")
-    op_token = request.args.get("op_token", "").strip()
-
-    if not pid:
-        return "<p>Falta parámetro <code>pid</code>.</p>"
-
-    prod = Producto.query.get(pid)
-    if not prod or not prod.habilitado:
-        return "<p>Producto sin stock o deshabilitado.</p>"
-
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp or not disp.activo:
-        return "<p>Dispenser no disponible.</p>"
-
-    tipo_cuenta = "administrador" if not op_token else "operador"
-
-    # Construir precios (1L, 2L, 3L)
-    precios = []
-    if prod.precio:
-        precios.append((1, prod.precio))
-    if "2" in (prod.bundle_precios or {}):
-        precios.append((2, prod.bundle_precios["2"]))
-    if "3" in (prod.bundle_precios or {}):
-        precios.append((3, prod.bundle_precios["3"]))
-
-    html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Seleccionar cantidad</title>
-        <style>
-            body {{
-                background-color: #0b122e;
-                color: #e5e7eb;
-                font-family: 'Inter', sans-serif;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-            }}
-            .card {{
-                background: rgba(255, 255, 255, 0.05);
-                padding: 28px;
-                border-radius: 16px;
-                text-align: center;
-                box-shadow: 0 0 25px rgba(0,0,0,0.2);
-                width: 90%;
-                max-width: 350px;
-            }}
-            h1 {{ color: #2cc2ff; margin-bottom: 8px; }}
-            h2 {{ color: white; margin-top: 0; }}
-            p {{ opacity: 0.9; margin-bottom: 18px; }}
-            button {{
-                display: block;
-                width: 100%;
-                background: #2cc2ff;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 14px;
-                font-size: 18px;
-                font-weight: bold;
-                margin: 8px 0;
-                cursor: pointer;
-                transition: 0.2s;
-            }}
-            button:hover {{ background: #1b99d8; }}
-            .footer {{
-                margin-top: 20px;
-                font-size: 13px;
-                opacity: 0.7;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>Seleccionar cantidad</h1>
-            <h2>{prod.nombre}</h2>
-            <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
-            <p>Seleccioná la cantidad a comprar:</p>
     """
+    Página HTML para que el cliente elija la cantidad de litros
+    y vea el estado del dispenser (online/offline).
+    """
+    try:
+        pid = _to_int(request.args.get("pid") or 0)
+        prod = Producto.query.get(pid)
+        if not prod or not prod.habilitado:
+            return _html("Producto no disponible", "<p>Este producto no está habilitado actualmente.</p>")
 
-    for litros, precio in precios:
-        html += f"""
-            <button onclick="pagar({litros})">{litros} L – ${precio}</button>
+        disp = Dispenser.query.get(prod.dispenser_id)
+        if not disp:
+            return _html("Dispenser no encontrado", "<p>El dispenser asociado no existe.</p>")
+
+        # Obtener estado del dispenser (si lo tenemos en memoria)
+        info_status = last_status.get(disp.device_id, {"status": "unknown"})
+        status = info_status.get("status", "unknown").lower()
+        is_online = (status == "online")
+
+        # Calcular opciones de compra
+        litros_list = [1, 2, 3]
+        opciones_html = ""
+        for L in litros_list:
+            precio = compute_total_price_ars(prod, L)
+            opciones_html += f"""
+                <button style="display:block;width:100%;margin:8px 0;padding:12px;
+                    font-size:18px;border:none;border-radius:8px;
+                    background:#0066cc;color:white;cursor:pointer;"
+                    onclick="iniciarPago({L})">{L} L – ${precio}</button>
+            """
+
+        estado_html = f"""
+        <p style='color:{"#00ff66" if is_online else "#ff5555"};margin-bottom:10px;'>
+            🖥️ Estado del dispenser: <b>{'Conectado' if is_online else 'Sin conexión'}</b>
+        </p>
         """
 
-    html += f"""
-            <div class="footer">Sistema Dispen-Easy © 2025</div>
-        </div>
-
-        <script>
-        async function pagar(litros) {{
-            try {{
-                const body = {{
-                    pid: "{prod.id}",
-                    bundle: litros,
-                    op_token: "{op_token}"
-                }};
-                const resp = await fetch("/api/pagos/preferencia", {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify(body)
-                }});
-                const data = await resp.json();
-                if (data.ok && data.url) {{
-                    window.location.href = data.url;
-                }} else {{
-                    alert("Error al generar el pago: " + (data.error || "Desconocido"));
+        html = f"""
+        <!doctype html>
+        <html lang="es">
+        <head>
+            <meta charset="utf-8"/>
+            <meta name="viewport" content="width=device-width,initial-scale=1"/>
+            <title>{prod.nombre}</title>
+        </head>
+        <body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
+            <div style="max-width:480px;margin:10vh auto;padding:20px;
+                background:rgba(255,255,255,.05);border-radius:16px;">
+                <h1 style="margin:0 0 10px;">{prod.nombre}</h1>
+                <p>Pagás con la cuenta MercadoPago vinculada al administrador</p>
+                {estado_html}
+                <p>Seleccioná la cantidad a comprar:</p>
+                {opciones_html}
+            </div>
+            <script>
+                function iniciarPago(litros) {{
+                    if (!{str(is_online).lower()}) {{
+                        alert('Este dispenser está sin conexión, no podrá dispensar el producto.');
+                    }}
+                    fetch('/api/pagos/preferencia', {{
+                        method:'POST',
+                        headers:{{'Content-Type':'application/json'}},
+                        body:JSON.stringify({{product_id:{prod.id}, litros:litros}})
+                    }}).then(r=>r.json()).then(d=>{
+                        if(d.ok && d.url) window.location=d.url;
+                        else alert('Error al generar el pago: '+(d.error||'desconocido'));
+                    });
                 }}
-            }} catch (err) {{
-                alert("Error de conexión: " + err);
-            }}
-        }}
-        </script>
-    </body>
-    </html>
-    """
-
-    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
+            </script>
+        </body>
+        </html>
+        """
+        return _html_raw(html)
+    except Exception as e:
+        return _html("Error", f"<p>{e}</p>")
 
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
