@@ -921,7 +921,7 @@ def pagos_list():
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def api_pagos_preferencia():
-    """Genera una preferencia de pago en MercadoPago usando el token del operador o la cuenta del administrador."""
+    """Genera una preferencia de pago en MercadoPago usando siempre el token fijo como antes."""
     try:
         data = request.get_json(force=True)
         pid = data.get("product_id") or data.get("pid")
@@ -934,21 +934,14 @@ def api_pagos_preferencia():
         # Determinar tipo de cuenta
         # ===========================
         if not op_token:
-            # Es el admin (no operador)
             tipo_cuenta = "admin"
-            mp_access_token = os.getenv("MP_ACCESS_TOKEN_PROD")
             print("✅ Generando pago con cuenta del ADMINISTRADOR")
         else:
-            # Es un operador (validar token)
-            op = OperatorToken.query.filter_by(token=op_token).first()
-            if not op:
-                print("❌ Operador no válido")
-                return jsonify(ok=False, error="Operador no válido")
-
-            # Antes no se usaba access_token, así que mantenemos compatibilidad
             tipo_cuenta = "operador"
-            mp_access_token = os.getenv("MP_ACCESS_TOKEN_PROD")
-            print(f"✅ Generando pago con cuenta del OPERADOR asignado (usando token global)")
+            print("✅ Generando pago con cuenta del OPERADOR (usa el mismo token global)")
+
+        # Token fijo como antes — el que usaba cuando todo funcionaba
+        mp_access_token = "APP_USR-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"  # ← poné aquí el token que estaba antes en el código
 
         # ===========================
         # Validar producto
@@ -1000,6 +993,7 @@ def api_pagos_preferencia():
     except Exception as e:
         print("⚠️ Error en /api/pagos/preferencia:", e)
         return jsonify(ok=False, error=str(e))
+
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
