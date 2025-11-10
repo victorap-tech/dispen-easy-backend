@@ -1682,6 +1682,7 @@ def ui_seleccionar():
                 // Avisar si el dispenser está sin conexión
                 if (!{str(disp.activo).lower()}) {{
                     alert('Este dispenser está sin conexión, no podrá dispensar el producto.');
+                    return;
                 }}
                 fetch('/api/pagos/preferencia', {{
                     method: 'POST',
@@ -1706,7 +1707,6 @@ def ui_seleccionar():
     """
 
     return _html_raw(html)
-
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
