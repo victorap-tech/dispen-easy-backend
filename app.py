@@ -918,10 +918,12 @@ def pagos_list():
         for p in pagos
     ])
 
-# -------------- preferencia (con litros elegidos) --------------
-# ======================================================
-# ENDPOINT PARA GENERAR PREFERENCIA DE PAGO (QR)
-# ======================================================
+# Asegurarnos de que la tabla Variable está declarada
+class Variable(db.Model):
+    __tablename__ = "variable"
+    key = db.Column(db.String(50), primary_key=True)
+    value = db.Column(db.String(255), nullable=False)
+
 @app.post("/api/pagos/preferencia")
 def generar_preferencia():
     try:
