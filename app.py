@@ -1037,59 +1037,124 @@ def crear_preferencia_api():
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
+    """
+    Webhook unificado — soporta pagos desde cuenta global o de operadores independientes.
+    """
     body = request.get_json(silent=True) or {}
     args = request.args or {}
     topic = args.get("topic") or body.get("type")
     live_mode = bool(body.get("live_mode", True))
     base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
 
+    # ============================================================
+    # 🔍 Determinar ID del pago
+    # ============================================================
     payment_id = None
     if topic == "payment":
         if "resource" in body and isinstance(body["resource"], str):
-            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception: payment_id = None
+            try:
+                payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception:
+                payment_id = None
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
+
     if not payment_id:
+        app.logger.warning("[MP-WEBHOOK] Sin payment_id válido")
         return "ok", 200
 
+    # ============================================================
+    # 🔍 Intentar obtener datos del pago desde MP
+    # ============================================================
+    # Primero probamos con token global, si falla intentaremos detectar si pertenece a operador
+    token_global, _ = get_mp_token_and_base()
+    r_pay = None
     try:
-        r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                             headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        r_pay.raise_for_status()
-    except Exception:
-        return "ok", 200
+        r_pay = requests.get(
+            f"{base_api}/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {token_global}"},
+            timeout=15
+        )
+        if r_pay.status_code != 200:
+            raise Exception(f"Global token no válido ({r_pay.status_code})")
+    except Exception as e:
+        app.logger.warning(f"[MP-WEBHOOK] Error con token global: {e}")
+        r_pay = None
 
-    pay = r_pay.json() or {}
-    estado = (pay.get("status") or "").lower()
-    md = pay.get("metadata") or {}
+    # Si el global no funcionó, intentamos buscar un operador relacionado
+    pay_data = None
+    if not r_pay or r_pay.status_code != 200:
+        # Buscar en tabla de pagos previos si ya fue guardado
+        p_old = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+        op_token = None
+        if p_old:
+            disp_id = p_old.dispenser_id
+            op = OperatorToken.query.filter_by(dispenser_id=disp_id, activo=True).first()
+            if op and op.mp_access_token:
+                op_token = op.mp_access_token
+                try:
+                    r_pay = requests.get(
+                        f"{base_api}/v1/payments/{payment_id}",
+                        headers={"Authorization": f"Bearer {op_token}"},
+                        timeout=15
+                    )
+                except Exception as e:
+                    app.logger.warning(f"[MP-WEBHOOK] Error con token operador: {e}")
+        if not r_pay or r_pay.status_code != 200:
+            app.logger.error(f"[MP-WEBHOOK] No se pudo recuperar pago {payment_id}")
+            return "ok", 200
+
+    pay_data = r_pay.json() or {}
+    estado = (pay_data.get("status") or "").lower()
+    md = pay_data.get("metadata") or {}
     product_id = _to_int(md.get("product_id") or 0)
     slot_id = _to_int(md.get("slot_id") or 0)
     litros = _to_int(md.get("litros") or 0)
     dispenser_id = _to_int(md.get("dispenser_id") or 0)
     device_id = str(md.get("device_id") or "")
-    monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
+    monto = _to_int(md.get("precio_final") or 0) or _to_int(pay_data.get("transaction_amount") or 0)
+    producto_txt = (md.get("producto") or pay_data.get("description") or "")[:120]
 
-    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
+    # ============================================================
+    # 🔄 Guardar / actualizar registro del pago
+    # ============================================================
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
         p = Pago(
-            mp_payment_id=str(payment_id), estado=estado or "pending", producto=producto_txt,
-            dispensado=False, procesado=False, slot_id=slot_id, litros=litros if litros>0 else 1,
-            monto=monto, product_id=product_id, dispenser_id=dispenser_id, device_id=device_id, raw=pay
-        ); db.session.add(p)
+            mp_payment_id=str(payment_id),
+            estado=estado or "pending",
+            producto=producto_txt,
+            dispensado=False,
+            procesado=False,
+            slot_id=slot_id,
+            litros=litros if litros > 0 else 1,
+            monto=monto,
+            product_id=product_id,
+            dispenser_id=dispenser_id,
+            device_id=device_id,
+            raw=pay_data
+        )
+        db.session.add(p)
     else:
-        p.estado = estado or p.estado; p.producto = producto_txt or p.producto
-        p.slot_id = p.slot_id or slot_id; p.product_id = p.product_id or product_id
-        p.litros = p.litros or (litros if litros>0 else p.litros)
-        p.monto = p.monto or monto; p.dispenser_id = p.dispenser_id or dispenser_id
-        p.device_id = p.device_id or device_id; p.raw = pay
+        p.estado = estado or p.estado
+        p.producto = producto_txt or p.producto
+        p.slot_id = p.slot_id or slot_id
+        p.product_id = p.product_id or product_id
+        p.litros = p.litros or (litros if litros > 0 else p.litros)
+        p.monto = p.monto or monto
+        p.dispenser_id = p.dispenser_id or dispenser_id
+        p.device_id = p.device_id or device_id
+        p.raw = pay_data
+
     try:
         db.session.commit()
-    except Exception:
+    except Exception as e:
         db.session.rollback()
+        app.logger.error(f"[MP-WEBHOOK] Error guardando pago: {e}")
         return "ok", 200
 
+    # ============================================================
+    # 🚀 Si aprobado, enviar comando al dispenser (MQTT)
+    # ============================================================
     try:
         if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
             dev = p.device_id
@@ -1101,11 +1166,12 @@ def mp_webhook():
             if dev:
                 published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros * 5))
                 if published:
-                    p.procesado = True; db.session.commit()
-    except Exception:
-        pass
-    return "ok", 200
+                    p.procesado = True
+                    db.session.commit()
+    except Exception as e:
+        app.logger.error(f"[MP-WEBHOOK] Error al procesar dispensado: {e}")
 
+    return "ok", 200
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
