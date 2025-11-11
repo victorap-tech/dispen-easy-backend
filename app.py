@@ -1592,8 +1592,8 @@ def ui_seleccionar():
         operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
 
     if operador:
-        token_mp = getattr(operador, "mp_token", None)
-        quien = "operador"
+    token_mp = getattr(operador, "mp_access_token", None)
+    quien = "operador"
     else:
         # Token global (modo test/live)
         kv = KV.query.get("mp_mode")
