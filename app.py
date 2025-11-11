@@ -1039,7 +1039,7 @@ def crear_preferencia_api():
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-
+    r_pay = None  # ✅ se inicializa antes de usar
     app.logger.info(f"[MP-WEBHOOK] BODY RECIBIDO: {str(body)[:600]}")
 
     token_global, base_api = get_mp_token_and_base()
@@ -1073,7 +1073,6 @@ def mp_webhook():
 
         # ⚠️ Fallback: buscar si el pago pertenece a un operador
         try:
-            # Buscamos metadatos del pago usando cualquier token de operador activo
             for op in OperatorToken.query.filter_by(activo=True).all():
                 row = KV.query.get(f"mp_token_{op.token}")
                 if not row or not row.value:
@@ -1162,6 +1161,16 @@ def mp_webhook():
         db.session.rollback()
 
     return "ok", 200
+
+
+# === Alias para compatibilidad ===
+@app.post("/webhook")
+def webhook_alias():
+    return mp_webhook()
+
+@app.post("/mp/webhook")
+def webhook_alias2():
+    return mp_webhook()
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
