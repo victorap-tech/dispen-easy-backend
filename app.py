@@ -930,64 +930,49 @@ class Variable(db.Model):
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = _to_int(data.get("product_id") or 0)
-    litros = _to_int(data.get("litros") or 0) or 1
+    data = request.get_json(force=True)
+    pid = int(data.get("product_id", 0))
+    litros = int(data.get("litros", 1))
+    op_token = request.headers.get("x-operator-token", "").strip()
 
-    prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return json_error("Producto no disponible o deshabilitado", 400)
+    prod = Producto.query.get(pid)
+    if not prod:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return json_error("Dispenser no disponible o deshabilitado", 400)
+    disp = Dispenser.query.get(prod.dispenser_id)
+    if not disp:
+        return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
 
-    # ============================================================
-    # 🔍 Determinar token de MercadoPago (operador o global)
-    # ============================================================
-    op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
-    token = None
-    base_api = "https://api.sandbox.mercadopago.com"
+    # === Determinar el token correcto ===
+    token_mp, base_api = get_mp_token_and_base()
 
-    if op and op.mp_access_token:
-        token = op.mp_access_token.strip()
-        app.logger.info(f"[MP] Usando token del operador '{op.nombre or op.token[:6]}'")
-        if not token.startswith("TEST-"):
-            base_api = "https://api.mercadopago.com"
+    # Si viene un token de operador, usamos su token específico
+    if op_token:
+        row = KV.query.get(f"mp_token_{op_token}")
+        if row and row.value:
+            token_mp = row.value.strip()
+
+    # === Calcular monto final ===
+    monto_final = float(prod.precio or 0)
+    if litros == 2 and prod.bundle2:
+        monto_final = float(prod.bundle2)
+    elif litros == 3 and prod.bundle3:
+        monto_final = float(prod.bundle3)
     else:
-        modo = get_mp_mode()
-        if modo == "live":
-            token = MP_ACCESS_TOKEN_LIVE
-            base_api = "https://api.mercadopago.com"
-        else:
-            token = MP_ACCESS_TOKEN_TEST
-            base_api = "https://api.sandbox.mercadopago.com"
-        app.logger.info(f"[MP] Usando token global ({modo})")
+        monto_final = float(prod.precio or 0) * litros
 
-    if not token:
-        return json_error("Token de MercadoPago no configurado (global u operador)", 500)
-
-    # ============================================================
-    # 🔍 Verificar stock
-    # ============================================================
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) < reserva:
-        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
-
-    monto_final = compute_total_price_ars(prod, litros)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-
-    body = {
+    # === Crear preferencia ===
+    external_ref = f"disp{disp.id}_prod{pid}_{int(time.time())}"
+    pref_data = {
         "items": [{
             "id": str(prod.id),
-            "title": f"{prod.nombre} · {litros} L",
+            "title": f"{prod.nombre} ({litros} L)",
             "description": prod.nombre,
             "quantity": 1,
             "currency_id": "ARS",
             "unit_price": float(monto_final),
         }],
-        "description": f"{prod.nombre} · {litros} L",
+        "description": f"{prod.nombre} ({litros} L)",
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
@@ -995,48 +980,35 @@ def crear_preferencia_api():
             "litros": int(litros),
             "dispenser_id": int(disp.id),
             "device_id": disp.device_id,
-            "precio_final": int(monto_final),
+            "precio_final": float(monto_final),
         },
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {
             "success": f"{WEB_URL}/gracias?status=success",
             "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
+            "pending": f"{WEB_URL}/gracias?status=pending",
         },
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-EASY",
+        "notification_url": f"{WEB_URL}/api/mp/webhook"
     }
 
     try:
         r = requests.post(
             f"{base_api}/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=20
+            headers={"Authorization": f"Bearer {token_mp}"},
+            json=pref_data,
+            timeout=20
         )
-        r.raise_for_status()
+        if r.status_code != 201:
+            app.logger.warning(f"[MP] Error al crear preferencia: {r.text[:400]}")
+            return jsonify({"ok": False, "error": "mp.preference_failed"}), 500
+
+        js = r.json()
+        init_point = js.get("init_point") or js.get("sandbox_init_point") or ""
+        return jsonify({"ok": True, "url": init_point})
     except Exception as e:
-        detail = str(e)
-        try:
-            if 'r' in locals():
-                detail = getattr(r, "text", str(e))[:600]
-        except Exception:
-            pass
-        return json_error("mp_preference_failed", 502, detail)
-
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-
-    return ok_json({
-        "ok": True,
-        "link": link,
-        "raw": pref,
-        "precio_final": monto_final,
-        "modo": "operador" if op and op.mp_access_token else get_mp_mode()
-    })
+        app.logger.error(f"[MP] Excepción al crear preferencia: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
