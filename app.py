@@ -935,13 +935,12 @@ def generar_preferencia():
         if not disp:
             return jsonify({"ok": False, "error": "Dispenser no encontrado"})
 
-        # Token: si tiene operador, usa su token; si no, usa global
-        token = None
+        # Seleccionar token según el contexto (operador o global)
         if op_token:
             operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
             if not operador:
                 return jsonify({"ok": False, "error": "Operador inválido"})
-            token = operador.token  # ← campo correcto según tu base
+            token = operador.mp_access_token  # ✅ ahora usamos el campo correcto
         else:
             token = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
 
@@ -950,15 +949,22 @@ def generar_preferencia():
 
         sdk = mercadopago.SDK(token)
 
+        # Crear preferencia
         item_title = f"{prod.nombre} - {litros} L"
         unit_price = prod.precio if litros == 1 else (prod.bundle_precios or {}).get(str(litros), 0)
         preference_data = {
-            "items": [{"title": item_title, "quantity": 1, "unit_price": float(unit_price)}],
+            "items": [
+                {
+                    "title": item_title,
+                    "quantity": 1,
+                    "unit_price": float(unit_price),
+                }
+            ],
             "back_urls": {
                 "success": "https://dispen-easy-web-production.up.railway.app/success",
                 "failure": "https://dispen-easy-web-production.up.railway.app/failure",
             },
-            "auto_return": "approved"
+            "auto_return": "approved",
         }
 
         preference = sdk.preference().create(preference_data)
@@ -971,7 +977,6 @@ def generar_preferencia():
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
-
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
