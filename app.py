@@ -1543,6 +1543,7 @@ def ui_seleccionar():
         if not disp or not disp.activo:
             return _html_raw("<p>Dispenser no disponible o deshabilitado.</p>")
 
+        # Detectar si el dispenser tiene operador asignado
         operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
         if not op_token and operador_asignado:
             return _html_raw(f"""
@@ -1554,6 +1555,7 @@ def ui_seleccionar():
 
         tipo_cuenta = "operador" if op_token else "administrador"
 
+        # Construir lista de precios
         precios = []
         if prod.precio:
             precios.append((1, prod.precio))
@@ -1607,6 +1609,14 @@ def ui_seleccionar():
                     font-size:12px;
                     opacity:0.6;
                 }}
+                .alert {{
+                    background:#ff4c4c;
+                    color:white;
+                    padding:10px;
+                    border-radius:8px;
+                    font-weight:bold;
+                    margin-bottom:15px;
+                }}
             </style>
         </head>
         <body>
@@ -1625,9 +1635,13 @@ def ui_seleccionar():
 
             <script>
             function iniciarPago(litros) {{
+                // Verificar si el dispenser está online antes de generar el pago
                 const online = {str(disp.activo).lower()};
                 if (!online) {{
-                    alert('⚠️ Este dispenser está sin conexión, no podrá dispensar el producto.');
+                    const alerta = document.createElement('div');
+                    alerta.className = 'alert';
+                    alerta.innerText = '⚠️ Este dispenser está sin conexión. No podrá dispensar el producto.';
+                    document.querySelector('.card').prepend(alerta);
                     return;
                 }}
 
