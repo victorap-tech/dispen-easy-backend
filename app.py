@@ -1077,28 +1077,42 @@ def mp_webhook():
         if r_pay.status_code != 200:
             raise Exception(f"Global token no válido ({r_pay.status_code})")
     except Exception as e:
-        app.logger.warning(f"[MP-WEBHOOK] Error con token global: {e}")
+        app.logger.warning(f"[MP-WEBHOOK] Error con token Global: {e}")
         r_pay = None
 
-    # Si el global no funcionó, intentamos buscar un operador relacionado
+    # ============================================================
+    # 🔁 Si el global no funcionó, intentamos buscar token de operador
+    # ============================================================
     pay_data = None
     if not r_pay or r_pay.status_code != 200:
-        # Buscar en tabla de pagos previos si ya fue guardado
-        p_old = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
         op_token = None
-        if p_old:
-            disp_id = p_old.dispenser_id
+        # Intentar obtener el dispenser_id desde metadata del body del webhook
+        md = (body.get("data") or {}).get("metadata") or body.get("metadata") or {}
+        disp_id = _to_int(md.get("dispenser_id") or 0)
+
+        if not disp_id:
+            # como fallback, buscar si ya hay un pago guardado en la base
+            p_old = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+            disp_id = p_old.dispenser_id if p_old else None
+
+        if disp_id:
             op = OperatorToken.query.filter_by(dispenser_id=disp_id, activo=True).first()
             if op and op.mp_access_token:
                 op_token = op.mp_access_token
+                app.logger.info(f"[MP-WEBHOOK] Reintentando con token del operador '{op.token[:6]}' para dispenser {disp_id}")
                 try:
                     r_pay = requests.get(
                         f"{base_api}/v1/payments/{payment_id}",
                         headers={"Authorization": f"Bearer {op_token}"},
                         timeout=15
                     )
+                    if r_pay.status_code == 200:
+                        app.logger.info(f"[MP-WEBHOOK] Pago recuperado exitosamente con token de operador {op.token[:6]}")
+                    else:
+                        app.logger.warning(f"[MP-WEBHOOK] Token operador inválido ({r_pay.status_code})")
                 except Exception as e:
                     app.logger.warning(f"[MP-WEBHOOK] Error con token operador: {e}")
+
         if not r_pay or r_pay.status_code != 200:
             app.logger.error(f"[MP-WEBHOOK] No se pudo recuperar pago {payment_id}")
             return "ok", 200
@@ -1115,7 +1129,7 @@ def mp_webhook():
     producto_txt = (md.get("producto") or pay_data.get("description") or "")[:120]
 
     # ============================================================
-    # 🔄 Guardar / actualizar registro del pago
+    # 💾 Guardar / actualizar registro del pago
     # ============================================================
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
@@ -1168,6 +1182,7 @@ def mp_webhook():
                 if published:
                     p.procesado = True
                     db.session.commit()
+                    app.logger.info(f"[MP-WEBHOOK] Dispensado publicado correctamente ({dev}, slot {p.slot_id}, {p.litros}L)")
     except Exception as e:
         app.logger.error(f"[MP-WEBHOOK] Error al procesar dispensado: {e}")
 
