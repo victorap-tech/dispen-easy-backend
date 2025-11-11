@@ -943,21 +943,17 @@ def crear_preferencia_api():
     if not disp:
         return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
 
-    # === Determinar el token correcto ===
+    # === Determinar token de MercadoPago ===
     token_mp, base_api = get_mp_token_and_base()
 
-    # Si viene token del operador, usamos el suyo si está guardado en KV
+    # Si viene token de operador, intentamos usar su token propio
     if op_token:
         row = KV.query.get(f"mp_token_{op_token}")
         if row and row.value:
             token_mp = row.value.strip()
+            app.logger.info(f"[MP] Usando token del operador ({op_token})")
         else:
-            app.logger.warning(f"[MP] Token de operador no encontrado o inválido ({op_token})")
-            return jsonify({"ok": False, "error": "Token de MercadoPago no encontrado (operador)"}), 401
-
-    # ⚠️ Aseguramos que no se use sandbox nunca en Railway
-    if "sandbox" in base_api:
-        base_api = "https://api.mercadopago.com"
+            app.logger.warning(f"[MP] Operador sin token propio, usando global ({op_token})")
 
     # === Calcular monto final ===
     monto_final = float(prod.precio or 0)
@@ -988,7 +984,6 @@ def crear_preferencia_api():
             "dispenser_id": int(disp.id),
             "device_id": disp.device_id,
             "precio_final": float(monto_final),
-            "operador": bool(op_token)
         },
         "external_reference": external_ref,
         "auto_return": "approved",
@@ -1014,7 +1009,6 @@ def crear_preferencia_api():
         js = r.json()
         init_point = js.get("init_point") or js.get("sandbox_init_point") or ""
         return jsonify({"ok": True, "url": init_point})
-
     except Exception as e:
         app.logger.error(f"[MP] Excepción al crear preferencia: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
