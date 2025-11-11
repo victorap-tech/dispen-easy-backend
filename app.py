@@ -1002,13 +1002,13 @@ def crear_preferencia_api():
         )
         r.raise_for_status()
     except Exception as e:
-    detail = str(e)
-    try:
+      detail = str(e)
+      try:
         if 'r' in locals():
             detail = getattr(r, "text", str(e))[:600]
-    except Exception:
+      except Exception:
         pass
-    return json_error("mp_preference_failed", 502, detail)
+      return json_error("mp_preference_failed", 502, detail)
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
