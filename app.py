@@ -1569,144 +1569,85 @@ def ui_qr_admin():
 
 @app.get("/ui/seleccionar")
 def ui_seleccionar():
-    try:
-        pid = request.args.get("pid", "").strip()
-        op_token = (request.args.get("op_token") or "").strip()
+    pid = _to_int(request.args.get("pid"))
+    op_token = (request.args.get("op_token") or "").strip()
 
-        if not pid:
-            return _html_raw("<p>Error: falta parámetro <code>pid</code></p>")
+    prod = Producto.query.get(pid)
+    if not prod or not prod.habilitado:
+        return _html("Producto sin stock o deshabilitado", "<p>Verifique disponibilidad.</p>")
 
-        prod = Producto.query.get(pid)
-        if not prod or not prod.habilitado:
-            return _html_raw("<p>Producto sin stock o deshabilitado.</p>")
+    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+    if not disp:
+        return _html("Error", "<p>Dispenser no encontrado.</p>")
 
-        disp = Dispenser.query.get(prod.dispenser_id)
-        if not disp or not disp.activo:
-            return _html_raw("<p>Dispenser no disponible o deshabilitado.</p>")
+    # ✅ Verificar si el dispenser está OFFLINE
+    dev = disp.device_id
+    estado = (last_status.get(dev) or {}).get("status", "unknown")
+    if estado != "online":
+        return _html("Dispenser sin conexión", "<p>⚠️ Este dispenser está sin conexión. Intente más tarde.</p>")
 
-        # Detectar si el dispenser tiene operador asignado
-        operador_asignado = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
-        if not op_token and operador_asignado:
-            return _html_raw(f"""
-                <p style='color:#e57e7e;font-family:Inter,sans-serif;text-align:center;margin-top:20vh'>
-                🚫 Este dispenser está asignado al operador <b>{operador_asignado.nombre or '(sin nombre)'}</b>.<br>
-                No es posible generar el QR desde la cuenta del administrador.
-                </p>
-            """)
+    # --- Determinar si se accede con token de operador o global ---
+    operador = None
+    if op_token:
+        operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
 
-        tipo_cuenta = "operador" if op_token else "administrador"
+    if operador:
+        token_mp = getattr(operador, "mp_token", None)
+        quien = "operador"
+    else:
+        # Token global (modo test/live)
+        kv = KV.query.get("mp_mode")
+        modo = (kv.value if kv else "test").lower()
+        token_mp = MP_ACCESS_TOKEN_LIVE if modo == "live" else MP_ACCESS_TOKEN_TEST
+        quien = "administrador"
 
-        # Construir lista de precios
-        precios = []
-        if prod.precio:
-            precios.append((1, prod.precio))
-        bundle = prod.bundle_precios or {}
-        for litros, valor in bundle.items():
-            precios.append((int(litros), valor))
+    if not token_mp:
+        return _html("Error", f"<p>Error al generar el pago: Token de MercadoPago no encontrado ({quien}).</p>")
 
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>{prod.nombre}</title>
-            <style>
-                body {{
-                    background-color:#0b1220;
-                    color:#e5e7eb;
-                    font-family:Inter,system-ui,sans-serif;
-                    display:flex;
-                    justify-content:center;
-                    align-items:center;
-                    height:100vh;
-                    margin:0;
-                }}
-                .card {{
-                    background:rgba(255,255,255,0.05);
-                    border-radius:12px;
-                    padding:24px 48px;
-                    text-align:center;
-                    box-shadow:0 20px 40px rgba(0,0,0,0.3);
-                }}
-                h1 {{ color:#3b82f6; margin-bottom:10px; }}
-                p {{ opacity:0.9; margin-bottom:14px; }}
-                button {{
-                    display:block;
-                    width:100%;
-                    background:#3b82f6;
-                    color:white;
-                    border:none;
-                    border-radius:8px;
-                    padding:12px;
-                    margin-top:8px;
-                    font-size:18px;
-                    font-weight:bold;
-                    cursor:pointer;
-                }}
-                button:hover {{ background:#2563eb; }}
-                footer {{
-                    margin-top:20px;
-                    font-size:12px;
-                    opacity:0.6;
-                }}
-                .alert {{
-                    background:#ff4c4c;
-                    color:white;
-                    padding:10px;
-                    border-radius:8px;
-                    font-weight:bold;
-                    margin-bottom:15px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>{prod.nombre}</h1>
-                <p>Pagás con la cuenta MercadoPago vinculada al <b>{tipo_cuenta}</b></p>
-                <p>Seleccioná la cantidad a comprar:</p>
-        """
+    # --- Opciones de litros ---
+    litros_list = [1, 2, 3]
+    _, reserva = get_thresholds()
+    opciones_html = ""
+    for L in litros_list:
+        if (int(prod.cantidad) - L) < reserva:
+            opciones_html += f'<button disabled style="opacity:.5;margin:6px;padding:10px 20px;border-radius:8px;background:#555;color:#ddd;">{L} L – Sin stock</button><br>'
+        else:
+            opciones_html += f"""
+            <button onclick="genPref({L})" style="margin:6px;padding:10px 20px;border:none;border-radius:8px;background:#007bff;color:white;cursor:pointer;">
+                {L} L – ${compute_total_price_ars(prod, L)}
+            </button><br>
+            """
 
-        for litros, precio in precios:
-            html += f"<button onclick='iniciarPago({litros})'>{litros} L – ${precio}</button>"
-
-        html += f"""
-                <footer>Sistema Dispen-Easy © 2025</footer>
-            </div>
-
-            <script>
-            function iniciarPago(litros) {{
-                // Verificar si el dispenser está online antes de generar el pago
-                const online = {str(disp.activo).lower()};
-                if (!online) {{
-                    const alerta = document.createElement('div');
-                    alerta.className = 'alert';
-                    alerta.innerText = '⚠️ Este dispenser está sin conexión. No podrá dispensar el producto.';
-                    document.querySelector('.card').prepend(alerta);
-                    return;
-                }}
-
-                fetch('/api/pagos/preferencia', {{
-                    method:'POST',
-                    headers:{{'Content-Type':'application/json'}},
-                    body:JSON.stringify({{ product_id:{pid}, litros:litros, op_token:'{op_token}' }})
-                }})
-                .then(r => r.json())
-                .then(d => {{
-                    if (d.ok && d.link) window.location = d.link;
-                    else alert('Error al generar el pago: ' + (d.error || 'desconocido'));
-                }})
-                .catch(err => alert('Error de red o servidor: ' + err));
-            }}
-            </script>
-        </body>
-        </html>
-        """
-
-        return _html_raw(html)
-
-    except Exception as e:
-        return _html_raw(f"<p>Error interno: {e}</p>")
+    # --- HTML dinámico ---
+    html = f"""<!doctype html><html lang="es"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{prod.nombre}</title>
+<script>
+async function genPref(lts) {{
+  try {{
+    const r = await fetch('/api/pagos/preferencia', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ product_id: {pid}, litros: lts }})
+    }});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Error desconocido');
+    window.location.href = j.link;
+  }} catch (e) {{
+    alert('Error al generar el pago: ' + e.message);
+  }}
+}}
+</script>
+</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
+<div style="max-width:700px;margin:12vh auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:24px;text-align:center">
+  <h1 style="color:#58a6ff;margin-bottom:6px;">{prod.nombre}</h1>
+  <p style="margin:0 0 10px;">Pagás con la cuenta MercadoPago vinculada al <b>{quien}</b></p>
+  <p>Seleccioná la cantidad a comprar:</p>
+  {opciones_html}
+  <p style="margin-top:20px;font-size:.85em;color:#aaa">Sistema Dispen·Easy © 2025</p>
+</div>
+</body></html>"""
+    return _html_raw(html)
 # ======================================================
 # ===  Panel de vinculación para operadores  ============
 # ======================================================
