@@ -342,9 +342,12 @@ def get_mp_mode() -> str:
 
 def get_mp_token_and_base() -> tuple[str, str]:
     mode = get_mp_mode()
+
+    # ✅ En modo test usamos el dominio real (Railway bloquea sandbox)
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-    return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
+    else:
+        return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
 
 # ============ MQTT + SSE ============
 
