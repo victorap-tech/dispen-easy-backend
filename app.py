@@ -1722,22 +1722,19 @@ def operator_login():
     # Si es GET, solo muestra la página HTML de ingreso
     return render_template("operator_login.html")
 
-# =====================
-# EDITAR PRODUCTOS (OPERADOR)
-# =====================
+# ============================================================================
+#  OPERADOR - EDITAR PRODUCTO  (precio, bundles, habilitado, nombre)
+# ============================================================================
 @app.post("/api/operator/productos/update")
 def operator_update_producto():
-    """
-    Permite que el operador actualice los datos de un producto asignado a su dispenser.
-    Campos válidos: precio, bundle2, bundle3, habilitado, nombre.
-    """
     data = request.get_json(force=True)
     token = request.headers.get("x-operator-token", "").strip()
 
     if not token:
-        return jsonify({"ok": False, "error": "Falta token de operador"}), 400
+        return jsonify({"ok": False, "error": "Falta token"}), 400
 
-    op = Operador.query.filter_by(token=token).first()
+    # ✔ CORRECTO: OperatorToken (tu modelo real)
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 403
 
@@ -1749,36 +1746,50 @@ def operator_update_producto():
     if not prod:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # Verificar que el producto pertenezca al dispenser del operador
+    # ✔ Verifica que el operador edite su propio dispenser
     if prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "El producto no pertenece a este operador"}), 403
+        return jsonify({"ok": False, "error": "No autorizado"}), 403
 
     try:
-        # Actualizar campos permitidos
-        if "precio" in data and data["precio"] not in (None, ""):
-            prod.precio = float(data["precio"])
-
-        if "bundle2" in data and data["bundle2"] not in (None, ""):
-            prod.bundle2 = float(data["bundle2"])
-
-        if "bundle3" in data and data["bundle3"] not in (None, ""):
-            prod.bundle3 = float(data["bundle3"])
-
-        if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
-
+        # === NOMBRE ===
         if "nombre" in data and str(data["nombre"]).strip():
             prod.nombre = str(data["nombre"]).strip()
 
+        # === PRECIO POR LITRO ===
+        if "precio" in data and data["precio"] not in ("", None):
+            prod.precio = float(data["precio"])
+
+        # === BUNDLES ===
+        if prod.bundle_precios is None:
+            prod.bundle_precios = {}
+
+        # Bundle 2L
+        if "bundle2" in data:
+            val = data["bundle2"]
+            if val in (None, "", "null"):
+                prod.bundle_precios.pop("2", None)
+            else:
+                prod.bundle_precios["2"] = float(val)
+
+        # Bundle 3L
+        if "bundle3" in data:
+            val = data["bundle3"]
+            if val in (None, "", "null"):
+                prod.bundle_precios.pop("3", None)
+            else:
+                prod.bundle_precios["3"] = float(val)
+
+        # === HABILITADO ===
+        if "habilitado" in data:
+            prod.habilitado = bool(data["habilitado"])
+
         db.session.commit()
 
-        app.logger.info(f"[OPERATOR UPDATE] Producto {prod.id} actualizado por operador {op.id}")
         return jsonify({"ok": True, "producto": prod.to_dict()})
 
     except Exception as e:
         db.session.rollback()
-        app.logger.error(f"[OPERATOR UPDATE ERROR] {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)})
 # ===============================
 # 📦 Generar link QR desde panel del operador
 # ===============================
