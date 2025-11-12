@@ -1725,22 +1725,17 @@ def operator_login():
 # =====================
 # EDITAR PRODUCTOS (OPERADOR)
 # =====================
-@app.post("/api/operator/productos/update")
-def operator_update_producto():
+@app.post("/api/productos/update")
+def productos_update_unificado():
     """
-    Permite que el operador actualice los datos de un producto asignado a su dispenser.
-    Campos válidos: precio, bundle2, bundle3, habilitado, nombre.
+    Endpoint universal para actualizar un producto.
+    Lo pueden usar:
+      - ADMIN (x-admin-secret)
+      - OPERADOR (x-operator-token)
     """
-    data = request.get_json(force=True)
-    token = request.headers.get("x-operator-token", "").strip()
+    data = request.get_json(force=True) or {}
 
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token de operador"}), 400
-
-    op = Operador.query.filter_by(token=token).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 403
-
+    # --- Validar product_id ---
     pid = int(data.get("product_id", 0))
     if not pid:
         return jsonify({"ok": False, "error": "Falta product_id"}), 400
@@ -1749,35 +1744,79 @@ def operator_update_producto():
     if not prod:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # Verificar que el producto pertenezca al dispenser del operador
-    if prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "El producto no pertenece a este operador"}), 403
+    # --- Seguridad: verificar si es admin o operador ---
+    admin_token = _admin_header()
+    operator_token = request.headers.get("x-operator-token", "").strip()
+
+    es_admin = False
+    es_operador = False
+    operador = None
+
+    # ADMIN
+    if admin_token and admin_token == _admin_env():
+        es_admin = True
+
+    # OPERADOR
+    if operator_token:
+        operador = OperatorToken.query.filter_by(token=operator_token, activo=True).first()
+        if operador:
+            if operador.dispenser_id != prod.dispenser_id:
+                return jsonify({"ok": False, "error": "El producto no pertenece al operador"}), 403
+            es_operador = True
+
+    if not (es_admin or es_operador):
+        return jsonify({"ok": False, "error": "No autorizado"}), 401
 
     try:
-        # Actualizar campos permitidos
-        if "precio" in data and data["precio"] not in (None, ""):
+        # ===== Campos simples =====
+        if "nombre" in data and str(data["nombre"]).strip():
+            prod.nombre = str(data["nombre"]).strip()
+
+        if "precio" in data and data["precio"] not in ("", None):
             prod.precio = float(data["precio"])
-
-        if "bundle2" in data and data["bundle2"] not in (None, ""):
-            prod.bundle2 = float(data["bundle2"])
-
-        if "bundle3" in data and data["bundle3"] not in (None, ""):
-            prod.bundle3 = float(data["bundle3"])
 
         if "habilitado" in data:
             prod.habilitado = bool(data["habilitado"])
 
-        if "nombre" in data and str(data["nombre"]).strip():
-            prod.nombre = str(data["nombre"]).strip()
+        # ===== Bundle precios =====
+        if prod.bundle_precios is None:
+            prod.bundle_precios = {}
+
+        if "bundle2" in data:
+            val = data["bundle2"]
+            if val not in ("", None, "null"):
+                prod.bundle_precios["2"] = float(val)
+            else:
+                prod.bundle_precios.pop("2", None)
+
+        if "bundle3" in data:
+            val = data["bundle3"]
+            if val not in ("", None, "null"):
+                prod.bundle_precios["3"] = float(val)
+            else:
+                prod.bundle_precios.pop("3", None)
+
+        # ===== Slot =====
+        if "slot" in data:
+            new_slot = int(data["slot"])
+            if new_slot != prod.slot_id:
+                conflict = Producto.query.filter_by(
+                    dispenser_id=prod.dispenser_id,
+                    slot_id=new_slot
+                ).first()
+                if conflict:
+                    return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
+                prod.slot_id = new_slot
 
         db.session.commit()
 
-        app.logger.info(f"[OPERATOR UPDATE] Producto {prod.id} actualizado por operador {op.id}")
-        return jsonify({"ok": True, "producto": prod.to_dict()})
+        return jsonify({
+            "ok": True,
+            "producto": prod.to_dict()
+        })
 
     except Exception as e:
         db.session.rollback()
-        app.logger.error(f"[OPERATOR UPDATE ERROR] {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 # ===============================
 # 📦 Generar link QR desde panel del operador
@@ -1951,90 +1990,6 @@ def ranking_productos():
         "top": top,
         "low": low
     })
-
-# ---------------- Admin: actualizar producto ----------------
-@app.post("/api/admin/productos/update")
-def admin_update_producto():
-    """
-    Actualización completa de producto para el ADMIN.
-    Admin puede modificar:
-      - nombre
-      - precio
-      - bundle2
-      - bundle3
-      - habilitado
-      - slot (opcional)
-    """
-    data = request.get_json(force=True) or {}
-    pid = int(data.get("product_id", 0))
-
-    if not pid:
-        return jsonify({"ok": False, "error": "Falta product_id"}), 400
-
-    prod = Producto.query.get(pid)
-    if not prod:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    try:
-        # ===== Campos simples =====
-        if "nombre" in data and str(data["nombre"]).strip():
-            prod.nombre = str(data["nombre"]).strip()
-
-        if "precio" in data and data["precio"] not in ("", None):
-            prod.precio = float(data["precio"])
-
-        # ===== Bundle precios =====
-        # Aseguramos que bundle_precios exista
-        if prod.bundle_precios is None:
-            prod.bundle_precios = {}
-
-        if "bundle2" in data:
-            if data["bundle2"] not in (None, "", "null"):
-                prod.bundle_precios["2"] = float(data["bundle2"])
-            elif "2" in prod.bundle_precios:
-                del prod.bundle_precios["2"]
-
-        if "bundle3" in data:
-            if data["bundle3"] not in (None, "", "null"):
-                prod.bundle_precios["3"] = float(data["bundle3"])
-            elif "3" in prod.bundle_precios:
-                del prod.bundle_precios["3"]
-
-        # ===== Habilitado / Deshabilitado =====
-        if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
-
-        # ===== Slot (opcional) =====
-        if "slot" in data:
-            new_slot = int(data["slot"])
-            if new_slot != prod.slot_id:
-                conflict = Producto.query.filter_by(
-                    dispenser_id=prod.dispenser_id,
-                    slot_id=new_slot
-                ).first()
-                if conflict:
-                    return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
-                prod.slot_id = new_slot
-
-        db.session.commit()
-
-        # Respuesta
-        return jsonify({
-            "ok": True,
-            "producto": {
-                "id": prod.id,
-                "nombre": prod.nombre,
-                "precio": prod.precio,
-                "bundle_precios": prod.bundle_precios or {},
-                "habilitado": prod.habilitado,
-                "slot": prod.slot_id,
-                "dispenser_id": prod.dispenser_id
-            }
-        })
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/api/admin/productos/qr/<int:pid>")
 def api_admin_qr(pid):
