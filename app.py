@@ -2012,6 +2012,119 @@ def api_admin_qr(pid):
     </html>
     """
     return _html("QR", html)    
+
+# ==============================================================
+# 🧩 CREAR PREFERENCIA DE PAGO (Versión Operador)
+# ==============================================================
+@app.post("/api/operator/pagos/preferencia")
+def operator_crear_preferencia():
+    """
+    Crea una preferencia de pago usando el token de MercadoPago
+    del operador vinculado. Mantiene compatibilidad con el webhook global.
+    """
+    token = request.headers.get("x-operator-token", "").strip()
+    if not token:
+        return json_error("Falta header x-operator-token", 401)
+
+    op = OperatorToken.query.filter_by(token=token, activo=True).first()
+    if not op:
+        return json_error("Operador inválido o inactivo", 401)
+
+    # 📦 Datos del pedido
+    data = request.get_json(force=True, silent=True) or {}
+    product_id = _to_int(data.get("product_id") or 0)
+    litros = _to_int(data.get("litros") or 1)
+    if litros <= 0:
+        litros = 1
+
+    prod = Producto.query.filter_by(id=product_id, dispenser_id=op.dispenser_id).first()
+    if not prod:
+        return json_error("Producto no encontrado o no autorizado", 404)
+    if not prod.habilitado:
+        return json_error("Producto deshabilitado", 400)
+
+    disp = Dispenser.query.get(op.dispenser_id)
+    if not disp or not disp.activo:
+        return json_error("Dispenser inactivo o inexistente", 400)
+
+    # ✅ Verificar stock mínimo
+    _, reserva = get_thresholds()
+    if (int(prod.cantidad) - litros) < reserva:
+        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
+
+    # 💰 Calcular monto final
+    monto_final = compute_total_price_ars(prod, litros)
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    base_api = "https://api.sandbox.mercadopago.com"
+    token_mp = op.mp_access_token
+
+    # Si el token no empieza con TEST-, asumimos entorno Live
+    if token_mp and not token_mp.startswith("TEST-"):
+        base_api = "https://api.mercadopago.com"
+
+    if not token_mp:
+        return json_error("Operador sin cuenta MercadoPago vinculada", 500)
+
+    # 🧾 Cuerpo de la preferencia
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};op={op.token}"
+    body = {
+        "items": [{
+            "id": str(prod.id),
+            "title": f"{prod.nombre} · {litros} L",
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(monto_final)
+        }],
+        "metadata": {
+            "slot_id": int(prod.slot_id),
+            "product_id": int(prod.id),
+            "producto": prod.nombre,
+            "litros": int(litros),
+            "dispenser_id": int(disp.id),
+            "device_id": disp.device_id,
+            "operator_token": op.token
+        },
+        "external_reference": external_ref,
+        "notification_url": f"{backend_base}/api/mp/webhook",
+        "auto_return": "approved",
+        "back_urls": {
+            "success": f"{WEB_URL}/gracias?status=success",
+            "failure": f"{WEB_URL}/gracias?status=failure",
+            "pending": f"{WEB_URL}/gracias?status=pending"
+        },
+        "statement_descriptor": "DISPEN-EASY"
+    }
+
+    # 🚀 Crear preferencia en MercadoPago
+    try:
+        r = requests.post(
+            f"{base_api}/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token_mp}",
+                "Content-Type": "application/json"
+            },
+            json=body, timeout=15
+        )
+        r.raise_for_status()
+    except Exception as e:
+        detail = getattr(r, "text", str(e))[:400] if 'r' in locals() else str(e)
+        return json_error("mp_preference_failed", 502, detail)
+
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+
+    if not link:
+        return json_error("preferencia_sin_link", 502, pref)
+
+    # 📤 Respuesta final
+    return ok_json({
+        "ok": True,
+        "link": link,
+        "modo": "operador",
+        "precio_final": monto_final,
+        "raw": pref
+    })
+
 # ============ DEBUG ADMIN SECRET ============
 @app.get("/api/_debug/admin")
 def debug_admin_secret():
