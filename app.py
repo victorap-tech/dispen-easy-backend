@@ -1727,69 +1727,58 @@ def operator_login():
 # =====================
 @app.post("/api/operator/productos/update")
 def operator_update_producto():
-    """Permite al operador actualizar precios, bundles y habilitación"""
-    token = request.headers.get("x-operator-token")
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
+    """
+    Permite que el operador actualice los datos de un producto asignado a su dispenser.
+    Campos válidos: precio, bundle2, bundle3, habilitado, nombre.
+    """
+    data = request.get_json(force=True)
+    token = request.headers.get("x-operator-token", "").strip()
+
+    if not token:
+        return jsonify({"ok": False, "error": "Falta token de operador"}), 400
+
+    op = Operador.query.filter_by(token=token).first()
     if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
+        return jsonify({"ok": False, "error": "Token inválido"}), 403
 
-    data = request.get_json() or {}
-    pid = data.get("product_id")
-    precio = data.get("precio")
-    bundle2 = data.get("bundle2")
-    bundle3 = data.get("bundle3")
-    habilitado = data.get("habilitado")
+    pid = int(data.get("product_id", 0))
+    if not pid:
+        return jsonify({"ok": False, "error": "Falta product_id"}), 400
 
-    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not p:
+    prod = Producto.query.get(pid)
+    if not prod:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # 🔹 Actualizamos los campos recibidos
-    if precio is not None:
-        try:
-            p.precio = float(precio)
-        except ValueError:
-            pass
+    # Verificar que el producto pertenezca al dispenser del operador
+    if prod.dispenser_id != op.dispenser_id:
+        return jsonify({"ok": False, "error": "El producto no pertenece a este operador"}), 403
 
-    if habilitado is not None:
-        p.habilitado = bool(habilitado)
-
-    # 🔹 Actualizamos bundles sin borrar los existentes
-    bp = p.bundle_precios or {}
-    if bundle2 is not None:
-        if str(bundle2).strip() == "":
-            bp.pop("2", None)
-        else:
-            bp["2"] = float(bundle2)
-    if bundle3 is not None:
-        if str(bundle3).strip() == "":
-            bp.pop("3", None)
-        else:
-            bp["3"] = float(bundle3)
-    p.bundle_precios = bp
-
-    db.session.commit()
-
-    # 🔹 Notificación opcional a Telegram
     try:
-        chat_id = getattr(op, "chat_id", None)
-        if chat_id:
-            msg = (
-                f"🧴 *Producto actualizado en tu dispenser #{op.dispenser_id}*\n\n"
-                f"Nombre: {p.nombre}\n"
-                f"Precio: ${p.precio:.2f}/L\n"
-                f"Bundle 2L: {bp.get('2', '-')}\n"
-                f"Bundle 3L: {bp.get('3', '-')}"
-            )
-            send_telegram_message(chat_id, msg)
+        # Actualizar campos permitidos
+        if "precio" in data and data["precio"] not in (None, ""):
+            prod.precio = float(data["precio"])
+
+        if "bundle2" in data and data["bundle2"] not in (None, ""):
+            prod.bundle2 = float(data["bundle2"])
+
+        if "bundle3" in data and data["bundle3"] not in (None, ""):
+            prod.bundle3 = float(data["bundle3"])
+
+        if "habilitado" in data:
+            prod.habilitado = bool(data["habilitado"])
+
+        if "nombre" in data and str(data["nombre"]).strip():
+            prod.nombre = str(data["nombre"]).strip()
+
+        db.session.commit()
+
+        app.logger.info(f"[OPERATOR UPDATE] Producto {prod.id} actualizado por operador {op.id}")
+        return jsonify({"ok": True, "producto": prod.to_dict()})
+
     except Exception as e:
-        print("Error enviando mensaje Telegram:", e)
-
-    return jsonify({
-        "ok": True,
-        "producto": p.to_dict(),
-    })
-
+        db.session.rollback()
+        app.logger.error(f"[OPERATOR UPDATE ERROR] {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 # ===============================
 # 📦 Generar link QR desde panel del operador
 # ===============================
