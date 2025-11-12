@@ -1952,6 +1952,90 @@ def ranking_productos():
         "low": low
     })
 
+# ---------------- Admin: actualizar producto ----------------
+@app.post("/api/admin/productos/update")
+def admin_update_producto():
+    """
+    Actualización completa de producto para el ADMIN.
+    Admin puede modificar:
+      - nombre
+      - precio
+      - bundle2
+      - bundle3
+      - habilitado
+      - slot (opcional)
+    """
+    data = request.get_json(force=True) or {}
+    pid = int(data.get("product_id", 0))
+
+    if not pid:
+        return jsonify({"ok": False, "error": "Falta product_id"}), 400
+
+    prod = Producto.query.get(pid)
+    if not prod:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    try:
+        # ===== Campos simples =====
+        if "nombre" in data and str(data["nombre"]).strip():
+            prod.nombre = str(data["nombre"]).strip()
+
+        if "precio" in data and data["precio"] not in ("", None):
+            prod.precio = float(data["precio"])
+
+        # ===== Bundle precios =====
+        # Aseguramos que bundle_precios exista
+        if prod.bundle_precios is None:
+            prod.bundle_precios = {}
+
+        if "bundle2" in data:
+            if data["bundle2"] not in (None, "", "null"):
+                prod.bundle_precios["2"] = float(data["bundle2"])
+            elif "2" in prod.bundle_precios:
+                del prod.bundle_precios["2"]
+
+        if "bundle3" in data:
+            if data["bundle3"] not in (None, "", "null"):
+                prod.bundle_precios["3"] = float(data["bundle3"])
+            elif "3" in prod.bundle_precios:
+                del prod.bundle_precios["3"]
+
+        # ===== Habilitado / Deshabilitado =====
+        if "habilitado" in data:
+            prod.habilitado = bool(data["habilitado"])
+
+        # ===== Slot (opcional) =====
+        if "slot" in data:
+            new_slot = int(data["slot"])
+            if new_slot != prod.slot_id:
+                conflict = Producto.query.filter_by(
+                    dispenser_id=prod.dispenser_id,
+                    slot_id=new_slot
+                ).first()
+                if conflict:
+                    return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
+                prod.slot_id = new_slot
+
+        db.session.commit()
+
+        # Respuesta
+        return jsonify({
+            "ok": True,
+            "producto": {
+                "id": prod.id,
+                "nombre": prod.nombre,
+                "precio": prod.precio,
+                "bundle_precios": prod.bundle_precios or {},
+                "habilitado": prod.habilitado,
+                "slot": prod.slot_id,
+                "dispenser_id": prod.dispenser_id
+            }
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/api/admin/productos/qr/<int:pid>")
 def api_admin_qr(pid):
     from flask import jsonify
