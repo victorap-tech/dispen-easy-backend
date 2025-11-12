@@ -342,12 +342,9 @@ def get_mp_mode() -> str:
 
 def get_mp_token_and_base() -> tuple[str, str]:
     mode = get_mp_mode()
-
-    # ✅ En modo test usamos el dominio real (Railway bloquea sandbox)
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-    else:
-        return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
+    return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
 
 # ============ MQTT + SSE ============
 
@@ -930,52 +927,64 @@ class Variable(db.Model):
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
-    data = request.get_json(force=True)
-    pid = int(data.get("product_id", 0))
-    litros = int(data.get("litros", 1))
-    op_token = request.headers.get("x-operator-token", "").strip()
+    data = request.get_json(force=True, silent=True) or {}
+    product_id = _to_int(data.get("product_id") or 0)
+    litros = _to_int(data.get("litros") or 0) or 1
 
-    prod = Producto.query.get(pid)
-    if not prod:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+    prod = Producto.query.get(product_id)
+    if not prod or not prod.habilitado:
+        return json_error("Producto no disponible o deshabilitado", 400)
 
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp:
-        return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
+    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+    if not disp or not disp.activo:
+        return json_error("Dispenser no disponible o deshabilitado", 400)
 
-    # === Determinar token de MercadoPago ===
-    token_mp, base_api = get_mp_token_and_base()
+    # ============================================================
+    # 🔍 Determinar token de MercadoPago (operador o global)
+    # ============================================================
+    op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
+    token = None
+    base_api = "https://api.sandbox.mercadopago.com"
 
-    # Si viene token de operador, intentamos usar su token propio
-    if op_token:
-        row = KV.query.get(f"mp_token_{op_token}")
-        if row and row.value:
-            token_mp = row.value.strip()
-            app.logger.info(f"[MP] Usando token del operador ({op_token})")
-        else:
-            app.logger.warning(f"[MP] Operador sin token propio, usando global ({op_token})")
-
-    # === Calcular monto final ===
-    monto_final = float(prod.precio or 0)
-    if litros == 2 and prod.bundle2:
-        monto_final = float(prod.bundle2)
-    elif litros == 3 and prod.bundle3:
-        monto_final = float(prod.bundle3)
+    if op and op.mp_access_token:
+        token = op.mp_access_token.strip()
+        app.logger.info(f"[MP] Usando token del operador '{op.nombre or op.token[:6]}'")
+        if not token.startswith("TEST-"):
+            base_api = "https://api.mercadopago.com"
     else:
-        monto_final = float(prod.precio or 0) * litros
+        modo = get_mp_mode()
+        if modo == "live":
+            token = MP_ACCESS_TOKEN_LIVE
+            base_api = "https://api.mercadopago.com"
+        else:
+            token = MP_ACCESS_TOKEN_TEST
+            base_api = "https://api.sandbox.mercadopago.com"
+        app.logger.info(f"[MP] Usando token global ({modo})")
 
-    # === Crear preferencia ===
-    external_ref = f"disp{disp.id}_prod{pid}_{int(time.time())}"
-    pref_data = {
+    if not token:
+        return json_error("Token de MercadoPago no configurado (global u operador)", 500)
+
+    # ============================================================
+    # 🔍 Verificar stock
+    # ============================================================
+    _, reserva = get_thresholds()
+    if (int(prod.cantidad) - litros) < reserva:
+        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
+
+    monto_final = compute_total_price_ars(prod, litros)
+    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
+
+    body = {
         "items": [{
             "id": str(prod.id),
-            "title": f"{prod.nombre} ({litros} L)",
+            "title": f"{prod.nombre} · {litros} L",
             "description": prod.nombre,
             "quantity": 1,
             "currency_id": "ARS",
             "unit_price": float(monto_final),
         }],
-        "description": f"{prod.nombre} ({litros} L)",
+        "description": f"{prod.nombre} · {litros} L",
         "metadata": {
             "slot_id": int(prod.slot_id),
             "product_id": int(prod.id),
@@ -983,100 +992,73 @@ def crear_preferencia_api():
             "litros": int(litros),
             "dispenser_id": int(disp.id),
             "device_id": disp.device_id,
-            "precio_final": float(monto_final),
+            "precio_final": int(monto_final),
         },
         "external_reference": external_ref,
         "auto_return": "approved",
         "back_urls": {
             "success": f"{WEB_URL}/gracias?status=success",
             "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending",
+            "pending": f"{WEB_URL}/gracias?status=pending"
         },
-        "notification_url": f"{WEB_URL}/api/mp/webhook"
+        "notification_url": f"{backend_base}/api/mp/webhook",
+        "statement_descriptor": "DISPEN-EASY",
     }
 
     try:
         r = requests.post(
             f"{base_api}/checkout/preferences",
-            headers={"Authorization": f"Bearer {token_mp}"},
-            json=pref_data,
-            timeout=20
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body, timeout=20
         )
-        if r.status_code != 201:
-            app.logger.warning(f"[MP] Error al crear preferencia: {r.text[:400]}")
-            return jsonify({"ok": False, "error": "mp.preference_failed"}), 500
-
-        js = r.json()
-        init_point = js.get("init_point") or js.get("sandbox_init_point") or ""
-        return jsonify({"ok": True, "url": init_point})
+        r.raise_for_status()
     except Exception as e:
-        app.logger.error(f"[MP] Excepción al crear preferencia: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        detail = str(e)
+        try:
+            if 'r' in locals():
+                detail = getattr(r, "text", str(e))[:600]
+        except Exception:
+            pass
+        return json_error("mp_preference_failed", 502, detail)
+
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+
+    if not link:
+        return json_error("preferencia_sin_link", 502, pref)
+
+    return ok_json({
+        "ok": True,
+        "link": link,
+        "raw": pref,
+        "precio_final": monto_final,
+        "modo": "operador" if op and op.mp_access_token else get_mp_mode()
+    })
 # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    r_pay = None  # ✅ se inicializa antes de usar
-    app.logger.info(f"[MP-WEBHOOK] BODY RECIBIDO: {str(body)[:600]}")
-
-    token_global, base_api = get_mp_token_and_base()
     topic = args.get("topic") or body.get("type")
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+    token, _ = get_mp_token_and_base()
 
     payment_id = None
     if topic == "payment":
         if "resource" in body and isinstance(body["resource"], str):
-            try:
-                payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception:
-                payment_id = None
+            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
+            except Exception: payment_id = None
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
-
     if not payment_id:
-        app.logger.warning("[MP-WEBHOOK] Sin payment_id válido")
         return "ok", 200
 
-    # --- intentar recuperar pago con token global ---
     try:
-        r_pay = requests.get(
-            f"{base_api}/v1/payments/{payment_id}",
-            headers={"Authorization": f"Bearer {token_global}"},
-            timeout=15
-        )
-        if r_pay.status_code == 404:
-            raise Exception("Token global no válido (404)")
+        r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
+                             headers={"Authorization": f"Bearer {token}"}, timeout=15)
         r_pay.raise_for_status()
-    except Exception as e:
-        app.logger.warning(f"[MP-WEBHOOK] Error con token Global: {e}")
-
-        # ⚠️ Fallback: buscar si el pago pertenece a un operador
-        try:
-            for op in OperatorToken.query.filter_by(activo=True).all():
-                row = KV.query.get(f"mp_token_{op.token}")
-                if not row or not row.value:
-                    continue
-                t_op = row.value.strip()
-                if not t_op:
-                    continue
-                try:
-                    r_op = requests.get(
-                        f"{base_api}/v1/payments/{payment_id}",
-                        headers={"Authorization": f"Bearer {t_op}"},
-                        timeout=15
-                    )
-                    if r_op.status_code == 200:
-                        r_pay = r_op
-                        app.logger.info(f"[MP-WEBHOOK] ✅ Recuperado con token de operador {op.token[:6]}..")
-                        break
-                except Exception:
-                    continue
-        except Exception as e2:
-            app.logger.error(f"[MP-WEBHOOK] Fallback operador falló: {e2}")
-            return "ok", 200
-
-        if not r_pay or r_pay.status_code != 200:
-            app.logger.error(f"[MP-WEBHOOK] No se pudo recuperar pago {payment_id}")
-            return "ok", 200
+    except Exception:
+        return "ok", 200
 
     pay = r_pay.json() or {}
     estado = (pay.get("status") or "").lower()
@@ -1087,38 +1069,29 @@ def mp_webhook():
     dispenser_id = _to_int(md.get("dispenser_id") or 0)
     device_id = str(md.get("device_id") or "")
     monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
-    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
 
+    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
         p = Pago(
-            mp_payment_id=str(payment_id), estado=estado or "pending",
-            producto=producto_txt, dispensado=False, procesado=False,
-            slot_id=slot_id, litros=litros if litros > 0 else 1,
-            monto=monto, product_id=product_id,
-            dispenser_id=dispenser_id, device_id=device_id, raw=pay
-        )
-        db.session.add(p)
+            mp_payment_id=str(payment_id), estado=estado or "pending", producto=producto_txt,
+            dispensado=False, procesado=False, slot_id=slot_id, litros=litros if litros>0 else 1,
+            monto=monto, product_id=product_id, dispenser_id=dispenser_id, device_id=device_id, raw=pay
+        ); db.session.add(p)
     else:
-        p.estado = estado or p.estado
-        p.producto = producto_txt or p.producto
-        p.slot_id = p.slot_id or slot_id
-        p.product_id = p.product_id or product_id
-        p.litros = p.litros or (litros if litros > 0 else p.litros)
-        p.monto = p.monto or monto
-        p.dispenser_id = p.dispenser_id or dispenser_id
-        p.device_id = p.device_id or device_id
-        p.raw = pay
-
+        p.estado = estado or p.estado; p.producto = producto_txt or p.producto
+        p.slot_id = p.slot_id or slot_id; p.product_id = p.product_id or product_id
+        p.litros = p.litros or (litros if litros>0 else p.litros)
+        p.monto = p.monto or monto; p.dispenser_id = p.dispenser_id or dispenser_id
+        p.device_id = p.device_id or device_id; p.raw = pay
     try:
         db.session.commit()
     except Exception:
         db.session.rollback()
         return "ok", 200
 
-    # --- si el pago fue aprobado, enviar comando al dispenser ---
     try:
-        if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False):
+        if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
             dev = p.device_id
             if not dev and p.product_id:
                 pr = Producto.query.get(p.product_id)
@@ -1126,29 +1099,13 @@ def mp_webhook():
                     d = Dispenser.query.get(pr.dispenser_id)
                     dev = d.device_id if d else ""
             if dev:
-                publicado = send_dispense_cmd(
-                    dev, p.mp_payment_id, p.slot_id, p.litros,
-                    timeout_s=max(30, p.litros * 5)
-                )
-                if publicado:
-                    p.procesado = True
-                    db.session.commit()
-                    app.logger.info(f"[MP-WEBHOOK] Comando enviado a {dev}")
-    except Exception as e:
-        app.logger.error(f"[MP-WEBHOOK] Error al enviar comando MQTT: {e}")
-        db.session.rollback()
-
+                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros * 5))
+                if published:
+                    p.procesado = True; db.session.commit()
+    except Exception:
+        pass
     return "ok", 200
 
-
-# === Alias para compatibilidad ===
-@app.post("/webhook")
-def webhook_alias():
-    return mp_webhook()
-
-@app.post("/mp/webhook")
-def webhook_alias2():
-    return mp_webhook()
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
