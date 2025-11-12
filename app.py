@@ -1726,16 +1726,13 @@ def operator_login():
 # EDITAR PRODUCTOS (OPERADOR)
 # =====================
 @app.post("/api/productos/update")
-def productos_update_unificado():
+def api_update_producto():
     """
-    Endpoint universal para actualizar un producto.
-    Lo pueden usar:
-      - ADMIN (x-admin-secret)
-      - OPERADOR (x-operator-token)
+    Endpoint unificado de actualización de productos.
+    - Si viene 'x-admin-token': Admin puede editar TODO.
+    - Si viene 'x-operator-token': Operador puede editar solo sus productos.
     """
     data = request.get_json(force=True) or {}
-
-    # --- Validar product_id ---
     pid = int(data.get("product_id", 0))
     if not pid:
         return jsonify({"ok": False, "error": "Falta product_id"}), 400
@@ -1744,77 +1741,88 @@ def productos_update_unificado():
     if not prod:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # --- Seguridad: verificar si es admin o operador ---
-    admin_token = _admin_header()
-    operator_token = request.headers.get("x-operator-token", "").strip()
-
+    # --- Detectar tipo de usuario ---
+    admin_token = request.headers.get("x-admin-token", "").strip()
+    op_token = request.headers.get("x-operator-token", "").strip()
     es_admin = False
     es_operador = False
-    operador = None
+    op = None
 
-    # ADMIN
-    if admin_token and admin_token == _admin_env():
+    if admin_token and admin_token == os.getenv("ADMIN_TOKEN"):
         es_admin = True
-
-    # OPERADOR
-    if operator_token:
-        operador = OperatorToken.query.filter_by(token=operator_token, activo=True).first()
-        if operador:
-            if operador.dispenser_id != prod.dispenser_id:
-                return jsonify({"ok": False, "error": "El producto no pertenece al operador"}), 403
+    elif op_token:
+        op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
+        if op and prod.dispenser_id == op.dispenser_id:
             es_operador = True
-
-    if not (es_admin or es_operador):
-        return jsonify({"ok": False, "error": "No autorizado"}), 401
+        else:
+            return jsonify({"ok": False, "error": "Token operador inválido o producto no autorizado"}), 403
+    else:
+        return jsonify({"ok": False, "error": "Falta token de autenticación"}), 401
 
     try:
-        # ===== Campos simples =====
+        # ===== CAMPOS COMUNES =====
         if "nombre" in data and str(data["nombre"]).strip():
             prod.nombre = str(data["nombre"]).strip()
-
-        if "precio" in data and data["precio"] not in ("", None):
+        if "precio" in data and data["precio"] not in (None, ""):
             prod.precio = float(data["precio"])
 
-        if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
-
-        # ===== Bundle precios =====
         if prod.bundle_precios is None:
             prod.bundle_precios = {}
 
         if "bundle2" in data:
-            val = data["bundle2"]
-            if val not in ("", None, "null"):
-                prod.bundle_precios["2"] = float(val)
-            else:
-                prod.bundle_precios.pop("2", None)
+            if data["bundle2"] not in (None, "", "null"):
+                prod.bundle_precios["2"] = float(data["bundle2"])
+            elif "2" in prod.bundle_precios:
+                del prod.bundle_precios["2"]
 
         if "bundle3" in data:
-            val = data["bundle3"]
-            if val not in ("", None, "null"):
-                prod.bundle_precios["3"] = float(val)
-            else:
-                prod.bundle_precios.pop("3", None)
+            if data["bundle3"] not in (None, "", "null"):
+                prod.bundle_precios["3"] = float(data["bundle3"])
+            elif "3" in prod.bundle_precios:
+                del prod.bundle_precios["3"]
 
-        # ===== Slot =====
-        if "slot" in data:
-            new_slot = int(data["slot"])
-            if new_slot != prod.slot_id:
-                conflict = Producto.query.filter_by(
-                    dispenser_id=prod.dispenser_id,
-                    slot_id=new_slot
-                ).first()
-                if conflict:
-                    return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
-                prod.slot_id = new_slot
+        if "habilitado" in data:
+            prod.habilitado = bool(data["habilitado"])
+
+        # ===== CAMPOS SOLO ADMIN =====
+        if es_admin:
+            if "slot" in data and data["slot"] not in (None, ""):
+                new_slot = int(data["slot"])
+                if new_slot != prod.slot_id:
+                    conflict = Producto.query.filter_by(
+                        dispenser_id=prod.dispenser_id,
+                        slot_id=new_slot
+                    ).first()
+                    if conflict:
+                        return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
+                    prod.slot_id = new_slot
+
+            if "dispenser_id" in data and data["dispenser_id"] not in (None, ""):
+                new_disp = int(data["dispenser_id"])
+                disp = Dispenser.query.get(new_disp)
+                if not disp:
+                    return jsonify({"ok": False, "error": "Dispenser destino no encontrado"}), 404
+                prod.dispenser_id = new_disp
+
+            if "cantidad" in data and data["cantidad"] not in (None, ""):
+                prod.cantidad = float(data["cantidad"])
 
         db.session.commit()
 
         return jsonify({
             "ok": True,
-            "producto": prod.to_dict()
+            "modo": "admin" if es_admin else "operador",
+            "producto": {
+                "id": prod.id,
+                "nombre": prod.nombre,
+                "precio": prod.precio,
+                "bundle_precios": prod.bundle_precios or {},
+                "habilitado": prod.habilitado,
+                "slot": prod.slot_id,
+                "dispenser_id": prod.dispenser_id,
+                "cantidad": prod.cantidad,
+            },
         })
-
     except Exception as e:
         db.session.rollback()
         return jsonify({"ok": False, "error": str(e)}), 500
