@@ -1,73 +1,21 @@
-# app.py
 import os
 import logging
 import threading
 import requests
 import json as _json
-import json 
 import time
 import secrets
 from collections import defaultdict
 from queue import Queue
 from threading import Lock
 
-from flask import Flask, jsonify, request, make_response, Response, render_template, redirect, url_for
+from flask import Flask, jsonify, request, make_response, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import UniqueConstraint, text as sqltext, and_
-from datetime import datetime
+from sqlalchemy import UniqueConstraint, text as sqltext, JSON
 import paho.mqtt.client as mqtt
-import mercadopago
 
-# ───────────────────────────────────────────────
-# Función auxiliar para devolver HTML crudo
-from flask import Response
-
-def _html_raw(html: str):
-    """Devuelve HTML plano (sin plantilla) para respuestas simples."""
-    return Response(html, mimetype="text/html")
-# ───────────────────────────────────────────────
-# URL base del frontend (React) que usa el sistema
-FRONT_BASE = os.getenv("FRONT_BASE", 
-"https://dispen-easy-web-production.up.railway.app")
-
-def send_telegram_message(chat_id, text):
-    """
-    Envía un mensaje simple por Telegram al chat_id indicado.
-    Usa el BOT_TOKEN definido en las variables de entorno.
-    """
-    import os, requests
-    TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN or not chat_id:
-        print("⚠️ No hay BOT_TOKEN o chat_id definido, no se envía mensaje.")
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10
-        )
-        print(f"📨 Mensaje enviado a {chat_id}: {text}")
-    except Exception as e:
-        print("❌ Error al enviar mensaje de Telegram:", e)
-
-# ============ Helpers ============
-
-def ok_json(data, status=200): return jsonify(data), status
-def json_error(msg, status=400, extra=None):
-    p = {"error": msg}
-    if extra is not None: p["detail"] = extra
-    return jsonify(p), status
-
-def _to_int(x, default=0):
-    try: return int(x)
-    except Exception:
-        try: return int(float(x))
-        except Exception: return default
-
-# ============ Config ============
-
+# ---------------- Config ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -83,22 +31,23 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 
-# acepta cualquiera de los dos nombres
-def _admin_env():
-    raw = (os.getenv("ADMIN_SECRET") or os.getenv("ADMIN_TOKEN") or "").strip().strip("'").strip('"')
-    return raw
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
-# ============ App/DB/CORS ============
+UMBRAL_ALERTA_LTS = int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3)
+STOCK_RESERVA_LTS = int(os.getenv("STOCK_RESERVA_LTS", "1") or 1)
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# ---------------- App/DB ----------------
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///local.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["https://dispen-easy-web-production.up.railway.app"]}},
-    allow_headers=["Content-Type", "x-admin-secret", "x-admin-token", "x-operator-token"],
+    resources={r"/api/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "x-admin-secret", "x-operator-token"],
     expose_headers=["Content-Type"],
 )
 
@@ -106,8 +55,7 @@ db = SQLAlchemy(app)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-# ============ Modelos ============
-
+# ---------------- Modelos ----------------
 class KV(db.Model):
     __tablename__ = "kv"
     key = db.Column(db.String(50), primary_key=True)
@@ -130,26 +78,11 @@ class Producto(db.Model):
     cantidad = db.Column(db.Integer, nullable=False)      # stock (L)
     slot_id = db.Column(db.Integer, nullable=False)       # 1..6
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
-    bundle_precios = db.Column(JSONB, nullable=True)      # {"2": 1800, "3": 2600}
+    bundle_precios = db.Column(JSON, nullable=True)       # {"2": 1800, "3": 2600}
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
     __table_args__ = (UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),)
-
-    def to_dict(self):
-        """Convierte el producto a diccionario JSON-friendly"""
-        return {
-            "id": self.id,
-            "dispenser_id": self.dispenser_id,
-            "nombre": self.nombre,
-            "precio": self.precio,
-            "cantidad": self.cantidad,
-            "porcion_litros": self.porcion_litros,
-            "habilitado": self.habilitado,
-            "bundle_precios": self.bundle_precios or {},
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None
-        }
 
 class Pago(db.Model):
     __tablename__ = "pago"
@@ -165,43 +98,56 @@ class Pago(db.Model):
     product_id = db.Column(db.Integer, nullable=False, default=0)
     dispenser_id = db.Column(db.Integer, nullable=False, default=0)
     device_id = db.Column(db.String(80), nullable=True, default="")
-    raw = db.Column(JSONB, nullable=True)
+    raw = db.Column(JSON, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 class OperatorToken(db.Model):
     __tablename__ = "operator_token"
-    token = db.Column(db.String(80), primary_key=True, unique=True, index=True, default=lambda: secrets.token_urlsafe(24))
+    token = db.Column(db.String(80), primary_key=True)
     dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="CASCADE"), nullable=False, index=True)
     nombre = db.Column(db.String(100), nullable=True, default="")
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-    chat_id = db.Column(db.String(40), nullable=True, default="")  # Telegram del cliente
-    mp_access_token = db.Column(db.String(255), nullable=True)  # Token propio de MercadoPago (OAuth)
 
 with app.app_context():
     db.create_all()
     if not KV.query.get("mp_mode"):
-        db.session.add(KV(key="mp_mode", value="test")); db.session.commit()
+        db.session.add(KV(key="mp_mode", value="test"))
+        db.session.commit()
     if Dispenser.query.count() == 0:
         db.session.add(Dispenser(device_id="dispen-01", nombre="dispen-01 (por defecto)", activo=True))
         db.session.commit()
+    # Migración defensiva JSONB->JSON (ignorada en SQLite)
     try:
-        db.session.execute(sqltext("ALTER TABLE producto ADD COLUMN IF NOT EXISTS bundle_precios JSONB"))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-    try:
-        db.session.execute(sqltext("CREATE INDEX IF NOT EXISTS operator_token_dispenser_id_idx ON operator_token(dispenser_id)"))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-    try:
-        db.session.execute(sqltext("ALTER TABLE operator_token ADD COLUMN IF NOT EXISTS mp_access_token VARCHAR(255)"))
+        db.session.execute(sqltext("""
+            DO $$
+            BEGIN
+                IF to_regclass('public.producto') IS NOT NULL THEN
+                    ALTER TABLE producto ALTER COLUMN bundle_precios TYPE JSON USING bundle_precios::json;
+                END IF;
+                IF to_regclass('public.pago') IS NOT NULL THEN
+                    ALTER TABLE pago ALTER COLUMN raw TYPE JSON USING raw::json;
+                END IF;
+            EXCEPTION WHEN others THEN
+                NULL;
+            END;$$;
+        """))
         db.session.commit()
     except Exception:
         db.session.rollback()
 
-# ============ Serializers y utils ============
+# ---------------- Helpers ----------------
+def ok_json(data, status=200): return jsonify(data), status
+def json_error(msg, status=400, extra=None):
+    p={"error":msg}
+    if extra is not None: p["detail"]=extra
+    return jsonify(p), status
+
+def _to_int(x, default=0):
+    try: return int(x)
+    except Exception:
+        try: return int(float(x))
+        except Exception: return default
 
 def serialize_producto(p: Producto) -> dict:
     return {
@@ -215,127 +161,93 @@ def serialize_producto(p: Producto) -> dict:
     }
 
 def serialize_dispenser(d: Dispenser) -> dict:
-    # Buscar el operador activo asociado
-    op = OperatorToken.query.filter_by(dispenser_id=d.id, activo=True).first()
-    operator_name = op.nombre if op else None
-
     return {
-        "id": d.id,
-        "device_id": d.device_id,
-        "nombre": d.nombre or "",
-        "estado": "Activo" if d.activo else "Suspendido",
-        "ubicacion": getattr(d, "ubicacion", None),
-        "operator": operator_name,
+        "id": d.id, "device_id": d.device_id, "nombre": d.nombre or "",
         "activo": bool(d.activo),
-        "created_at": d.created_at.isoformat() if getattr(d, "created_at", None) else None,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
     }
-    
+
 def get_thresholds():
-    reserva = max(0, int(os.getenv("STOCK_RESERVA_LTS", "1") or 1))
-    umbral_cfg = max(0, int(os.getenv("UMBRAL_ALERTA_LTS", "3") or 3))
+    reserva = max(0, int(STOCK_RESERVA_LTS))
+    umbral_cfg = max(0, int(UMBRAL_ALERTA_LTS))
     umbral = umbral_cfg if umbral_cfg > reserva else (reserva + 1)
     return umbral, reserva
 
-# ============ Notificaciones Telegram ============
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-def _tg_send(text: str, chat_id: str = None):
-    token = TELEGRAM_BOT_TOKEN
-    if not token: 
-        app.logger.warning("[TG] TOKEN no configurado; mensaje no enviado")
-        return
-    dest = chat_id or TELEGRAM_CHAT_ID
-    if not dest: 
-        app.logger.warning("[TG] CHAT_ID no configurado; mensaje no enviado")
+# ---- Telegram ----
+def tg_notify(text: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": dest, "text": text},
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=10
         )
     except Exception as e:
         app.logger.error(f"[TG] Error enviando notificación: {e}")
 
-def tg_notify_admin(text: str): _tg_send(text, TELEGRAM_CHAT_ID)
-
-def tg_notify_all(text: str, dispenser_id: int | None = None):
-    tg_notify_admin(text)
-    if dispenser_id:
-        toks = OperatorToken.query.filter(and_(OperatorToken.dispenser_id == dispenser_id, OperatorToken.activo == True)).all()
-        for t in toks:
-            if (t.chat_id or "").strip():
-                _tg_send(text, t.chat_id.strip())
-
-def _post_stock_change_hook(prod: "Producto", motivo: str, operator_name: str = None):
+def _post_stock_change_hook(prod: "Producto", motivo: str):
     umbral, reserva = get_thresholds()
     stock = int(prod.cantidad or 0)
-    note = f" – {motivo}"
-    if operator_name:
-        note += f" (operator: {operator_name})"
+
     if stock <= umbral:
-        tg_notify_all(
+        tg_notify(
             f"⚠️ Bajo stock '{prod.nombre}' (disp {prod.dispenser_id}, slot {prod.slot_id}): "
-            f"{stock} L (umbral={umbral}, reserva={reserva}){note}",
-            dispenser_id=prod.dispenser_id
+            f"{stock} L (umbral={umbral}, reserva={reserva}) – {motivo}"
         )
+
     if stock < reserva:
         if prod.habilitado:
             prod.habilitado = False
-            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock})")
+            app.logger.info(f"[STOCK] Deshabilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} < {reserva})")
     else:
         if not prod.habilitado:
             prod.habilitado = True
-            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock})")
+            app.logger.info(f"[STOCK] Re-habilitado '{prod.nombre}' disp={prod.dispenser_id} (stock={stock} ≥ {reserva})")
 
-# ============ Admin guard ============
+# --- Pricing ---
+def compute_total_price_ars(prod: Producto, litros: int) -> int:
+    litros = int(litros or 1)
+    bundles = prod.bundle_precios or {}
+    if str(litros) in bundles:
+        try: return int(round(float(bundles[str(litros)])))
+        except Exception: pass
+    try: return int(round(float(prod.precio) * litros))
+    except Exception: return max(1, litros)
 
-def _admin_header():
-    return (request.headers.get("x-admin-secret")
-            or request.headers.get("x_admin_secret")
-            or request.headers.get("x-admin-token")
-            or request.headers.get("x_admin_token")
-            or request.environ.get("HTTP_X_ADMIN_SECRET")
-            or request.environ.get("HTTP_X_ADMIN_TOKEN")
-            or "").strip().strip("'").strip('"')
-
+# ---------------- Auth guard ----------------
+PUBLIC_PATHS = {
+    "/", "/gracias", "/sin-stock",
+    "/api/mp/webhook", "/webhook", "/mp/webhook",
+    "/api/pagos/preferencia", "/api/pagos/pendiente",
+    "/api/config", "/go", "/ui/seleccionar",
+    "/api/productos/opciones",
+}
 @app.before_request
 def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
-
-    p = request.path
-    PUBLIC_PATHS = {
-        "/", "/gracias", "/sin-stock",
-        "/vincular_mp", "/operator_login",
-        "/operator",
-        "/ui/qr_admin",
-        "/api/mp/webhook", "/webhook", "/mp/webhook",
-        "/api/mp/oauth_start", "/api/mp/oauth_callback",
-        "/api/pagos/preferencia", "/api/pagos/pendiente",
-        "/api/config", "/go", "/ui/seleccionar",
-        "/api/productos/opciones",
-        "/api/operator/productos", "/api/operator/productos/reponer",
-        "/api/operator/productos/reset", "/api/operator/link",
-        "/api/_debug/admin", "/api/debug/last_status",
-        "/api/dispensers/status",
-    }
-    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")) or p.startswith("/api/operator/"):
+    p = request.path or ""
+    # Permitir rutas públicas y rutas de operador sin admin secret
+    if p in PUBLIC_PATHS or (p.startswith("/api/productos/") and p.endswith("/opciones")) or p.startswith("/api/op/"):
         return None
-
-    env = _admin_env()
-    if not env:
-        return None  # sin password -> libre (dev)
-
-    hdr = _admin_header()
-    if hdr != env:
+    if not ADMIN_SECRET:
+        return None
+    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
         return json_error("unauthorized", 401)
     return None
 
-# ============ MP tokens ============
+# ---- Operator helpers ----
+def _unauth_op():
+    return json_error("operator_unauthorized", 401)
 
+def get_operator_scope():
+    tok = (request.headers.get("x-operator-token") or "").strip()
+    if not tok:
+        return None
+    return OperatorToken.query.filter_by(token=tok, activo=True).first()
+
+# ---------------- MP tokens ----------------
 def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
     return (row.value if row else "test").lower()
@@ -346,8 +258,7 @@ def get_mp_token_and_base() -> tuple[str, str]:
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
     return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
 
-# ============ MQTT + SSE ============
-
+# ---------------- MQTT ----------------
 _mqtt_client = None
 _mqtt_lock = threading.Lock()
 def topic_cmd(device_id: str) -> str: return f"dispen/{device_id}/cmd/dispense"
@@ -355,8 +266,9 @@ def topic_state_wild() -> str: return "dispen/+/state/dispense"
 def topic_status_wild() -> str: return "dispen/+/status"
 def topic_event_wild() -> str: return "dispen/+/event"
 
-# SSE infra
-_sse_clients = []; _sse_lock = Lock()
+# ---- SSE infra ----
+_sse_clients = []
+_sse_lock = Lock()
 def _sse_broadcast(data: dict):
     with _sse_lock:
         dead = []
@@ -369,93 +281,37 @@ def _sse_broadcast(data: dict):
 
 @app.get("/api/events/stream")
 def sse_stream():
-    import os
-
-    # 🧩 Tomamos el secreto desde variable de entorno o valor por defecto
-    env_secret = os.getenv("ADMIN_SECRET", "adm123")
-
-    # 🧩 Aceptamos tanto ?secret como headers
-    secret = (
-        request.args.get("secret")
-        or request.headers.get("x-admin-secret")
-        or request.headers.get("x-admin-token")
-        or ""
-    )
-
-    # 🧠 Verificamos que el secreto sea correcto
-    if secret.strip() != env_secret.strip():
-        print(f"⚠️ SSE rechazado. Recibido: {secret} | Esperado: {env_secret}")
+    if ADMIN_SECRET and (request.args.get("secret") or "") != ADMIN_SECRET:
         return json_error("unauthorized", 401)
-
-    # 🧱 Creamos la cola para eventos
     q = Queue(maxsize=100)
     with _sse_lock:
         _sse_clients.append(q)
-
-    # 🔁 Función generadora que envía los datos
     def gen():
         yield "retry: 5000\n\n"
         try:
             while True:
                 data = q.get()
-                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
         except GeneratorExit:
             with _sse_lock:
-                try:
-                    _sse_clients.remove(q)
-                except Exception:
-                    pass
-
+                try: _sse_clients.remove(q)
+                except Exception: pass
     return Response(gen(), mimetype="text/event-stream")
 
-# ===================== Control de estados ONLINE / OFFLINE =====================
-from collections import defaultdict
-import threading, time
-
+# ---- Estado online/offline ----
+last_status = defaultdict(lambda: {"status": "unknown", "t": 0})
 _last_notified_status = defaultdict(lambda: "")
-_online_timers = {}
-last_status = {}
+OFF_DEBOUNCE_S = 5
+ON_DEBOUNCE_S  = 5
+_online_timers = {}  # dev -> threading.Timer
 
-ON_DEBOUNCE_S = 5   # segundos para confirmar ONLINE
-OFF_DEBOUNCE_S = 0  # sin demora para OFFLINE
+def _notify_online_if_stable(dev: str):
+    st = (last_status.get(dev) or {}).get("status", "")
+    if st == "online" and _last_notified_status[dev] != "online":
+        tg_notify(f"✅ {dev}: ONLINE")
+        _last_notified_status[dev] = "online"
 
-def _device_notify(dev: str, status: str):
-    """Envía notificación a Telegram solo si hay cambio de estado."""
-    disp = Dispenser.query.filter(Dispenser.device_id == dev).first()
-    disp_id = disp.id if disp else None
-    icon = "✅" if status == "online" else "⚠️"
-
-    last_state = _last_notified_status[dev]
-    if last_state != status:
-        _last_notified_status[dev] = status
-        tg_notify_all(f"{icon} {dev}: {status.upper()}", dispenser_id=disp_id)
-        app.logger.info(f"[NOTIFY] Cambio detectado → {dev}: {status}")
-    else:
-        app.logger.info(f"[NOTIFY] Ignorado {dev} {status} (sin cambio)")
-
-def _schedule_online_notify(dev: str, ts_mark: float):
-    """Espera unos segundos antes de confirmar ONLINE."""
-    def _do():
-        rec = last_status.get(dev, {"status": "unknown", "t": 0})
-        if rec["status"] != "online" or rec["t"] < ts_mark:
-            return
-        if _last_notified_status[dev] != "online":
-            _last_notified_status[dev] = "online"
-            with app.app_context():
-                _device_notify(dev, "online")
-
-    t_old = _online_timers.get(dev)
-    try:
-        if t_old:
-            t_old.cancel()
-    except Exception:
-        pass
-
-    t = threading.Timer(ON_DEBOUNCE_S, _do)
-    t.daemon = True
-    _online_timers[dev] = t
-    t.start()
-
+# ---- MQTT callbacks ----
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
     app.logger.info(f"[MQTT] conectado rc={rc}; subscribe {topic_state_wild()} {topic_status_wild()} {topic_event_wild()}")
     client.subscribe(topic_state_wild(), qos=1)
@@ -467,7 +323,7 @@ def _mqtt_on_message(client, userdata, msg):
     except Exception: raw = "<binario>"
     app.logger.info(f"[MQTT] RX topic={msg.topic} payload={raw}")
 
-    # Pulsador físico → SSE
+    # Evento botón físico → SSE
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/event"):
         try: data = _json.loads(raw or "{}")
         except Exception: data = {}
@@ -478,43 +334,45 @@ def _mqtt_on_message(client, userdata, msg):
             _sse_broadcast({"type":"button_press","device_id":dev,"slot":slot})
         return
 
-   # Estado ONLINE/OFFLINE
+    # Estado ONLINE/OFFLINE con debounce por Timer
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
         try:
             data = _json.loads(raw or "{}")
         except Exception:
             return
-
         dev = str(data.get("device") or "").strip()
-        st = str(data.get("status") or "").lower().strip()
-        if not dev or st not in ("online", "offline"):
-            return
-
+        st  = str(data.get("status") or "").lower().strip()
         now = time.time()
+
         last_status[dev] = {"status": st, "t": now}
         _sse_broadcast({"type": "device_status", "device_id": dev, "status": st})
 
-        if st == "offline":
-            # cancelar timer de ONLINE
-            t_old = _online_timers.get(dev)
-            try:
-                if t_old:
-                    t_old.cancel()
-            except Exception:
-                pass
-            with app.app_context():
-                _device_notify(dev, "offline")
+        if _last_notified_status[dev] == st:
             return
 
-        if st == "online":
-            # 🔥 Notificar inmediatamente, sin debounce
-            with app.app_context():
-                _device_notify(dev, "online")
-            app.logger.info(f"[MQTT] Notificación ONLINE inmediata para {dev}")
+        if st == "offline":
+            t = _online_timers.pop(dev, None)
+            if t:
+                try: t.cancel()
+                except Exception: pass
+            tg_notify(f"⚠️ {dev}: OFFLINE")
+            _last_notified_status[dev] = "offline"
             return
-    # Estado dispensa → actualizar stock si llega "done"
+
+        t = _online_timers.pop(dev, None)
+        if t:
+            try: t.cancel()
+            except Exception: pass
+        new_t = threading.Timer(ON_DEBOUNCE_S, _notify_online_if_stable, args=(dev,))
+        _online_timers[dev] = new_t
+        new_t.daemon = True
+        new_t.start()
+        return
+
+    # Estado de dispensa DONE/TIMEOUT para stock
     try: data = _json.loads(raw or "{}")
     except Exception: return
+
     payment_id = str(data.get("payment_id") or "").strip()
     status = str(data.get("status") or "").lower()
     if status in ("ok", "finish", "finished", "success"): status = "done"
@@ -551,174 +409,57 @@ def start_mqtt_background():
         _mqtt_client.loop_forever()
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
-# ============ Health/Config ============
+def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int, timeout_s: int = 30) -> bool:
+    if not MQTT_HOST: return False
+    msg = { "payment_id": str(payment_id), "slot_id": int(slot_id), "litros": int(litros or 1), "timeout_s": int(timeout_s or 30) }
+    payload = _json.dumps(msg, ensure_ascii=False)
+    with _mqtt_lock:
+        if not _mqtt_client: return False
+        t = topic_cmd(device_id)
+        info = _mqtt_client.publish(t, payload, qos=1, retain=False)
+        return (info.rc == mqtt.MQTT_ERR_SUCCESS)
 
+# ---------------- Health ----------------
 @app.get("/")
 def health(): return ok_json({"status": "ok"})
 
+# ---------------- Config ----------------
 @app.get("/api/config")
 def api_get_config():
     umbral, reserva = get_thresholds()
-    return ok_json({"mp_mode": get_mp_mode(), "umbral_alerta_lts": umbral, "stock_reserva_lts": reserva})
+    return ok_json({ "mp_mode": get_mp_mode(), "umbral_alerta_lts": umbral, "stock_reserva_lts": reserva })
 
 @app.post("/api/mp/mode")
 def api_set_mode():
     data = request.get_json(force=True, silent=True) or {}
     mode = str(data.get("mode") or "").lower()
-    if mode not in ("test", "live"): return json_error("modo inválido (test|live)", 400)
+    if mode not in ("test","live"): return json_error("modo inválido (test|live)", 400)
     kv = KV.query.get("mp_mode") or KV(key="mp_mode", value=mode); kv.value = mode
     db.session.merge(kv); db.session.commit()
     return ok_json({"ok": True, "mp_mode": mode})
-# =====================================
-# VINCULACIÓN MERCADOPAGO POR OPERADOR (OAuth)
-# =====================================
 
-@app.get("/api/mp/oauth_start")
-def mp_oauth_start():
-    app.logger.info(f"[DEBUG] Headers recibidos en /api/mp/oauth_start: {dict(request.headers)}")
-    app.logger.info(f"[DEBUG] Args recibidos: {request.args}")
-    """Devuelve la URL de autorización de MercadoPago para vincular una cuenta."""
-    operator = _operator_from_header()
-    if not operator:
-        return json_error("Token de operador inválido", 401)
-
-    client_id = os.getenv("MP_CLIENT_ID", "")
-    if not client_id:
-        return json_error("CLIENT_ID no configurado", 500)
-
-    # ✅ Usa BACKEND_BASE_URL si existe, o el dominio actual como respaldo
-    redirect_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    redirect_uri = f"{redirect_base}/api/mp/oauth_callback"
-
-    url = (
-        f"https://auth.mercadopago.com.ar/authorization?"
-        f"response_type=code&client_id={client_id}"
-        f"&redirect_uri={redirect_uri}&state={operator.token}"
-    )
-    return ok_json({"ok": True, "url": url})
-
-
-@app.get("/api/mp/oauth_callback")
-def mp_oauth_callback():
-    """Callback que MercadoPago llama luego de la autorización."""
-    code = request.args.get("code")
-    state = request.args.get("state")  # token del operador
-    if not code or not state:
-        return json_error("Faltan parámetros", 400)
-
-    op = OperatorToken.query.filter_by(token=state).first()
-    if not op:
-        return json_error("Token de operador inválido", 401)
-
-    client_id = os.getenv("MP_CLIENT_ID", "")
-    client_secret = os.getenv("MP_CLIENT_SECRET", "")
-    if not client_id or not client_secret:
-        return json_error("Credenciales MP faltantes", 500)
-
-    # ✅ Igual que arriba, usamos redirect_base para que funcione en Railway o local
-    redirect_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    redirect_uri = f"{redirect_base}/api/mp/oauth_callback"
-
-    # Pedimos el access_token a MercadoPago
-    import requests
-    token_url = "https://api.mercadopago.com/oauth/token"
-    data = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-        "redirect_uri": redirect_uri,
-    }
-
-    r = requests.post(token_url, data=data)
-    if r.status_code != 200:
-        return json_error(f"Error al obtener token: {r.text}", 400)
-
-    mp_data = r.json()
-    access_token = mp_data.get("access_token")
-    user_id = mp_data.get("user_id")
-
-    if not access_token:
-        return json_error("MercadoPago no devolvió access_token", 400)
-
-    op.mp_access_token = access_token
-    op.mp_user_id = str(user_id)
-    db.session.commit()
-
-    return ok_json({"ok": True, "mensaje": "Cuenta vinculada correctamente"})
-
-# ============ Dispensers/Productos CRUD ============
-
+# ---------------- Dispensers ----------------
 @app.get("/api/dispensers")
 def dispensers_list():
     ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
-    data = []
-    for d in ds:
-        operator_name = None
-        if getattr(d, "operator_token_id", None):
-            op = OperatorToken.query.filter_by(id=d.operator_token_id).first()
-            if op:
-                operator_name = getattr(op, "nombre", None) or getattr(op, "usuario", None) or "Operador asignado"
-
-        data.append({
-            "id": d.id,
-            "nombre": getattr(d, "nombre", None),
-            "device_id": getattr(d, "device_id", None),
-            "ubicacion": getattr(d, "ubicacion", None),
-            "estado": "Activo" if d.activo else "Suspendido",  # ✅ CORRECTO
-            "activo": bool(d.activo),                         # ✅ NUEVO CAMPO EXPLÍCITO
-            "operator": operator_name,
-        })
-    return jsonify(data)
-    
-def require_admin():
-    env = _admin_env()
-    hdr = _admin_header()
-    print(f"[ADMIN DEBUG] Header={repr(hdr)} Env={repr(env)}")
-    if env and hdr != env:
-        return jsonify({"error": "unauthorized"}), 401
-    return None
+    return jsonify([serialize_dispenser(d) for d in ds])
 
 @app.put("/api/dispensers/<int:did>")
 def dispensers_update(did):
-    ra = require_admin()
-    if ra:
-        return ra
-
     d = Dispenser.query.get_or_404(did)
     data = request.get_json(force=True, silent=True) or {}
+    if "nombre" in data: d.nombre = str(data["nombre"]).strip()
+    if "activo" in data: d.activo = bool(data["activo"])
+    if "device_id" in data:
+        nid = str(data["device_id"]).strip()
+        if nid and nid != d.device_id:
+            if Dispenser.query.filter(Dispenser.device_id == nid, Dispenser.id != d.id).first():
+                return json_error("device_id ya usado", 409)
+            d.device_id = nid
+    db.session.commit()
+    return ok_json({"ok": True, "dispenser": serialize_dispenser(d)})
 
-    try:
-        # --- Actualiza solo los campos presentes en el JSON recibido ---
-        if "activo" in data:
-            d.activo = bool(data["activo"])
-            d.estado = "Activo" if d.activo else "Suspendido"
-            app.logger.info(f"🟢 Dispenser {d.id} {'activado' if d.activo else 'suspendido'}")
-
-        if "nombre" in data:
-            d.nombre = data["nombre"]
-
-        if "ubicacion" in data:
-            d.ubicacion = data["ubicacion"]
-
-        if "operator" in data:
-            d.operator = data["operator"]
-
-        # Mantener valores previos si no se enviaron
-        if "operator" not in data and hasattr(d, "operator"):
-            d.operator = d.operator
-        if "nombre" not in data and hasattr(d, "nombre"):
-            d.nombre = d.nombre
-
-        db.session.commit()
-        app.logger.info(f"✅ Dispenser {d.id} actualizado correctamente.")
-        return jsonify(serialize_dispenser(d))
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"❌ Error al actualizar dispenser {d.id}: {e}")
-        return jsonify({"error": str(e)}), 500
-        
+# ---------------- Productos CRUD ----------------
 @app.get("/api/productos")
 def productos_list():
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
@@ -737,7 +478,7 @@ def productos_create():
         p = Producto(
             dispenser_id=disp_id,
             nombre=str(data.get("nombre", "")).strip(),
-            precio=float(data.get("precio", 0)),
+            precio=float(data.get("precio", 0)),  # $/L
             cantidad=int(float(data.get("cantidad", 0))),
             slot_id=int(data.get("slot", 1)),
             porcion_litros=int(data.get("porcion_litros", 1)),
@@ -746,7 +487,8 @@ def productos_create():
         )
         if p.precio < 0 or p.cantidad < 0 or p.porcion_litros < 1:
             return json_error("Valores inválidos", 400)
-        if Producto.query.filter(Producto.dispenser_id == p.dispenser_id, Producto.slot_id == p.slot_id).first():
+        if Producto.query.filter(Producto.dispenser_id == p.dispenser_id,
+                                 Producto.slot_id == p.slot_id).first():
             return json_error("Slot ya asignado a otro producto en este dispenser", 409)
         db.session.add(p); _post_stock_change_hook(p, motivo="create"); db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
@@ -764,12 +506,16 @@ def productos_update(pid):
         if "dispenser_id" in data:
             new_d = _to_int(data["dispenser_id"])
             if new_d and new_d != p.dispenser_id and Dispenser.query.get(new_d):
-                if Producto.query.filter(Producto.dispenser_id == new_d, Producto.slot_id == p.slot_id).first():
+                if Producto.query.filter(Producto.dispenser_id == new_d,
+                                         Producto.slot_id == p.slot_id).first():
                     return json_error("Slot ya usado en el nuevo dispenser", 409)
                 p.dispenser_id = new_d
         if "nombre" in data: p.nombre = str(data["nombre"]).strip()
         if "precio" in data: p.precio = float(data["precio"])
-        if "cantidad" in data: p.cantidad = int(float(data["cantidad"]))
+        if "cantidad" in data:
+            new_cant = int(float(data["cantidad"]))
+            if new_cant < 0: return json_error("cantidad no puede ser negativa", 400)
+            p.cantidad = new_cant
         if "porcion_litros" in data:
             val = int(data["porcion_litros"])
             if val < 1: return json_error("porcion_litros debe ser ≥ 1", 400)
@@ -777,7 +523,9 @@ def productos_update(pid):
         if "slot" in data:
             new_slot = int(data["slot"])
             if new_slot != p.slot_id and \
-               Producto.query.filter(Producto.dispenser_id == p.dispenser_id, Producto.slot_id == new_slot, Producto.id != p.id).first():
+               Producto.query.filter(Producto.dispenser_id == p.dispenser_id,
+                                     Producto.slot_id == new_slot,
+                                     Producto.id != p.id).first():
                 return json_error("Slot ya asignado a otro producto en este dispenser", 409)
             p.slot_id = new_slot
         if "habilitado" in data: p.habilitado = bool(data["habilitado"])
@@ -790,38 +538,66 @@ def productos_update(pid):
         db.session.rollback()
         return json_error("Error actualizando producto", 500, str(e))
 
-@app.post("/api/productos/<int:pid>/reponer")
-def productos_reponer(pid):
+# ─── Utilidad: obtener operador desde el header ────────────────────────────────
+def _require_operator():
+    token = (request.headers.get("x-operator-token") or "").strip()
+    if not token:
+        return None, json_error("missing operator token", 401)
+    op = OperatorToken.query.filter_by(token=token).first()
+    if not op or not op.activo:
+        return None, json_error("invalid operator token", 401)
+    return op, None
+
+# ─── Reponer (vía operador) ───────────────────────────────────────────────────
+@app.post("/api/op/productos/<int:pid>/reponer")
+def op_productos_reponer(pid):
+    op, err = _require_operator()
+    if err: return err
     p = Producto.query.get_or_404(pid)
+    if int(p.dispenser_id or 0) != int(op.dispenser_id):
+        return json_error("forbidden", 403)
+
     litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
     if litros <= 0: return json_error("Litros inválidos", 400)
+
     try:
         p.cantidad = max(0, int(p.cantidad or 0) + litros)
-        _post_stock_change_hook(p, motivo="reponer")
+        # 👇 ahora notificamos con el NOMBRE del operador (si no tiene, mostramos “operador”)
+        nombre = (op.nombre or "").strip() or "operador"
+        _post_stock_change_hook(p, motivo=f"reponer (operador: {nombre})")
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
         return json_error("Error reponiendo producto", 500, str(e))
 
-@app.post("/api/productos/<int:pid>/reset_stock")
-def productos_reset(pid):
+# ─── Reset stock (vía operador) ───────────────────────────────────────────────
+@app.post("/api/op/productos/<int:pid>/reset_stock")
+def op_productos_reset(pid):
+    op, err = _require_operator()
+    if err: return err
     p = Producto.query.get_or_404(pid)
+    if int(p.dispenser_id or 0) != int(op.dispenser_id):
+        return json_error("forbidden", 403)
+
     litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
     if litros < 0: return json_error("Litros inválidos", 400)
+
     try:
         p.cantidad = int(litros)
-        _post_stock_change_hook(p, motivo="reset_stock")
+        # 👇 nombre en la notificación
+        nombre = (op.nombre or "").strip() or "operador"
+        _post_stock_change_hook(p, motivo=f"reset_stock (operador: {nombre})")
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
-        return json_error("Error reseteando stock", 500, str(e))
+        return json_error("Error reseteando producto", 500, str(e))
 
-# Opciones 1/2/3 L (bundle)
+# -------- Opciones (1/2/3 L con precios calculados) --------
 @app.get("/api/productos/<int:pid>/opciones")
 def productos_opciones(pid):
-    litros_list = [1, 2, 3]
+    litros_list = [1,2,3]
     try:
         prod = Producto.query.get_or_404(pid)
         disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
@@ -833,96 +609,35 @@ def productos_opciones(pid):
             if (int(prod.cantidad) - L) < reserva:
                 options.append({"litros": L, "disponible": False})
             else:
-                options.append({"litros": L, "disponible": True, "precio_final": compute_total_price_ars(prod, L)})
+                options.append({
+                    "litros": L,
+                    "disponible": True,
+                    "precio_final": compute_total_price_ars(prod, L)
+                })
         return ok_json({"ok": True, "producto": serialize_producto(prod), "opciones": options})
     except Exception as e:
         return json_error("error_opciones", 500, str(e))
 
-# Pricing/bundles
-def compute_total_price_ars(prod: Producto, litros: int) -> int:
-    litros = int(litros or 1)
-    bundles = prod.bundle_precios or {}
-    if str(litros) in bundles:
-        try:
-            return int(round(float(bundles[str(litros)])))
-        except Exception:
-            pass
-    try:
-        base = float(prod.precio) * litros
-        return int(round(base))
-    except Exception:
-        return max(1, litros)
-
-# ============ Pagos + MP ============
-
+# ---------------- Pagos ----------------
 @app.get("/api/pagos")
 def pagos_list():
     try:
-        limit = int(request.args.get("limit", 50))
-        limit = max(1, min(limit, 200))
-    except Exception:
-        limit = 50
-
+        limit = int(request.args.get("limit", 50)); limit = max(1, min(limit, 200))
+    except Exception: limit = 50
     estado = (request.args.get("estado") or "").strip()
     qsearch = (request.args.get("q") or "").strip()
-    dispenser_id = (request.args.get("dispenser_id") or "").strip()
-    desde = request.args.get("desde")
-    hasta = request.args.get("hasta")
-
     q = Pago.query
-
-    # 🔹 Filtro por dispenser (usa el campo correcto)
-    if dispenser_id:
-        q = q.filter((Pago.dispenser_id == dispenser_id) | (Pago.device_id == dispenser_id))
-
-    # 🔹 Filtro por estado
-    if estado:
-        q = q.filter(Pago.estado == estado)
-
-    # 🔹 Filtro por texto libre
-    if qsearch:
-        q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
-
-    # 🔹 Filtros opcionales de fecha
-    if desde:
-        try:
-            desde_dt = datetime.fromisoformat(desde)
-            q = q.filter(Pago.created_at >= desde_dt)
-        except Exception:
-            pass
-
-    if hasta:
-        try:
-            hasta_dt = datetime.fromisoformat(hasta)
-            q = q.filter(Pago.created_at <= hasta_dt)
-        except Exception:
-            pass
-
+    if estado: q = q.filter(Pago.estado == estado)
+    if qsearch: q = q.filter(Pago.mp_payment_id.ilike(f"%{qsearch}%"))
     pagos = q.order_by(Pago.id.desc()).limit(limit).all()
-
-    return jsonify([
-        {
-            "id": p.id,
-            "mp_payment_id": p.mp_payment_id,
-            "estado": p.estado,
-            "producto": p.producto,
-            "product_id": p.product_id,
-            "dispenser_id": p.dispenser_id,
-            "device_id": p.device_id,
-            "slot_id": p.slot_id,
-            "litros": p.litros,
-            "monto": p.monto,
-            "dispensado": bool(p.dispensado),
-            "created_at": p.created_at.isoformat() if p.created_at else None,
-        }
-        for p in pagos
-    ])
-
-# Asegurarnos de que la tabla Variable está declarada
-class Variable(db.Model):
-    __tablename__ = "variable"
-    key = db.Column(db.String(50), primary_key=True)
-    value = db.Column(db.String(255), nullable=False)
+    return jsonify([{
+        "id": p.id, "mp_payment_id": p.mp_payment_id, "estado": p.estado,
+        "producto": p.producto, "product_id": p.product_id,
+        "dispenser_id": p.dispenser_id, "device_id": p.device_id,
+        "slot_id": p.slot_id, "litros": p.litros, "monto": p.monto,
+        "dispensado": bool(p.dispensado),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    } for p in pagos])
 
 # -------------- preferencia (con litros elegidos) --------------
 @app.post("/api/pagos/preferencia")
@@ -931,50 +646,22 @@ def crear_preferencia_api():
     product_id = _to_int(data.get("product_id") or 0)
     litros = _to_int(data.get("litros") or 0) or 1
 
+    token, _base_api = get_mp_token_and_base()
+    if not token: return json_error("MP token no configurado", 500)
+
     prod = Producto.query.get(product_id)
-    if not prod or not prod.habilitado:
-        return json_error("Producto no disponible o deshabilitado", 400)
-
+    if not prod or not prod.habilitado: return json_error("producto no disponible", 400)
     disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp or not disp.activo:
-        return json_error("Dispenser no disponible o deshabilitado", 400)
+    if not disp or not disp.activo: return json_error("dispenser no disponible", 400)
 
-    # ============================================================
-    # 🔍 Determinar token de MercadoPago (operador o global)
-    # ============================================================
-    op = OperatorToken.query.filter_by(dispenser_id=disp.id, activo=True).first()
-    token = None
-    base_api = "https://api.sandbox.mercadopago.com"
-
-    if op and op.mp_access_token:
-        token = op.mp_access_token.strip()
-        app.logger.info(f"[MP] Usando token del operador '{op.nombre or op.token[:6]}'")
-        if not token.startswith("TEST-"):
-            base_api = "https://api.mercadopago.com"
-    else:
-        modo = get_mp_mode()
-        if modo == "live":
-            token = MP_ACCESS_TOKEN_LIVE
-            base_api = "https://api.mercadopago.com"
-        else:
-            token = MP_ACCESS_TOKEN_TEST
-            base_api = "https://api.sandbox.mercadopago.com"
-        app.logger.info(f"[MP] Usando token global ({modo})")
-
-    if not token:
-        return json_error("Token de MercadoPago no configurado (global u operador)", 500)
-
-    # ============================================================
-    # 🔍 Verificar stock
-    # ============================================================
     _, reserva = get_thresholds()
     if (int(prod.cantidad) - litros) < reserva:
         return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
 
     monto_final = compute_total_price_ars(prod, litros)
+
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};dev={disp.device_id}"
-
     body = {
         "items": [{
             "id": str(prod.id),
@@ -1007,42 +694,27 @@ def crear_preferencia_api():
 
     try:
         r = requests.post(
-            f"{base_api}/checkout/preferences",
+            "https://api.mercadopago.com/checkout/preferences",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=body, timeout=20
-        )
-        r.raise_for_status()
+        ); r.raise_for_status()
     except Exception as e:
-        detail = str(e)
-        try:
-            if 'r' in locals():
-                detail = getattr(r, "text", str(e))[:600]
-        except Exception:
-            pass
+        detail = getattr(r, "text", str(e))[:600]
         return json_error("mp_preference_failed", 502, detail)
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
+    if not link: return json_error("preferencia_sin_link", 502, pref)
+    return ok_json({"ok": True, "link": link, "raw": pref, "precio_final": monto_final})
 
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-
-    return ok_json({
-        "ok": True,
-        "link": link,
-        "raw": pref,
-        "precio_final": monto_final,
-        "modo": "operador" if op and op.mp_access_token else get_mp_mode()
-    })
-# Webhook MP
+# ---------------- Webhook MP ----------------
 @app.post("/api/mp/webhook")
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
+
+    token, base_api = get_mp_token_and_base()
     topic = args.get("topic") or body.get("type")
-    live_mode = bool(body.get("live_mode", True))
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
 
     payment_id = None
     if topic == "payment":
@@ -1050,6 +722,7 @@ def mp_webhook():
             try: payment_id = body["resource"].rstrip("/").split("/")[-1]
             except Exception: payment_id = None
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
+
     if not payment_id:
         return "ok", 200
 
@@ -1087,7 +760,7 @@ def mp_webhook():
     try:
         db.session.commit()
     except Exception:
-        db.session.rollback()
+        db.session.rollback(); 
         return "ok", 200
 
     try:
@@ -1111,371 +784,124 @@ def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
 def mp_webhook_alias2(): return mp_webhook()
 
-# Estado para Admin (fallback)
+# ---------------- Reintento de dispensa (admin) ----------------
+@app.post("/api/pagos/<int:pid>/reenviar")
+def pagos_reenviar(pid):
+    p = Pago.query.get_or_404(pid)
+    if p.dispensado:
+        return json_error("ya_dispensado", 409)
+    if (p.estado or "").lower() != "approved":
+        return json_error("estado_no_aprobado", 409, {"estado": p.estado})
+    if not p.slot_id or not p.litros:
+        return json_error("pago_incompleto", 400)
+    dev = (p.device_id or "").strip()
+    if not dev and p.product_id:
+        pr = Producto.query.get(p.product_id)
+        if pr and pr.dispenser_id:
+            d = Dispenser.query.get(pr.dispenser_id)
+            if d:
+                dev = d.device_id or ""
+    if not dev:
+        return json_error("sin_device_id", 400, "No se pudo inferir device_id")
+    try:
+        published = send_dispense_cmd(dev, p.mp_payment_id, int(p.slot_id), int(p.litros), timeout_s=max(30, int(p.litros) * 5))
+        if not published:
+            return json_error("mqtt_publish_failed", 502)
+        p.procesado = True
+        db.session.commit()
+        return ok_json({"ok": True, "msg": "Comando de dispensa re-enviado", "device_id": dev})
+    except Exception as e:
+        db.session.rollback()
+        return json_error("reenviar_failed", 500, str(e))
+
+# ---------------- Estado para Admin (fallback) ----------------
 @app.get("/api/dispensers/status")
 def api_disp_status():
     out = []
-
     for dev, info in last_status.items():
-        # Convertir el nombre del dispenser (ej: "dispen-01") a número entero
-        disp_id = None
-        if isinstance(dev, str) and dev.startswith("dispen-"):
-            try:
-                disp_id = int(dev.replace("dispen-", ""))
-            except:
-                disp_id = None
-
-        # Buscar operador asignado a ese dispenser (si existe)
-        op = OperatorToken.query.filter_by(dispenser_id=disp_id).first() if disp_id else None
-        nombre_op = op.nombre if op else None
-
-        out.append({
-            "device_id": dev,
-            "status": info.get("status", "offline"),
-            "operator": nombre_op
-        })
-
+        out.append({"device_id": dev, "status": info["status"]})
     return jsonify(out)
 
-# Debug: ver mapa de status que mantiene el backend
-@app.get("/api/debug/last_status")
-def debug_last_status():
-    return ok_json({"last_status": last_status})
+# ---------------- Admin: Operator Tokens ----------------
+@app.get("/api/admin/operator_tokens")
+def admin_list_operator_tokens():
+    rows = OperatorToken.query.order_by(OperatorToken.created_at.desc()).all()
+    return ok_json({"ok": True, "tokens": [{
+        "token": r.token, "dispenser_id": r.dispenser_id, "nombre": r.nombre or "",
+        "activo": bool(r.activo),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]})
 
-# Reset por dispenser
-@app.post("/api/admin/reset_dispenser")
-def admin_reset_dispenser():
+@app.post("/api/admin/operator_tokens")
+def admin_create_operator_token():
     data = request.get_json(force=True, silent=True) or {}
     did = int(data.get("dispenser_id") or 0)
-    mode = (data.get("mode") or "soft").lower()           # "soft" | "hard_keep" | "hard_wipe"
-    reset_stock_to = data.get("reset_stock_to", None)
-    confirm = (data.get("confirm") or "").strip().lower()
+    nombre = (data.get("nombre") or "").strip()
+    if not did or not Dispenser.query.get(did):
+        return json_error("dispenser_id inválido", 400)
+    tok = secrets.token_urlsafe(32)
+    row = OperatorToken(token=tok, dispenser_id=did, nombre=nombre, activo=True)
+    db.session.add(row); db.session.commit()
+    return ok_json({"ok": True, "token": tok, "dispenser_id": did, "nombre": nombre})
 
-    if not did or confirm != "reset":
-        return json_error("dispenser_id y confirm='reset' requeridos", 400)
+@app.post("/api/admin/operator_tokens/<string:token>/toggle")
+def admin_toggle_operator_token(token):
+    row = OperatorToken.query.get_or_404(token)
+    row.activo = not bool(row.activo)
+    db.session.commit()
+    return ok_json({"ok": True, "token": row.token, "activo": bool(row.activo)})
 
-    disp = Dispenser.query.get(did)
-    if not disp:
-        return json_error("dispenser no encontrado", 404)
+@app.delete("/api/admin/operator_tokens/<string:token>")
+def admin_delete_operator_token(token):
+    row = OperatorToken.query.get_or_404(token)
+    db.session.delete(row); db.session.commit()
+    return ok_json({"ok": True, "deleted": True})
 
+# ---------------- Operator (scoped) ----------------
+@app.get("/api/op/productos")
+def op_list_productos_of_dispenser():
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    prods = Producto.query.filter(Producto.dispenser_id == op.dispenser_id).order_by(Producto.slot_id.asc()).all()
+    return jsonify([serialize_producto(p) for p in prods])
+
+@app.post("/api/op/productos/<int:pid>/reponer")
+def op_reponer(pid):
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    p = Producto.query.get_or_404(pid)
+    if p.dispenser_id != op.dispenser_id:
+        return json_error("forbidden", 403, "No podés modificar productos de otro dispenser")
+    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
+    if litros <= 0: return json_error("Litros inválidos", 400)
     try:
-        deleted_pagos = Pago.query.filter(Pago.dispenser_id == did).delete(synchronize_session=False)
-
-        if mode == "soft":
-            stock_set = None
-            if reset_stock_to is not None:
-                val = max(0, int(reset_stock_to))
-                for p in Producto.query.filter(Producto.dispenser_id == did).all():
-                    p.cantidad = val
-                stock_set = val
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"soft", "deleted_pagos": deleted_pagos, "stock_set": stock_set})
-
-        if mode == "hard_keep":
-            for p in Producto.query.filter(Producto.dispenser_id == did).all():
-                p.cantidad = 0
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"hard_keep", "deleted_pagos": deleted_pagos, "stock_set": 0})
-
-        if mode == "hard_wipe":
-            Producto.query.filter(Producto.dispenser_id == did).delete(synchronize_session=False)
-            db.session.commit()
-            return ok_json({"ok": True, "mode":"hard_wipe", "deleted_pagos": deleted_pagos, "productos_borrados": True})
-
-        return json_error("mode inválido (soft|hard_keep|hard_wipe)", 400)
-
-    except Exception as e:
-        db.session.rollback()
-        return json_error("reset_failed", 500, str(e))
-
-# Operadores (Admin)
-@app.get("/api/admin/operator_tokens")
-def admin_operator_list():
-    toks = OperatorToken.query.order_by(OperatorToken.created_at.desc()).all()
-    return jsonify([{
-        "token": t.token, "dispenser_id": t.dispenser_id, "nombre": t.nombre or "",
-        "activo": bool(t.activo), "chat_id": t.chat_id or "",
-        "created_at": t.created_at.isoformat() if t.created_at else None
-    } for t in toks])
-
-# ======================================================
-# ===  Crear nuevo token de operador  ==================
-# ======================================================
-@app.post("/api/admin/operator_tokens")
-def create_operator_token():
-    require_admin()
-    data = request.get_json(force=True, silent=True) or {}
-    dispenser_id = data.get("dispenser_id")
-    nombre = data.get("nombre", "").strip() or "Operador"
-    if not dispenser_id:
-        return jsonify({"ok": False, "error": "dispenser_id requerido"}), 400
-
-    try:
-        tok = secrets.token_urlsafe(16)
-        op = OperatorToken(
-            token=tok,
-            dispenser_id=dispenser_id,
-            nombre=nombre,
-            activo=True,
-            created_at=datetime.utcnow(),
-            chat_id=None
-        )
-        db.session.add(op)
+        p.cantidad = max(0, int(p.cantidad or 0) + litros)
+        _post_stock_change_hook(p, motivo=f"reponer (operator:{op.token[:8]}..)")
         db.session.commit()
-
-        return jsonify({
-            "ok": True,
-            "token": tok,
-            "dispenser_id": dispenser_id,
-            "nombre": nombre
-        })
+        return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
-        print("Error creando operator token:", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
-@app.put("/api/admin/operator_tokens/<token>")
-def admin_operator_update(token):
-    data = request.get_json(force=True, silent=True) or {}
-    t = OperatorToken.query.get_or_404(token)
-    if "dispenser_id" in data:
-        did = _to_int(data["dispenser_id"])
-        if did and Dispenser.query.get(did): t.dispenser_id = did
-    if "nombre" in data: t.nombre = str(data["nombre"] or "")
-    if "activo" in data: t.activo = bool(data["activo"])
-    if "chat_id" in data: t.chat_id = str(data["chat_id"] or "")
-    db.session.commit()
-    return ok_json({"ok": True})
+        return json_error("Error reponiendo producto", 500, str(e))
 
-@app.delete("/api/admin/operator_tokens/<token>")
-def admin_operator_delete(token):
-    t = OperatorToken.query.get_or_404(token)
-    db.session.delete(t); db.session.commit()
-    return ok_json({"ok": True})
-
-# Operadores (público por token)
-
-def _operator_from_header() -> OperatorToken | None:
-    """Devuelve el operador autenticado. Acepta token desde:
-    - Header: x-operator-token o X-Operator-Token
-    - Parámetro de query: ?token=
-    - Campo JSON o form-data: {"token": "..."}
-    """
-    from flask import request, has_request_context
-
-    if not has_request_context():
-        app.logger.warning("[AUTH] Llamada fuera de contexto de request")
-        return None
-
-    # 🔍 Log completo de headers
+@app.post("/api/op/productos/<int:pid>/reset_stock")
+def op_reset_stock(pid):
+    op = get_operator_scope()
+    if not op: return _unauth_op()
+    p = Producto.query.get_or_404(pid)
+    if p.dispenser_id != op.dispenser_id:
+        return json_error("forbidden", 403, "No podés modificar productos de otro dispenser")
+    litros = _to_int((request.get_json(force=True) or {}).get("litros", 0))
+    if litros < 0: return json_error("Litros inválidos", 400)
     try:
-        app.logger.info(f"[DEBUG] HEADERS COMPLETOS: {dict(request.headers)}")
+        p.cantidad = int(litros)
+        _post_stock_change_hook(p, motivo=f"reset_stock (operator:{op.token[:8]}..)")
+        db.session.commit()
+        return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
-        app.logger.warning(f"[DEBUG] No se pudieron loguear headers: {e}")
+        db.session.rollback()
+        return json_error("Error reseteando stock", 500, str(e))
 
-    # Intentar extraer token desde múltiples fuentes
-    tok = (
-        request.headers.get("x-operator-token")
-        or request.headers.get("X-Operator-Token")
-        or request.args.get("token")
-        or (request.get_json(silent=True) or {}).get("token")
-        or request.form.get("token")
-        or ""
-    ).strip()
-
-    app.logger.info(f"[DEBUG] Token recibido en _operator_from_header: {tok}")
-
-    if not tok:
-        return None
-
-    op = OperatorToken.query.filter_by(token=tok, activo=True).first()
-    if not op:
-        app.logger.warning(f"[AUTH] Token inválido o inactivo: {tok}")
-        return None
-
-    return op
-    
-@app.get("/api/operator/productos")
-def operator_productos():
-    """Devuelve los productos visibles para el panel del operador"""
-    token = request.headers.get("x-operator-token")
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido o inactivo"}), 401
-
-    # 🔹 Ordenamos por número de slot (como en el gabinete físico)
-    productos = (
-        Producto.query.filter_by(dispenser_id=op.dispenser_id)
-        .order_by(Producto.slot_id.asc())
-        .all()
-    )
-
-    return jsonify({
-        "ok": True,
-        "operator": {
-            "token": op.token,
-            "nombre": getattr(op, "nombre", ""),
-            "dispenser_id": op.dispenser_id,
-            "chat_id": getattr(op, "chat_id", None),
-        },
-        "productos": [
-            {
-                "id": p.id,
-                "nombre": p.nombre,
-                "slot": p.slot_id,
-                "precio": p.precio,
-                "cantidad": p.cantidad,
-                "habilitado": p.habilitado,
-                # ✅ Conserva los bundles definidos
-                "bundle2": (p.bundle_precios or {}).get("2"),
-                "bundle3": (p.bundle_precios or {}).get("3"),
-            }
-            for p in productos
-        ],
-    })
-
-@app.get("/api/operator/estado")
-def operator_estado():
-    """Devuelve el estado actual del dispenser asociado al operador."""
-    token = request.args.get("token") or request.headers.get("x-operator-token", "").strip()
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 400
-
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
-
-    disp = Dispenser.query.get(op.dispenser_id)
-    if not disp:
-        return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
-
-    return jsonify({
-        "ok": True,
-        "dispenser": {
-            "id": disp.id,
-            "device_id": disp.device_id,
-            "nombre": disp.nombre,
-            "activo": bool(disp.activo)
-        },
-        "operator": {
-            "token": op.token,
-            "nombre": op.nombre
-        }
-    })
-# ==========================================
-# ✅ REPOENER PRODUCTO (sumar stock)
-# ==========================================
-# --- REPOSICIÓN DE PRODUCTO POR OPERADOR ---
-@app.post("/api/operator/productos/reponer")
-def operator_reponer():
-    token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
-
-    data = request.get_json(force=True)
-    pid = data.get("product_id")
-    litros = float(data.get("litros", 0))
-
-    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not p:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    # ✅ sumar litros
-    p.cantidad = (p.cantidad or 0) + litros
-    if not p.bundle_precios:
-        p.bundle_precios = {}
-
-    db.session.commit()
-    
-    check_stock_alert(p, op)
-    
-    # ✅ notificar por Telegram si está vinculado
-    if op.chat_id:
-        try:
-            msg = f"📦 Reposición realizada\n\nProducto: {p.nombre}\nCantidad: {litros} L\nStock actual: {p.cantidad} L"
-            send_telegram_message(op.chat_id, msg)
-        except Exception as e:
-            print("Error enviando Telegram:", e)
-
-    return jsonify({"ok": True, "producto": p.to_dict()})
-
-# ==========================================
-# ✅ RESETEAR PRODUCTO (setear stock exacto)
-# ==========================================
-@app.post("/api/operator/productos/reset")
-def operator_reset():
-    token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
-
-    data = request.get_json(force=True)
-    pid = data.get("product_id")
-    litros = float(data.get("litros", 0))
-
-    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not p:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    # ✅ set directo
-    p.cantidad = litros
-    if not p.bundle_precios:
-        p.bundle_precios = {}
-
-    db.session.commit()
-   
-    check_stock_alert(p, op)
-    
-    # ✅ notificación Telegram
-    if op.chat_id:
-        try:
-            msg = f"🔄 Stock reiniciado\n\nProducto: {p.nombre}\nNuevo stock: {litros} L"
-            send_telegram_message(op.chat_id, msg)
-        except Exception as e:
-            print("Error enviando Telegram:", e)
-
-    return jsonify({"ok": True, "producto": p.to_dict()})
-        
-@app.post("/api/operator/link")
-def operator_link():
-    data = request.get_json(force=True, silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    chat_id = (data.get("chat_id") or "").strip()
-    if not tok or not chat_id: return json_error("token y chat_id requeridos", 400)
-    t = OperatorToken.query.get(tok)
-    if not t: return json_error("token inválido", 404)
-    t.chat_id = chat_id
-    db.session.commit()
-    tg_notify_all(f"🔗 Operador vinculado: '{t.nombre or t.token[:6]}' → dispenser {t.dispenser_id}", dispenser_id=t.dispenser_id)
-    return ok_json({"ok": True})
-
-@app.post("/api/operator/unlink")
-def operator_unlink():
-    """Permite desvincular el chat_id (Telegram) del operador."""
-    data = request.get_json(force=True, silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    if not tok:
-        return json_error("token requerido", 400)
-    t = OperatorToken.query.get(tok)
-    if not t:
-        return json_error("token inválido", 404)
-
-    t.chat_id = ""
-    db.session.commit()
-    tg_notify_all(
-        f"❌ Operador desvinculado de Telegram: '{t.nombre or t.token[:6]}' (disp {t.dispenser_id})",
-        dispenser_id=t.dispenser_id
-    )
-    return ok_json({"ok": True})
-
-# Gracias / Sin stock
+# ---------------- Gracias / Sin stock ----------------
 @app.get("/gracias")
 def pagina_gracias():
     status = (request.args.get("status") or "").lower()
@@ -1484,13 +910,14 @@ def pagina_gracias():
     elif status in ("pending","in_process"):
         title="Pago pendiente"; subtitle="Tu pago está en revisión."
     else:
-        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado. Intente nuevamente.</span>'
+        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado.Intente nuevamente.</span>'
     return _html(title, f"<p>{subtitle}</p>")
 
 @app.get("/sin-stock")
 def pagina_sin_stock():
     return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
 
+# ---- HTML helpers ----
 def _html(title: str, body_html: str):
     html = f"""<!doctype html><html lang="es"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1502,742 +929,10 @@ def _html(title: str, body_html: str):
 </div></body></html>"""
     r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
-# ================== QR fijo del administrador ==================
-@app.get("/ui/qr_admin")
-def ui_qr_admin():
-    """Muestra el QR del admin para un producto específico"""
-    pid = request.args.get("pid", "").strip()
-    if not pid:
-        return "<p>Falta parámetro <code>pid</code>.</p>"
+def _html_raw(html: str):
+    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
 
-    prod = Producto.query.get(pid)
-    if not prod:
-        return "<p>Producto no encontrado.</p>"
-
-    # link al selector de cantidad
-    link = f"/ui/seleccionar?pid={pid}"
-    full_url = request.host_url.rstrip("/") + link
-    qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={full_url}"
-
-    html = f"""
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>QR de {prod.nombre}</title>
-      <style>
-        body {{
-          background-color: #0b1220;
-          color: #e5e7eb;
-          font-family: 'Inter', sans-serif;
-          display: flex;
-          flex-direction: column;
-          justify-content: center;
-          align-items: center;
-          height: 100vh;
-          margin: 0;
-        }}
-        .card {{
-          text-align: center;
-          background: rgba(255,255,255,0.05);
-          border-radius: 12px;
-          padding: 24px 40px;
-          box-shadow: 0 0 20px rgba(0,0,0,0.3);
-        }}
-        img {{
-          width: 220px;
-          height: 220px;
-          margin: 15px 0;
-        }}
-        h1 {{
-          color: #3b82f6;
-          margin-bottom: 6px;
-        }}
-        p {{
-          opacity: 0.8;
-          margin-top: 0;
-        }}
-        a {{
-          background: #3b82f6;
-          color: white;
-          text-decoration: none;
-          padding: 10px 18px;
-          border-radius: 8px;
-          margin-top: 16px;
-          display: inline-block;
-        }}
-        a:hover {{ background: #2563eb; }}
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <img src="https://i.ibb.co/XXZgD2Q/dispen-logo.png" width="80" style="margin-bottom:10px;">
-        <h1>Dispen-Easy</h1>
-        <h2>{prod.nombre}</h2>
-        <img src="{qr_api}" alt="QR">
-        <p>Escaneá este código para acceder a la compra.</p>
-        <a href="{full_url}" target="_blank">Abrir página de pago</a>
-      </div>
-    </body>
-    </html>
-    """
-    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
-# QR de selección
-
-@app.get("/ui/seleccionar")
-def ui_seleccionar():
-    pid = _to_int(request.args.get("pid"))
-    op_token = (request.args.get("op_token") or "").strip()
-
-    prod = Producto.query.get(pid)
-    if not prod or not prod.habilitado:
-        return _html("Producto sin stock o deshabilitado", "<p>Verifique disponibilidad.</p>")
-
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp:
-        return _html("Error", "<p>Dispenser no encontrado.</p>")
-
-    # ✅ Verificar si el dispenser está OFFLINE
-    dev = disp.device_id
-    estado = (last_status.get(dev) or {}).get("status", "unknown")
-    if estado != "online":
-        return _html("Dispenser sin conexión", "<p>⚠️ Este dispenser está sin conexión. Intente más tarde.</p>")
-
-    # --- Determinar si se accede con token de operador o global ---
-    operador = None
-    if op_token:
-        operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-
-    if operador:
-       token_mp = getattr(operador, "mp_access_token", None)
-       quien = "operador"
-    else:
-        # Token global (modo test/live)
-        kv = KV.query.get("mp_mode")
-        modo = (kv.value if kv else "test").lower()
-        token_mp = MP_ACCESS_TOKEN_LIVE if modo == "live" else MP_ACCESS_TOKEN_TEST
-        quien = "administrador"
-
-    if not token_mp:
-        return _html("Error", f"<p>Error al generar el pago: Token de MercadoPago no encontrado ({quien}).</p>")
-
-    # --- Opciones de litros ---
-    litros_list = [1, 2, 3]
-    _, reserva = get_thresholds()
-    opciones_html = ""
-    for L in litros_list:
-        if (int(prod.cantidad) - L) < reserva:
-            opciones_html += f'<button disabled style="opacity:.5;margin:6px;padding:10px 20px;border-radius:8px;background:#555;color:#ddd;">{L} L – Sin stock</button><br>'
-        else:
-            opciones_html += f"""
-            <button onclick="genPref({L})" style="margin:6px;padding:10px 20px;border:none;border-radius:8px;background:#007bff;color:white;cursor:pointer;">
-                {L} L – ${compute_total_price_ars(prod, L)}
-            </button><br>
-            """
-
-    # --- HTML dinámico ---
-    html = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{prod.nombre}</title>
-<script>
-async function genPref(lts) {{
-  try {{
-    const r = await fetch('/api/pagos/preferencia', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ product_id: {pid}, litros: lts }})
-    }});
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || 'Error desconocido');
-    window.location.href = j.link;
-  }} catch (e) {{
-    alert('Error al generar el pago: ' + e.message);
-  }}
-}}
-</script>
-</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-<div style="max-width:700px;margin:12vh auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:24px;text-align:center">
-  <h1 style="color:#58a6ff;margin-bottom:6px;">{prod.nombre}</h1>
-  <p style="margin:0 0 10px;">Pagás con la cuenta MercadoPago vinculada al <b>{quien}</b></p>
-  <p>Seleccioná la cantidad a comprar:</p>
-  {opciones_html}
-  <p style="margin-top:20px;font-size:.85em;color:#aaa">Sistema Dispen·Easy © 2025</p>
-</div>
-</body></html>"""
-    return _html_raw(html)
-# ======================================================
-# ===  Panel de vinculación para operadores  ============
-# ======================================================
-
-@app.get("/vincular_mp")
-def vincular_mp():
-    """Panel simple donde el operador puede vincular su cuenta de MercadoPago."""
-    token = request.args.get("token") or request.headers.get("x-operator-token")
-    if not token:
-        return _html("Vinculación MercadoPago", "<p>Falta token del operador.</p>")
-
-    op = OperatorToken.query.get(token)
-    if not op:
-        return _html("Error", "<p>Operador no encontrado.</p>")
-
-    # Verificar si ya tiene una cuenta vinculada
-    if op.mp_access_token:
-        html = f"""
-        <h3>Cuenta de MercadoPago ya vinculada ✅</h3>
-        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
-        <p>Podés desvincularla si es necesario.</p>
-        """
-    else:
-        # Mostrar botón para iniciar OAuth
-        auth_url = f"{BACKEND_BASE_URL}/api/mp/oauth_start?token={token}"
-        html = f"""
-        <h3>Vincular cuenta de MercadoPago</h3>
-        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
-        <p>Actualmente no hay cuenta vinculada.</p>
-        <a href="{auth_url}" style="background:#009EE3;color:white;padding:10px 20px;text-decoration:none;border-radius:8px;">Vincular MercadoPago</a>
-        """
-
-    return _html("Vinculación MercadoPago", html)
-
-# =======================
-# Ingreso por Token (nuevo)
-# =======================
-
-@app.route("/operator_login", methods=["GET", "POST"])
-def operator_login():
-    if request.method == "POST":
-        data = request.get_json(force=True)
-        token = (data.get("token") or "").strip()
-
-        op = OperatorToken.query.filter_by(token=token).first()
-        if not op:
-            return jsonify({"error": "Token inválido"}), 401
-
-        # Redirige al panel del operador correspondiente
-        return jsonify({
-            "success": True,
-            "redirect": f"/operator?token={token}",
-            "nombre": op.nombre
-        })
-
-    # Si es GET, solo muestra la página HTML de ingreso
-    return render_template("operator_login.html")
-
-# =====================
-# EDITAR PRODUCTOS (OPERADOR)
-# =====================
-@app.post("/api/productos/update")
-def api_update_producto():
-    """
-    Endpoint unificado de actualización de productos.
-    - Si viene 'x-admin-token': Admin puede editar TODO.
-    - Si viene 'x-operator-token': Operador puede editar solo sus productos.
-    """
-    data = request.get_json(force=True) or {}
-    pid = int(data.get("product_id", 0))
-    if not pid:
-        return jsonify({"ok": False, "error": "Falta product_id"}), 400
-
-    prod = Producto.query.get(pid)
-    if not prod:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    # --- Detectar tipo de usuario ---
-    admin_token = request.headers.get("x-admin-token", "").strip()
-    op_token = request.headers.get("x-operator-token", "").strip()
-    es_admin = False
-    es_operador = False
-    op = None
-
-    if admin_token and admin_token == os.getenv("ADMIN_TOKEN"):
-        es_admin = True
-    elif op_token:
-        op = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-        if op and prod.dispenser_id == op.dispenser_id:
-            es_operador = True
-        else:
-            return jsonify({"ok": False, "error": "Token operador inválido o producto no autorizado"}), 403
-    else:
-        return jsonify({"ok": False, "error": "Falta token de autenticación"}), 401
-
-    try:
-        # ===== CAMPOS COMUNES =====
-        if "nombre" in data and str(data["nombre"]).strip():
-            prod.nombre = str(data["nombre"]).strip()
-        if "precio" in data and data["precio"] not in (None, ""):
-            prod.precio = float(data["precio"])
-
-        if prod.bundle_precios is None:
-            prod.bundle_precios = {}
-
-        if "bundle2" in data:
-            if data["bundle2"] not in (None, "", "null"):
-                prod.bundle_precios["2"] = float(data["bundle2"])
-            elif "2" in prod.bundle_precios:
-                del prod.bundle_precios["2"]
-
-        if "bundle3" in data:
-            if data["bundle3"] not in (None, "", "null"):
-                prod.bundle_precios["3"] = float(data["bundle3"])
-            elif "3" in prod.bundle_precios:
-                del prod.bundle_precios["3"]
-
-        if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
-
-        # ===== CAMPOS SOLO ADMIN =====
-        if es_admin:
-            if "slot" in data and data["slot"] not in (None, ""):
-                new_slot = int(data["slot"])
-                if new_slot != prod.slot_id:
-                    conflict = Producto.query.filter_by(
-                        dispenser_id=prod.dispenser_id,
-                        slot_id=new_slot
-                    ).first()
-                    if conflict:
-                        return jsonify({"ok": False, "error": "Slot ya asignado"}), 409
-                    prod.slot_id = new_slot
-
-            if "dispenser_id" in data and data["dispenser_id"] not in (None, ""):
-                new_disp = int(data["dispenser_id"])
-                disp = Dispenser.query.get(new_disp)
-                if not disp:
-                    return jsonify({"ok": False, "error": "Dispenser destino no encontrado"}), 404
-                prod.dispenser_id = new_disp
-
-            if "cantidad" in data and data["cantidad"] not in (None, ""):
-                prod.cantidad = float(data["cantidad"])
-
-        db.session.commit()
-
-        return jsonify({
-            "ok": True,
-            "modo": "admin" if es_admin else "operador",
-            "producto": {
-                "id": prod.id,
-                "nombre": prod.nombre,
-                "precio": prod.precio,
-                "bundle_precios": prod.bundle_precios or {},
-                "habilitado": prod.habilitado,
-                "slot": prod.slot_id,
-                "dispenser_id": prod.dispenser_id,
-                "cantidad": prod.cantidad,
-            },
-        })
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
-# ===============================
-# 📦 Generar link QR desde panel del operador
-# ===============================
-@app.get("/api/operator/productos/qr/<int:product_id>")
-def operator_generar_qr(product_id):
-    """Genera y muestra el QR estático del producto para el operador, 
-    que lleva al selector de litros (/ui/seleccionar) usando su cuenta MercadoPago"""
-    token = request.headers.get("x-operator-token", "").strip()
-    if not token:
-        return jsonify({"ok": False, "error": "Token requerido"}), 401
-
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
-
-    prod = Producto.query.get(product_id)
-    if not prod or prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "Producto no autorizado o inexistente"}), 404
-
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp or not disp.activo:
-        return jsonify({"ok": False, "error": "Dispenser no disponible"}), 400
-
-    # ✅ El QR debe apuntar al selector de litros, incluyendo el token del operador
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    link = f"{backend_base}/ui/seleccionar?pid={product_id}&op_token={token}"
-
-    # 🧾 Generar imagen QR (base64)
-    import qrcode
-    import io, base64
-    qr_buffer = io.BytesIO()
-    qrcode.make(link).save(qr_buffer, format="PNG")
-    qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode("utf-8")
-
-    # 🖥️ Devolver HTML que muestra el QR y link (para imprimir o pegar)
-    html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>QR del producto</title>
-        <style>
-            body {{
-                background-color: #111;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                margin-top: 60px;
-            }}
-            img {{
-                margin-top: 30px;
-                width: 300px;
-                height: 300px;
-                border: 6px solid #007bff;
-                border-radius: 16px;
-                background-color: white;
-                padding: 10px;
-            }}
-            a {{
-                color: #00bfff;
-                font-size: 18px;
-            }}
-        </style>
-    </head>
-    <body>
-        <h2>QR del producto: {prod.nombre}</h2>
-        <p>📍 Escaneá este código para abrir el selector de litros</p>
-        <img src="data:image/png;base64,{qr_base64}" alt="QR del producto"><br>
-        <p><a href="{link}" target="_blank">{link}</a></p>
-        <p>💳 Pagás con la cuenta MercadoPago vinculada al operador: <b>{op.nombre if hasattr(op, 'nombre') else 'Operador'}</b></p>
-    </body>
-    </html>
-    """
-
-    return make_response(html)
-    #-----PANEL CONTABLE-----#
-
-@app.route('/api/contabilidad/resumen', methods=['GET'])
-def contabilidad_resumen():
-    """
-    Devuelve resumen de ventas agrupadas por operador, con totales de monto, litros y comisiones.
-    """
-    desde = request.args.get('desde')
-    hasta = request.args.get('hasta')
-
-    if not desde or not hasta:
-        hasta = datetime.now().strftime("%Y-%m-%d")
-        desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-
-    # Leer comisión editable de tabla configuracion
-    cfg = Configuracion.query.filter_by(clave='comision_porcentaje').first()
-    COMISION_PORCENTAJE = float(cfg.valor) if cfg else 10
-
-    query = text("""
-        SELECT 
-            operator_token AS operador,
-            SUM(monto) AS total_ventas,
-            SUM(litros) AS litros_vendidos,
-            COUNT(*) AS cantidad_transacciones
-        FROM pago
-        WHERE estado = 'approved'
-          AND fecha BETWEEN :desde AND :hasta
-        GROUP BY operator_token
-        ORDER BY total_ventas DESC
-    """)
-    result = db.session.execute(query, {'desde': desde, 'hasta': hasta}).fetchall()
-
-    resumen = []
-    for r in result:
-        comision = round(r.total_ventas * COMISION_PORCENTAJE / 100, 2)
-        neto = round(r.total_ventas - comision, 2)
-        resumen.append({
-            "operador": r.operador or "Sin asignar",
-            "ventas_totales": round(r.total_ventas, 2),
-            "litros_vendidos": round(r.litros_vendidos or 0, 2),
-            "comision": comision,
-            "neto_operador": neto,
-            "transacciones": r.cantidad_transacciones
-        })
-
-    return ok_json({
-        "desde": desde,
-        "hasta": hasta,
-        "comision_porcentaje": COMISION_PORCENTAJE,
-        "resumen": resumen
-    })  
-
-@app.route('/api/contabilidad/ranking_productos', methods=['GET'])
-def ranking_productos():
-    """
-    Devuelve ranking de productos más y menos vendidos por monto.
-    """
-    desde = request.args.get('desde')
-    hasta = request.args.get('hasta')
-
-    if not desde or not hasta:
-        hasta = datetime.now().strftime("%Y-%m-%d")
-        desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-
-    query = text("""
-        SELECT 
-            pr.nombre AS producto,
-            SUM(pg.litros) AS litros_totales,
-            SUM(pg.monto) AS monto_total,
-            COUNT(pg.id) AS transacciones
-        FROM pago pg
-        JOIN producto pr ON pg.id_producto = pr.id
-        WHERE pg.estado = 'approved'
-          AND pg.fecha BETWEEN :desde AND :hasta
-        GROUP BY pr.nombre
-        ORDER BY monto_total DESC
-    """)
-    result = db.session.execute(query, {'desde': desde, 'hasta': hasta}).fetchall()
-
-    data = [
-        {
-            "producto": r.producto,
-            "litros_totales": float(r.litros_totales or 0),
-            "monto_total": float(r.monto_total or 0),
-            "transacciones": int(r.transacciones)
-        }
-        for r in result
-    ]
-
-    top = data[:5]
-    low = list(reversed(data[-5:]))
-
-    return ok_json({
-        "desde": desde,
-        "hasta": hasta,
-        "top": top,
-        "low": low
-    })
-
-@app.route("/api/admin/productos/qr/<int:pid>")
-def api_admin_qr(pid):
-    from flask import jsonify
-    token = request.headers.get("x-admin-token") or request.args.get("token")
-    if token != os.getenv("ADMIN_TOKEN"):
-        return jsonify({"ok": False, "error": "Token inválido"}), 403
-
-    prod = Producto.query.get(pid)
-    if not prod:
-        return _html("QR", "<p>Producto no encontrado</p>")
-
-    url = f"{FRONT_BASE}/ui/seleccionar?pid={pid}&op_token=admin_global"
-
-    html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>QR del producto: {prod.nombre}</title>
-        <style>
-            body {{
-                background-color: #0b1220;
-                color: #e5e7eb;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                padding-top: 50px;
-            }}
-            img {{
-                border: 6px solid #3b82f6;
-                border-radius: 20px;
-                background: white;
-                padding: 10px;
-                margin: 20px auto;
-            }}
-            a {{
-                color: #60a5fa;
-                text-decoration: none;
-            }}
-        </style>
-    </head>
-    <body>
-        <h2>QR del producto: {prod.nombre}</h2>
-        <p>📍 Escaneá este código para abrir el selector de litros</p>
-        <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={url}">
-        <p><a href="{url}">{url}</a></p>
-        <p style="margin-top:30px;opacity:.8">Pagás con la cuenta MercadoPago del administrador</p>
-    </body>
-    </html>
-    """
-    return _html("QR", html)    
-
-# ==============================================================
-# 🧩 CREAR PREFERENCIA DE PAGO (Versión Operador)
-# ==============================================================
-@app.post("/api/operator/pagos/preferencia")
-def operator_crear_preferencia():
-    """
-    Crea una preferencia de pago usando el token de MercadoPago
-    del operador vinculado. Mantiene compatibilidad con el webhook global.
-    """
-    token = request.headers.get("x-operator-token", "").strip()
-    if not token:
-        return json_error("Falta header x-operator-token", 401)
-
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-    if not op:
-        return json_error("Operador inválido o inactivo", 401)
-
-    # 📦 Datos del pedido
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = _to_int(data.get("product_id") or 0)
-    litros = _to_int(data.get("litros") or 1)
-    if litros <= 0:
-        litros = 1
-
-    prod = Producto.query.filter_by(id=product_id, dispenser_id=op.dispenser_id).first()
-    if not prod:
-        return json_error("Producto no encontrado o no autorizado", 404)
-    if not prod.habilitado:
-        return json_error("Producto deshabilitado", 400)
-
-    disp = Dispenser.query.get(op.dispenser_id)
-    if not disp or not disp.activo:
-        return json_error("Dispenser inactivo o inexistente", 400)
-
-    # ✅ Verificar stock mínimo
-    _, reserva = get_thresholds()
-    if (int(prod.cantidad) - litros) < reserva:
-        return json_error("stock_reserva", 409, {"stock": int(prod.cantidad), "reserva": reserva})
-
-    # 💰 Calcular monto final
-    monto_final = compute_total_price_ars(prod, litros)
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    base_api = "https://api.sandbox.mercadopago.com"
-    token_mp = op.mp_access_token
-
-    # Si el token no empieza con TEST-, asumimos entorno Live
-    if token_mp and not token_mp.startswith("TEST-"):
-        base_api = "https://api.mercadopago.com"
-
-    if not token_mp:
-        return json_error("Operador sin cuenta MercadoPago vinculada", 500)
-
-    # 🧾 Cuerpo de la preferencia
-    external_ref = f"pid={prod.id};slot={prod.slot_id};litros={litros};disp={disp.id};op={op.token}"
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": f"{prod.nombre} · {litros} L",
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final)
-        }],
-        "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
-            "producto": prod.nombre,
-            "litros": int(litros),
-            "dispenser_id": int(disp.id),
-            "device_id": disp.device_id,
-            "operator_token": op.token
-        },
-        "external_reference": external_ref,
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending"
-        },
-        "statement_descriptor": "DISPEN-EASY"
-    }
-
-    # 🚀 Crear preferencia en MercadoPago
-    try:
-        r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={
-                "Authorization": f"Bearer {token_mp}",
-                "Content-Type": "application/json"
-            },
-            json=body, timeout=15
-        )
-        r.raise_for_status()
-    except Exception as e:
-        detail = getattr(r, "text", str(e))[:400] if 'r' in locals() else str(e)
-        return json_error("mp_preference_failed", 502, detail)
-
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-
-    # 📤 Respuesta final
-    return ok_json({
-        "ok": True,
-        "link": link,
-        "modo": "operador",
-        "precio_final": monto_final,
-        "raw": pref
-    })
-
-# ============ DEBUG ADMIN SECRET ============
-@app.get("/api/_debug/admin")
-def debug_admin_secret():
-    env = _admin_env()
-    hdr = _admin_header()
-    return jsonify({
-        "ok": True,
-        "admin_env": env,
-        "header_recibido": hdr
-    })
-
-@app.get("/api/debug/tokens")
-def debug_tokens():
-    ops = OperatorToken.query.all()
-    return jsonify([
-        {"token": o.token, "nombre": (o.nombre or ""), "dispenser_id": o.dispenser_id, "activo": bool(o.activo)}
-        for o in ops
-    ])
-
-# ===================== ALERTA DE BAJO STOCK =====================
-
-def check_stock_alert(producto, operador):
-    """Envia alerta por Telegram si el stock cae por debajo del umbral"""
-    try:
-        import os
-        umbral = float(os.getenv("STOCK_RESERVA_LTS", 2))
-        if producto.cantidad <= umbral and operador.chat_id:
-            msg = (
-                f"⚠️ *Alerta de bajo stock*\n\n"
-                f"Dispenser #{producto.dispenser_id}\n"
-                f"Producto: {producto.nombre}\n"
-                f"Stock actual: {producto.cantidad} L\n\n"
-                f"Recomendación: reponer el producto cuanto antes 🧴"
-            )
-            send_telegram_message(operador.chat_id, msg)
-    except Exception as e:
-        print("Error al enviar alerta de bajo stock:", e)
-
-
-# ==========================================
-# 📤 Enviar reporte por Telegram (seguro con variables)
-# ==========================================
-import requests, os
-
-@app.route("/api/enviar_telegram", methods=["POST"])
-def enviar_telegram():
-    try:
-        data = request.get_json(force=True)
-        mensaje = data.get("mensaje", "")
-        if not mensaje:
-            return jsonify({"error": "mensaje vacío"}), 400
-
-        TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-        TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return jsonify({"error": "faltan variables TELEGRAM_*"}), 500
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": mensaje,
-            "parse_mode": "Markdown",
-        }
-
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            return jsonify({"ok": True})
-        else:
-            print("Error Telegram:", r.text)
-            return jsonify({"error": "telegram error"}), 500
-    except Exception as e:
-        print("Error enviando telegram:", e)
-        return jsonify({"error": str(e)}), 500
-    
-# ============ MQTT init ============
-
+# ---------------- Inicializar MQTT ----------------
 with app.app_context():
     try: start_mqtt_background()
     except Exception: app.logger.exception("[MQTT] error iniciando hilo")
