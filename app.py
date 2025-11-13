@@ -201,6 +201,22 @@ with app.app_context():
     except Exception:
         db.session.rollback()
 
+class ProductoOperador(db.Model):
+    __tablename__ = "producto_operador"
+
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey("producto.id"), nullable=False)
+    operator_token = db.Column(db.String(64), db.ForeignKey("operator_token.token"), nullable=False)
+
+    # Datos independientes
+    precio = db.Column(db.Float, nullable=True)
+    bundle2 = db.Column(db.Float, nullable=True)
+    bundle3 = db.Column(db.Float, nullable=True)
+    habilitado = db.Column(db.Boolean, default=True)
+
+    # Relación
+    producto = db.relationship("Producto")
+    operador = db.relationship("OperatorToken")
 # ============ Serializers y utils ============
 
 def serialize_producto(p: Producto) -> dict:
