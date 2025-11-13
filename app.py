@@ -1340,7 +1340,11 @@ def _operator_from_header() -> OperatorToken | None:
     
 @app.get("/api/operator/productos")
 def operator_productos():
-    token = request.headers.get("x-operator-token")
+    token = (
+    request.headers.get("x-operator-token")
+    or request.args.get("token")
+    or ""
+).strip()
     op = OperatorToken.query.filter_by(token=token, activo=True).first()
 
     if not op:
