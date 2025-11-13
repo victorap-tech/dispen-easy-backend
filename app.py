@@ -1774,62 +1774,33 @@ def operator_update_producto():
     data = request.get_json(force=True)
     token = request.headers.get("x-operator-token", "").strip()
 
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 400
-
-    # ✔ CORRECTO: OperatorToken (tu modelo real)
     op = OperatorToken.query.filter_by(token=token, activo=True).first()
     if not op:
         return jsonify({"ok": False, "error": "Token inválido"}), 403
 
     pid = int(data.get("product_id", 0))
-    if not pid:
-        return jsonify({"ok": False, "error": "Falta product_id"}), 400
-
     prod = Producto.query.get(pid)
-    if not prod:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+    if not prod or prod.dispenser_id != op.dispenser_id:
+        return jsonify({"ok": False, "error": "Producto no autorizado"}), 403
 
-    # ✔ Verifica que el operador edite su propio dispenser
-    if prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "No autorizado"}), 403
+    po = get_or_create_operator_product(op, prod)
 
     try:
-        # === NOMBRE ===
-        if "nombre" in data and str(data["nombre"]).strip():
-            prod.nombre = str(data["nombre"]).strip()
-
-        # === PRECIO POR LITRO ===
         if "precio" in data and data["precio"] not in ("", None):
-            prod.precio = float(data["precio"])
+            po.precio = float(data["precio"])
 
-        # === BUNDLES ===
-        if prod.bundle_precios is None:
-            prod.bundle_precios = {}
-
-        # Bundle 2L
         if "bundle2" in data:
-            val = data["bundle2"]
-            if val in (None, "", "null"):
-                prod.bundle_precios.pop("2", None)
-            else:
-                prod.bundle_precios["2"] = float(val)
+            po.bundle2 = float(data["bundle2"]) if data["bundle2"] not in ("", None) else None
 
-        # Bundle 3L
         if "bundle3" in data:
-            val = data["bundle3"]
-            if val in (None, "", "null"):
-                prod.bundle_precios.pop("3", None)
-            else:
-                prod.bundle_precios["3"] = float(val)
+            po.bundle3 = float(data["bundle3"]) if data["bundle3"] not in ("", None) else None
 
-        # === HABILITADO ===
         if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
+            po.habilitado = bool(data["habilitado"])
 
         db.session.commit()
 
-        return jsonify({"ok": True, "producto": prod.to_dict()})
+        return jsonify({"ok": True})
 
     except Exception as e:
         db.session.rollback()
