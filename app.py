@@ -1340,42 +1340,42 @@ def _operator_from_header() -> OperatorToken | None:
     
 @app.get("/api/operator/productos")
 def operator_productos():
-    """Devuelve los productos visibles para el panel del operador"""
     token = request.headers.get("x-operator-token")
     op = OperatorToken.query.filter_by(token=token, activo=True).first()
 
     if not op:
         return jsonify({"ok": False, "error": "Token inválido o inactivo"}), 401
 
-    # 🔹 Ordenamos por número de slot (como en el gabinete físico)
     productos = (
         Producto.query.filter_by(dispenser_id=op.dispenser_id)
         .order_by(Producto.slot_id.asc())
         .all()
     )
 
+    lista = []
+    for p in productos:
+        po = get_or_create_operator_product(op, p)
+        lista.append({
+            "id": p.id,
+            "slot": p.slot_id,
+            "nombre": p.nombre,
+            "cantidad": p.cantidad,
+            # ← valores propios del operador
+            "precio": po.precio,
+            "bundle2": po.bundle2,
+            "bundle3": po.bundle3,
+            "habilitado": po.habilitado,
+        })
+
     return jsonify({
         "ok": True,
         "operator": {
             "token": op.token,
-            "nombre": getattr(op, "nombre", ""),
+            "nombre": op.nombre,
             "dispenser_id": op.dispenser_id,
-            "chat_id": getattr(op, "chat_id", None),
+            "chat_id": op.chat_id,
         },
-        "productos": [
-            {
-                "id": p.id,
-                "nombre": p.nombre,
-                "slot": p.slot_id,
-                "precio": p.precio,
-                "cantidad": p.cantidad,
-                "habilitado": p.habilitado,
-                # ✅ Conserva los bundles definidos
-                "bundle2": (p.bundle_precios or {}).get("2"),
-                "bundle3": (p.bundle_precios or {}).get("3"),
-            }
-            for p in productos
-        ],
+        "productos": lista
     })
 
 @app.get("/api/operator/estado")
