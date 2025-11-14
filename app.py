@@ -1294,16 +1294,35 @@ def _operator_from_header() -> OperatorToken | None:
 
     return op
     
+# ============================================================
+#                  BLOQUE COMPLETO OPERADOR
+# ============================================================
+
+def _operator_from_header():
+    """Devuelve el operador autenticado por header, query o JSON."""
+    tok = (
+        request.headers.get("x-operator-token")
+        or request.headers.get("X-Operator-Token")
+        or request.args.get("token")
+        or (request.get_json(silent=True) or {}).get("token")
+        or ""
+    ).strip()
+
+    if not tok:
+        return None
+
+    return OperatorToken.query.filter_by(token=tok, activo=True).first()
+
+
+# ============================================================
+#                  LISTADO DE PRODUCTOS OPERADOR
+# ============================================================
 @app.get("/api/operator/productos")
 def operator_productos():
-    """Devuelve los productos visibles para el panel del operador"""
-    token = request.headers.get("x-operator-token")
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-
+    op = _operator_from_header()
     if not op:
-        return jsonify({"ok": False, "error": "Token inválido o inactivo"}), 401
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
 
-    # 🔹 Ordenamos por número de slot (como en el gabinete físico)
     productos = (
         Producto.query.filter_by(dispenser_id=op.dispenser_id)
         .order_by(Producto.slot_id.asc())
@@ -1314,9 +1333,10 @@ def operator_productos():
         "ok": True,
         "operator": {
             "token": op.token,
-            "nombre": getattr(op, "nombre", ""),
+            "nombre": op.nombre or "",
             "dispenser_id": op.dispenser_id,
-            "chat_id": getattr(op, "chat_id", None),
+            "chat_id": op.chat_id or "",
+            "mp_vinculado": bool(op.mp_access_token),
         },
         "productos": [
             {
@@ -1326,7 +1346,6 @@ def operator_productos():
                 "precio": p.precio,
                 "cantidad": p.cantidad,
                 "habilitado": p.habilitado,
-                # ✅ Conserva los bundles definidos
                 "bundle2": (p.bundle_precios or {}).get("2"),
                 "bundle3": (p.bundle_precios or {}).get("3"),
             }
@@ -1334,412 +1353,17 @@ def operator_productos():
         ],
     })
 
-@app.get("/api/operator/estado")
-def operator_estado():
-    """Devuelve el estado actual del dispenser asociado al operador."""
-    token = request.args.get("token") or request.headers.get("x-operator-token", "").strip()
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 400
 
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
-
-    disp = Dispenser.query.get(op.dispenser_id)
-    if not disp:
-        return jsonify({"ok": False, "error": "Dispenser no encontrado"}), 404
-
-    return jsonify({
-        "ok": True,
-        "dispenser": {
-            "id": disp.id,
-            "device_id": disp.device_id,
-            "nombre": disp.nombre,
-            "activo": bool(disp.activo)
-        },
-        "operator": {
-            "token": op.token,
-            "nombre": op.nombre
-        }
-    })
-# ==========================================
-# ✅ REPOENER PRODUCTO (sumar stock)
-# ==========================================
-# --- REPOSICIÓN DE PRODUCTO POR OPERADOR ---
-@app.post("/api/operator/productos/reponer")
-def operator_reponer():
-    token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
-
-    data = request.get_json(force=True)
-    pid = data.get("product_id")
-    litros = float(data.get("litros", 0))
-
-    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not p:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    # ✅ sumar litros
-    p.cantidad = (p.cantidad or 0) + litros
-    if not p.bundle_precios:
-        p.bundle_precios = {}
-
-    db.session.commit()
-    
-    check_stock_alert(p, op)
-    
-    # ✅ notificar por Telegram si está vinculado
-    if op.chat_id:
-        try:
-            msg = f"📦 Reposición realizada\n\nProducto: {p.nombre}\nCantidad: {litros} L\nStock actual: {p.cantidad} L"
-            send_telegram_message(op.chat_id, msg)
-        except Exception as e:
-            print("Error enviando Telegram:", e)
-
-    return jsonify({"ok": True, "producto": p.to_dict()})
-
-# ==========================================
-# ✅ RESETEAR PRODUCTO (setear stock exacto)
-# ==========================================
-@app.post("/api/operator/productos/reset")
-def operator_reset():
-    token = request.headers.get("x-operator-token")
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token"}), 401
-
-    op = OperatorToken.query.filter_by(token=token).first()
-    if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 401
-
-    data = request.get_json(force=True)
-    pid = data.get("product_id")
-    litros = float(data.get("litros", 0))
-
-    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
-    if not p:
-        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
-
-    # ✅ set directo
-    p.cantidad = litros
-    if not p.bundle_precios:
-        p.bundle_precios = {}
-
-    db.session.commit()
-   
-    check_stock_alert(p, op)
-    
-    # ✅ notificación Telegram
-    if op.chat_id:
-        try:
-            msg = f"🔄 Stock reiniciado\n\nProducto: {p.nombre}\nNuevo stock: {litros} L"
-            send_telegram_message(op.chat_id, msg)
-        except Exception as e:
-            print("Error enviando Telegram:", e)
-
-    return jsonify({"ok": True, "producto": p.to_dict()})
-        
-@app.post("/api/operator/link")
-def operator_link():
-    data = request.get_json(force=True, silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    chat_id = (data.get("chat_id") or "").strip()
-    if not tok or not chat_id: return json_error("token y chat_id requeridos", 400)
-    t = OperatorToken.query.get(tok)
-    if not t: return json_error("token inválido", 404)
-    t.chat_id = chat_id
-    db.session.commit()
-    tg_notify_all(f"🔗 Operador vinculado: '{t.nombre or t.token[:6]}' → dispenser {t.dispenser_id}", dispenser_id=t.dispenser_id)
-    return ok_json({"ok": True})
-
-@app.post("/api/operator/unlink")
-def operator_unlink():
-    """Permite desvincular el chat_id (Telegram) del operador."""
-    data = request.get_json(force=True, silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    if not tok:
-        return json_error("token requerido", 400)
-    t = OperatorToken.query.get(tok)
-    if not t:
-        return json_error("token inválido", 404)
-
-    t.chat_id = ""
-    db.session.commit()
-    tg_notify_all(
-        f"❌ Operador desvinculado de Telegram: '{t.nombre or t.token[:6]}' (disp {t.dispenser_id})",
-        dispenser_id=t.dispenser_id
-    )
-    return ok_json({"ok": True})
-
-# Gracias / Sin stock
-@app.get("/gracias")
-def pagina_gracias():
-    status = (request.args.get("status") or "").lower()
-    if status in ("success","approved"):
-        title="¡Gracias por su compra!"; subtitle='<span class="ok">Pago aprobado.</span> Presione el botón del producto seleccionado para dispensar.'
-    elif status in ("pending","in_process"):
-        title="Pago pendiente"; subtitle="Tu pago está en revisión."
-    else:
-        title="Pago no completado"; subtitle='<span class="err">El pago fue cancelado o rechazado. Intente nuevamente.</span>'
-    return _html(title, f"<p>{subtitle}</p>")
-
-@app.get("/sin-stock")
-def pagina_sin_stock():
-    return _html("❌ Producto sin stock", "<p>Este producto alcanzó la reserva crítica.</p>")
-
-def _html(title: str, body_html: str):
-    html = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{title}</title>
-</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-<div style="max-width:720px;margin:14vh auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:20px">
-<h1 style="margin:0 0 8px">{title}</h1>
-{body_html}
-</div></body></html>"""
-    r = make_response(html, 200); r.headers["Content-Type"]="text/html; charset=utf-8"; return r
-
-# ================== QR fijo del administrador ==================
-@app.get("/ui/qr_admin")
-def ui_qr_admin():
-    """Muestra el QR del admin para un producto específico"""
-    pid = request.args.get("pid", "").strip()
-    if not pid:
-        return "<p>Falta parámetro <code>pid</code>.</p>"
-
-    prod = Producto.query.get(pid)
-    if not prod:
-        return "<p>Producto no encontrado.</p>"
-
-    # link al selector de cantidad
-    link = f"/ui/seleccionar?pid={pid}"
-    full_url = request.host_url.rstrip("/") + link
-    qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={full_url}"
-
-    html = f"""
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>QR de {prod.nombre}</title>
-      <style>
-        body {{
-          background-color: #0b1220;
-          color: #e5e7eb;
-          font-family: 'Inter', sans-serif;
-          display: flex;
-          flex-direction: column;
-          justify-content: center;
-          align-items: center;
-          height: 100vh;
-          margin: 0;
-        }}
-        .card {{
-          text-align: center;
-          background: rgba(255,255,255,0.05);
-          border-radius: 12px;
-          padding: 24px 40px;
-          box-shadow: 0 0 20px rgba(0,0,0,0.3);
-        }}
-        img {{
-          width: 220px;
-          height: 220px;
-          margin: 15px 0;
-        }}
-        h1 {{
-          color: #3b82f6;
-          margin-bottom: 6px;
-        }}
-        p {{
-          opacity: 0.8;
-          margin-top: 0;
-        }}
-        a {{
-          background: #3b82f6;
-          color: white;
-          text-decoration: none;
-          padding: 10px 18px;
-          border-radius: 8px;
-          margin-top: 16px;
-          display: inline-block;
-        }}
-        a:hover {{ background: #2563eb; }}
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <img src="https://i.ibb.co/XXZgD2Q/dispen-logo.png" width="80" style="margin-bottom:10px;">
-        <h1>Dispen-Easy</h1>
-        <h2>{prod.nombre}</h2>
-        <img src="{qr_api}" alt="QR">
-        <p>Escaneá este código para acceder a la compra.</p>
-        <a href="{full_url}" target="_blank">Abrir página de pago</a>
-      </div>
-    </body>
-    </html>
-    """
-    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
-# QR de selección
-
-@app.get("/ui/seleccionar")
-def ui_seleccionar():
-    pid = _to_int(request.args.get("pid"))
-    op_token = (request.args.get("op_token") or "").strip()
-
-    prod = Producto.query.get(pid)
-    if not prod or not prod.habilitado:
-        return _html("Producto sin stock o deshabilitado", "<p>Verifique disponibilidad.</p>")
-
-    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
-    if not disp:
-        return _html("Error", "<p>Dispenser no encontrado.</p>")
-
-    # ✅ Verificar si el dispenser está OFFLINE
-    dev = disp.device_id
-    estado = (last_status.get(dev) or {}).get("status", "unknown")
-    if estado != "online":
-        return _html("Dispenser sin conexión", "<p>⚠️ Este dispenser está sin conexión. Intente más tarde.</p>")
-
-    # --- Determinar si se accede con token de operador o global ---
-    operador = None
-    if op_token:
-        operador = OperatorToken.query.filter_by(token=op_token, activo=True).first()
-
-    if operador:
-       token_mp = getattr(operador, "mp_access_token", None)
-       quien = "operador"
-    else:
-        # Token global (modo test/live)
-        kv = KV.query.get("mp_mode")
-        modo = (kv.value if kv else "test").lower()
-        token_mp = MP_ACCESS_TOKEN_LIVE if modo == "live" else MP_ACCESS_TOKEN_TEST
-        quien = "administrador"
-
-    if not token_mp:
-        return _html("Error", f"<p>Error al generar el pago: Token de MercadoPago no encontrado ({quien}).</p>")
-
-    # --- Opciones de litros ---
-    litros_list = [1, 2, 3]
-    _, reserva = get_thresholds()
-    opciones_html = ""
-    for L in litros_list:
-        if (int(prod.cantidad) - L) < reserva:
-            opciones_html += f'<button disabled style="opacity:.5;margin:6px;padding:10px 20px;border-radius:8px;background:#555;color:#ddd;">{L} L – Sin stock</button><br>'
-        else:
-            opciones_html += f"""
-            <button onclick="genPref({L})" style="margin:6px;padding:10px 20px;border:none;border-radius:8px;background:#007bff;color:white;cursor:pointer;">
-                {L} L – ${compute_total_price_ars(prod, L)}
-            </button><br>
-            """
-
-    # --- HTML dinámico ---
-    html = f"""<!doctype html><html lang="es"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{prod.nombre}</title>
-<script>
-async function genPref(lts) {{
-  try {{
-    const r = await fetch('/api/pagos/preferencia', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ product_id: {pid}, litros: lts }})
-    }});
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || 'Error desconocido');
-    window.location.href = j.link;
-  }} catch (e) {{
-    alert('Error al generar el pago: ' + e.message);
-  }}
-}}
-</script>
-</head><body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto">
-<div style="max-width:700px;margin:12vh auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:24px;text-align:center">
-  <h1 style="color:#58a6ff;margin-bottom:6px;">{prod.nombre}</h1>
-  <p style="margin:0 0 10px;">Pagás con la cuenta MercadoPago vinculada al <b>{quien}</b></p>
-  <p>Seleccioná la cantidad a comprar:</p>
-  {opciones_html}
-  <p style="margin-top:20px;font-size:.85em;color:#aaa">Sistema Dispen·Easy © 2025</p>
-</div>
-</body></html>"""
-    return _html_raw(html)
-# ======================================================
-# ===  Panel de vinculación para operadores  ============
-# ======================================================
-
-@app.get("/vincular_mp")
-def vincular_mp():
-    """Panel simple donde el operador puede vincular su cuenta de MercadoPago."""
-    token = request.args.get("token") or request.headers.get("x-operator-token")
-    if not token:
-        return _html("Vinculación MercadoPago", "<p>Falta token del operador.</p>")
-
-    op = OperatorToken.query.get(token)
-    if not op:
-        return _html("Error", "<p>Operador no encontrado.</p>")
-
-    # Verificar si ya tiene una cuenta vinculada
-    if op.mp_access_token:
-        html = f"""
-        <h3>Cuenta de MercadoPago ya vinculada ✅</h3>
-        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
-        <p>Podés desvincularla si es necesario.</p>
-        """
-    else:
-        # Mostrar botón para iniciar OAuth
-        auth_url = f"{BACKEND_BASE_URL}/api/mp/oauth_start?token={token}"
-        html = f"""
-        <h3>Vincular cuenta de MercadoPago</h3>
-        <p>Operador: <b>{op.nombre or token[:6]}</b></p>
-        <p>Actualmente no hay cuenta vinculada.</p>
-        <a href="{auth_url}" style="background:#009EE3;color:white;padding:10px 20px;text-decoration:none;border-radius:8px;">Vincular MercadoPago</a>
-        """
-
-    return _html("Vinculación MercadoPago", html)
-
-# =======================
-# Ingreso por Token (nuevo)
-# =======================
-
-@app.route("/operator_login", methods=["GET", "POST"])
-def operator_login():
-    if request.method == "POST":
-        data = request.get_json(force=True)
-        token = (data.get("token") or "").strip()
-
-        op = OperatorToken.query.filter_by(token=token).first()
-        if not op:
-            return jsonify({"error": "Token inválido"}), 401
-
-        # Redirige al panel del operador correspondiente
-        return jsonify({
-            "success": True,
-            "redirect": f"/operator?token={token}",
-            "nombre": op.nombre
-        })
-
-    # Si es GET, solo muestra la página HTML de ingreso
-    return render_template("operator_login.html")
-
-# =====================
-# EDITAR PRODUCTOS (OPERADOR)
-# =====================
+# ============================================================
+#                  ACTUALIZAR PRODUCTO OPERADOR
+# ============================================================
 @app.post("/api/operator/productos/update")
 def operator_update_producto():
-    """
-    Permite que el operador actualice los datos de un producto asignado a su dispenser.
-    Campos válidos: precio, bundle2, bundle3, habilitado, nombre.
-    """
     data = request.get_json(force=True)
-    token = request.headers.get("x-operator-token", "").strip()
+    op = _operator_from_header()
 
-    if not token:
-        return jsonify({"ok": False, "error": "Falta token de operador"}), 400
-
-    op = Operador.query.filter_by(token=token).first()
     if not op:
-        return jsonify({"ok": False, "error": "Token inválido"}), 403
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
 
     pid = int(data.get("product_id", 0))
     if not pid:
@@ -1749,107 +1373,128 @@ def operator_update_producto():
     if not prod:
         return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
 
-    # Verificar que el producto pertenezca al dispenser del operador
     if prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "El producto no pertenece a este operador"}), 403
+        return jsonify({"ok": False, "error": "No autorizado"}), 403
 
+    # === Actualizaciones válidas ===
     try:
-        # Actualizar campos permitidos
-        if "precio" in data and data["precio"] not in (None, ""):
+        if "precio" in data and data["precio"] not in ("", None):
             prod.precio = float(data["precio"])
-
-        if "bundle2" in data and data["bundle2"] not in (None, ""):
-            prod.bundle2 = float(data["bundle2"])
-
-        if "bundle3" in data and data["bundle3"] not in (None, ""):
-            prod.bundle3 = float(data["bundle3"])
-
-        if "habilitado" in data:
-            prod.habilitado = bool(data["habilitado"])
 
         if "nombre" in data and str(data["nombre"]).strip():
             prod.nombre = str(data["nombre"]).strip()
 
+        if "habilitado" in data:
+            prod.habilitado = bool(data["habilitado"])
+
+        # Bundles
+        if prod.bundle_precios is None:
+            prod.bundle_precios = {}
+
+        if "bundle2" in data:
+            val = data["bundle2"]
+            if val in ("", None, "null"):
+                prod.bundle_precios.pop("2", None)
+            else:
+                prod.bundle_precios["2"] = float(val)
+
+        if "bundle3" in data:
+            val = data["bundle3"]
+            if val in ("", None, "null"):
+                prod.bundle_precios.pop("3", None)
+            else:
+                prod.bundle_precios["3"] = float(val)
+
         db.session.commit()
 
-        app.logger.info(f"[OPERATOR UPDATE] Producto {prod.id} actualizado por operador {op.id}")
         return jsonify({"ok": True, "producto": prod.to_dict()})
 
     except Exception as e:
         db.session.rollback()
-        app.logger.error(f"[OPERATOR UPDATE ERROR] {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-# ===============================
-# 📦 Generar link QR desde panel del operador
-# ===============================
+
+
+# ============================================================
+#                       REPOSICIÓN
+# ============================================================
+@app.post("/api/operator/productos/reponer")
+def operator_reponer():
+    op = _operator_from_header()
+    if not op:
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
+
+    data = request.get_json(force=True)
+    pid = data.get("product_id")
+    litros = float(data.get("litros", 0))
+
+    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    if not p:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    p.cantidad = (p.cantidad or 0) + litros
+    if not p.bundle_precios:
+        p.bundle_precios = {}
+
+    db.session.commit()
+    check_stock_alert(p, op)
+
+    return jsonify({"ok": True, "producto": p.to_dict()})
+
+
+# ============================================================
+#                       RESET STOCK
+# ============================================================
+@app.post("/api/operator/productos/reset")
+def operator_reset():
+    op = _operator_from_header()
+    if not op:
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
+
+    data = request.get_json(force=True)
+    pid = data.get("product_id")
+    litros = float(data.get("litros", 0))
+
+    p = Producto.query.filter_by(id=pid, dispenser_id=op.dispenser_id).first()
+    if not p:
+        return jsonify({"ok": False, "error": "Producto no encontrado"}), 404
+
+    p.cantidad = litros
+    if not p.bundle_precios:
+        p.bundle_precios = {}
+
+    db.session.commit()
+    check_stock_alert(p, op)
+
+    return jsonify({"ok": True, "producto": p.to_dict()})
+
+
+# ============================================================
+#                  GENERAR QR DEL OPERADOR
+# ============================================================
 @app.get("/api/operator/productos/qr/<int:product_id>")
 def operator_generar_qr(product_id):
-    """Genera y muestra el QR estático del producto para el operador, 
-    que lleva al selector de litros (/ui/seleccionar) usando su cuenta MercadoPago"""
-    token = request.headers.get("x-operator-token", "").strip()
-    if not token:
-        return jsonify({"ok": False, "error": "Token requerido"}), 401
-
-    op = OperatorToken.query.filter_by(token=token, activo=True).first()
+    op = _operator_from_header()
     if not op:
-        return jsonify({"ok": False, "error": "Operador inválido o inactivo"}), 401
+        return jsonify({"ok": False, "error": "Token inválido"}), 401
 
     prod = Producto.query.get(product_id)
     if not prod or prod.dispenser_id != op.dispenser_id:
-        return jsonify({"ok": False, "error": "Producto no autorizado o inexistente"}), 404
+        return jsonify({"ok": False, "error": "Producto no autorizado"}), 404
 
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp or not disp.activo:
-        return jsonify({"ok": False, "error": "Dispenser no disponible"}), 400
-
-    # ✅ El QR debe apuntar al selector de litros, incluyendo el token del operador
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    link = f"{backend_base}/ui/seleccionar?pid={product_id}&op_token={token}"
+    link = f"{backend_base}/ui/seleccionar?pid={product_id}&op_token={op.token}"
 
-    # 🧾 Generar imagen QR (base64)
-    import qrcode
-    import io, base64
-    qr_buffer = io.BytesIO()
-    qrcode.make(link).save(qr_buffer, format="PNG")
-    qr_base64 = base64.b64encode(qr_buffer.getvalue()).decode("utf-8")
+    import qrcode, io, base64
+    buf = io.BytesIO()
+    qrcode.make(link).save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
 
-    # 🖥️ Devolver HTML que muestra el QR y link (para imprimir o pegar)
     html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>QR del producto</title>
-        <style>
-            body {{
-                background-color: #111;
-                color: white;
-                font-family: Arial, sans-serif;
-                text-align: center;
-                margin-top: 60px;
-            }}
-            img {{
-                margin-top: 30px;
-                width: 300px;
-                height: 300px;
-                border: 6px solid #007bff;
-                border-radius: 16px;
-                background-color: white;
-                padding: 10px;
-            }}
-            a {{
-                color: #00bfff;
-                font-size: 18px;
-            }}
-        </style>
-    </head>
-    <body>
-        <h2>QR del producto: {prod.nombre}</h2>
-        <p>📍 Escaneá este código para abrir el selector de litros</p>
-        <img src="data:image/png;base64,{qr_base64}" alt="QR del producto"><br>
-        <p><a href="{link}" target="_blank">{link}</a></p>
-        <p>💳 Pagás con la cuenta MercadoPago vinculada al operador: <b>{op.nombre if hasattr(op, 'nombre') else 'Operador'}</b></p>
-    </body>
-    </html>
+    <html><body style="background:#111;color:white;text-align:center;">
+    <h2>QR de {prod.nombre}</h2>
+    <img src="data:image/png;base64,{b64}" width="280">
+    <p><a href="{link}" target="_blank" style="color:#0af;">{link}</a></p>
+    </body></html>
     """
 
     return make_response(html)
