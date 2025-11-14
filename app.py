@@ -66,18 +66,6 @@ def _to_int(x, default=0):
         try: return int(float(x))
         except Exception: return default
 
-def get_or_create_operator_product(op, prod):
-    """
-    Devuelve el objeto ProductoOperador del operador para este producto.
-    Si NO existe, lo crea copiando los valores del admin.
-    """
-    po = ProductoOperador.query.filter_by(
-        operator_token=op.token,
-        product_id=prod.id
-    ).first()
-
-    if po:
-        return po
 
     # Crear copia inicial de los valores del admin para este operador
     po = ProductoOperador(
