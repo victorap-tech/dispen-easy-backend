@@ -1037,75 +1037,115 @@ def crear_preferencia_api():
     # Webhook MP
 @app.post("/api/mp/webhook")
 def mp_webhook():
+    """
+    Webhook unificado que funciona tanto para:
+    - Pagos globales (admin)
+    - Pagos de operador (token MercadoPago propio)
+    """
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")
-    live_mode = bool(body.get("live_mode", True))
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
 
-    payment_id = None
-    if topic == "payment":
-        if "resource" in body and isinstance(body["resource"], str):
-            try: payment_id = body["resource"].rstrip("/").split("/")[-1]
-            except Exception: payment_id = None
-        payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
+    app.logger.info("[WEBHOOK] Payload recibido: %s", body)
+
+    # 1) Detectar payment_id
+    topic = args.get("topic") or body.get("type") or body.get("topic")
+
+    if topic != "payment":
+        return "ok", 200
+
+    # Extraer el ID del pago
+    payment_id = (
+        (body.get("data") or {}).get("id")
+        or args.get("id")
+        or (body.get("resource") or "").split("/")[-1]
+    )
+
     if not payment_id:
+        app.logger.warning("[WEBHOOK] Sin payment_id")
         return "ok", 200
 
+    # 2) Determinar si es Live o Sandbox
+    live_mode = bool(body.get("live_mode", True))
+    base_api = (
+        "https://api.mercadopago.com"
+        if live_mode else
+        "https://api.sandbox.mercadopago.com"
+    )
+
+    # 3) Token global
+    token_global = MP_ACCESS_TOKEN_LIVE or MP_ACCESS_TOKEN_TEST
+
+    # 4) Obtener detalles del pago
     try:
-        r_pay = requests.get(f"{base_api}/v1/payments/{payment_id}",
-                             headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        r_pay.raise_for_status()
-    except Exception:
+        r = requests.get(
+            f"{base_api}/v1/payments/{payment_id}",
+            headers={"Authorization": f"Bearer {token_global}"},
+            timeout=15
+        )
+        r.raise_for_status()
+    except Exception as e:
+        app.logger.error("[WEBHOOK] Error consultando pago %s: %s", payment_id, e)
         return "ok", 200
 
-    pay = r_pay.json() or {}
+    pay = r.json() or {}
     estado = (pay.get("status") or "").lower()
-    md = pay.get("metadata") or {}
-    product_id = _to_int(md.get("product_id") or 0)
-    slot_id = _to_int(md.get("slot_id") or 0)
-    litros = _to_int(md.get("litros") or 0)
-    dispenser_id = _to_int(md.get("dispenser_id") or 0)
-    device_id = str(md.get("device_id") or "")
-    monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
+    metadata = pay.get("metadata") or {}
+    ext_ref = pay.get("external_reference") or ""
 
-    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
+    # -------------------------------
+    # CAMPOS LEÍDOS DESDE METADATA
+    # -------------------------------
+    product_id   = int(metadata.get("product_id") or 0)
+    slot_id      = int(metadata.get("slot_id") or 0)
+    litros       = float(metadata.get("litros") or 0)
+    dispenser_id = int(metadata.get("dispenser_id") or 0)
+    device_id    = metadata.get("device_id") or ""
+    operador_tok = metadata.get("operator_token") or None
+
+    monto = (
+        float(metadata.get("precio_final") or 0)
+        or float(pay.get("transaction_amount") or 0)
+    )
+
+    # -------------------------------
+    # GUARDAR EL PAGO EN MODELO Pago ACTUAL
+    # -------------------------------
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+
     if not p:
         p = Pago(
-            mp_payment_id=str(payment_id), estado=estado or "pending", producto=producto_txt,
-            dispensado=False, procesado=False, slot_id=slot_id, litros=litros if litros>0 else 1,
-            monto=monto, product_id=product_id, dispenser_id=dispenser_id, device_id=device_id, raw=pay
-        ); db.session.add(p)
+            mp_payment_id=str(payment_id),
+            mp_preference_id=pay.get("order", {}).get("id"),
+            mp_status=estado,
+            mp_detail=pay,
+            producto_id=product_id if product_id else None,
+            litros=litros if litros > 0 else 1,
+            precio_total=monto,
+        )
+        db.session.add(p)
     else:
-        p.estado = estado or p.estado; p.producto = producto_txt or p.producto
-        p.slot_id = p.slot_id or slot_id; p.product_id = p.product_id or product_id
-        p.litros = p.litros or (litros if litros>0 else p.litros)
-        p.monto = p.monto or monto; p.dispenser_id = p.dispenser_id or dispenser_id
-        p.device_id = p.device_id or device_id; p.raw = pay
+        p.mp_status = estado
+        p.mp_detail = pay
+        p.precio_total = monto or p.precio_total
+        p.litros = litros or p.litros
+
     try:
         db.session.commit()
-    except Exception:
+    except Exception as e:
         db.session.rollback()
+        app.logger.error("[WEBHOOK] Error guardando Pago: %s", e)
         return "ok", 200
 
-    try:
-        if p.estado == "approved" and not p.dispensado and not getattr(p, "procesado", False) and p.slot_id and p.litros:
-            dev = p.device_id
-            if not dev and p.product_id:
-                pr = Producto.query.get(p.product_id)
-                if pr and pr.dispenser_id:
-                    d = Dispenser.query.get(pr.dispenser_id)
-                    dev = d.device_id if d else ""
-            if dev:
-                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros * 5))
-                if published:
-                    p.procesado = True; db.session.commit()
-    except Exception:
-        pass
-    return "ok", 200
+    # -------------------------------
+    # Si fue aprobado → disparar MQTT
+    # -------------------------------
+    if estado == "approved":
+        try:
+            _procesar_pago_confirmado(p)
+        except Exception as e:
+            app.logger.error("[WEBHOOK] Error procesando pago aprobado: %s", e)
 
+    return "ok", 200
 @app.post("/webhook")
 def mp_webhook_alias1(): return mp_webhook()
 @app.post("/mp/webhook")
