@@ -1038,22 +1038,29 @@ def crear_preferencia_api():
 @app.post("/api/mp/webhook")
 def mp_webhook():
     """
-    Webhook unificado que funciona tanto para:
-    - Pagos globales (admin)
-    - Pagos de operador (token MercadoPago propio)
+    Webhook oficial:
+    - Recibe todos los pagos (admin y operador)
+    - Guarda usando el modelo Pago ACTUAL
+    - Mantiene compatibilidad con metadata vieja
+    - Dispara MQTT si está aprobado
     """
     body = request.get_json(silent=True) or {}
     args = request.args or {}
 
     app.logger.info("[WEBHOOK] Payload recibido: %s", body)
 
-    # 1) Detectar payment_id
-    topic = args.get("topic") or body.get("type") or body.get("topic")
+    # =============================
+    # 1) Determinar payment_id
+    # =============================
+    topic = (
+        args.get("topic")
+        or body.get("type")
+        or body.get("topic")
+    )
 
     if topic != "payment":
         return "ok", 200
 
-    # Extraer el ID del pago
     payment_id = (
         (body.get("data") or {}).get("id")
         or args.get("id")
@@ -1064,7 +1071,9 @@ def mp_webhook():
         app.logger.warning("[WEBHOOK] Sin payment_id")
         return "ok", 200
 
-    # 2) Determinar si es Live o Sandbox
+    # =============================
+    # 2) Sandbox vs Live
+    # =============================
     live_mode = bool(body.get("live_mode", True))
     base_api = (
         "https://api.mercadopago.com"
@@ -1072,84 +1081,107 @@ def mp_webhook():
         "https://api.sandbox.mercadopago.com"
     )
 
-    # 3) Token global
-    token_global = MP_ACCESS_TOKEN_LIVE or MP_ACCESS_TOKEN_TEST
+    # Token global (solo para CONSULTAR el pago)
+    token_global, _ = get_mp_token_and_base()
 
-    # 4) Obtener detalles del pago
+    # =============================
+    # 3) Obtener detalles del pago
+    # =============================
     try:
-        r = requests.get(
+        r_pay = requests.get(
             f"{base_api}/v1/payments/{payment_id}",
             headers={"Authorization": f"Bearer {token_global}"},
             timeout=15
         )
-        r.raise_for_status()
+        r_pay.raise_for_status()
     except Exception as e:
         app.logger.error("[WEBHOOK] Error consultando pago %s: %s", payment_id, e)
         return "ok", 200
 
-    pay = r.json() or {}
+    pay = r_pay.json() or {}
+
     estado = (pay.get("status") or "").lower()
     metadata = pay.get("metadata") or {}
-    ext_ref = pay.get("external_reference") or ""
 
-    # -------------------------------
-    # CAMPOS LEÍDOS DESDE METADATA
-    # -------------------------------
+    # =============================
+    # 4) Datos desde metadata
+    # =============================
     product_id   = int(metadata.get("product_id") or 0)
     slot_id      = int(metadata.get("slot_id") or 0)
-    litros       = float(metadata.get("litros") or 0)
+    litros       = float(metadata.get("litros") or 0) or 1
     dispenser_id = int(metadata.get("dispenser_id") or 0)
     device_id    = metadata.get("device_id") or ""
-    operador_tok = metadata.get("operator_token") or None
+    operador_tok = metadata.get("operator_token")  # opcional
 
     monto = (
         float(metadata.get("precio_final") or 0)
         or float(pay.get("transaction_amount") or 0)
     )
 
-    # -------------------------------
-    # GUARDAR EL PAGO EN MODELO Pago ACTUAL
-    # -------------------------------
+    # =============================
+    # 5) Guardar en el modelo Pago
+    # =============================
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
 
     if not p:
         p = Pago(
             mp_payment_id=str(payment_id),
-            mp_preference_id=pay.get("order", {}).get("id"),
-            mp_status=estado,
-            mp_detail=pay,
-            producto_id=product_id if product_id else None,
-            litros=litros if litros > 0 else 1,
-            precio_total=monto,
+            estado=estado,
+            producto=metadata.get("producto", "")[:120],
+            dispensado=False,
+            procesado=False,
+            slot_id=slot_id,
+            litros=litros,
+            monto=monto,
+            product_id=product_id,
+            dispenser_id=dispenser_id,
+            device_id=device_id,
+            raw=pay
         )
         db.session.add(p)
+
     else:
-        p.mp_status = estado
-        p.mp_detail = pay
-        p.precio_total = monto or p.precio_total
+        p.estado = estado
+        p.raw = pay
         p.litros = litros or p.litros
+        p.monto = monto or p.monto
 
     try:
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        app.logger.error("[WEBHOOK] Error guardando Pago: %s", e)
+        app.logger.error("[WEBHOOK] Error guardando pago: %s", e)
         return "ok", 200
 
-    # -------------------------------
-    # Si fue aprobado → disparar MQTT
-    # -------------------------------
-    if estado == "approved":
+    # =============================
+    # 6) Si fue aprobado → mandar MQTT
+    # =============================
+    if estado == "approved" and p.slot_id and p.litros:
         try:
-            _procesar_pago_confirmado(p)
+            dev = p.device_id
+            if dev:
+                ok = send_dispense_cmd(
+                    dev,
+                    p.mp_payment_id,
+                    p.slot_id,
+                    p.litros,
+                    timeout_s=max(30, int(p.litros) * 5)
+                )
+                if ok:
+                    p.procesado = True
+                    db.session.commit()
         except Exception as e:
-            app.logger.error("[WEBHOOK] Error procesando pago aprobado: %s", e)
+            app.logger.error("[WEBHOOK] Error al enviar comando MQTT: %s", e)
 
     return "ok", 200
+
 @app.post("/webhook")
-def mp_webhook_alias1(): return mp_webhook()
+def mp_webhook_alias1():
+    return mp_webhook()
+
 @app.post("/mp/webhook")
-def mp_webhook_alias2(): return mp_webhook()
+def mp_webhook_alias2():
+    return mp_webhook()
 
 # Estado para Admin (fallback)
 @app.get("/api/dispensers/status")
