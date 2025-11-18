@@ -1,63 +1,105 @@
-from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-import mercadopago
 import os
+import json
 from datetime import datetime
+from flask import Flask, request, jsonify, Response
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.orm import relationship
+from sqlalchemy import func
+from flask_cors import CORS
+import requests
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "adm123")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+BASE_URL = os.getenv("BACKEND_BASE_URL", "")  # Railway
+MQTT_HOST = os.getenv("MQTT_HOST", "")
+MQTT_TOPIC_PREFIX = "dispen"
 
 app = Flask(__name__)
 CORS(app)
 
-# ------------------------------------
-# CONFIG DB
-# ------------------------------------
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///pagos.db"
+db_url = os.getenv("DATABASE_URL")
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://")
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# ------------------------------------
-# MODELOS
-# ------------------------------------
+
+# --------------------------------------------------
+# MODELOS SIMPLIFICADOS
+# --------------------------------------------------
 
 class Dispenser(db.Model):
+    __tablename__ = "dispenser"
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String, unique=True)
     nombre = db.Column(db.String)
     activo = db.Column(db.Boolean, default=True)
-    productos = db.relationship("Producto", backref="dispenser")
+
+    productos = relationship("Producto", backref="dispenser", cascade="all, delete-orphan")
+
 
 class Producto(db.Model):
+    __tablename__ = "producto"
     id = db.Column(db.Integer, primary_key=True)
+
     dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id"))
-    slot = db.Column(db.Integer)
+    slot = db.Column(db.Integer)  # 1 ó 2
+
     nombre = db.Column(db.String)
     precio = db.Column(db.Float)
-    habilitado = db.Column(db.Boolean, default=False)
+
+    habilitado = db.Column(db.Boolean, default=True)
+
 
 class Pago(db.Model):
+    __tablename__ = "pago"
     id = db.Column(db.Integer, primary_key=True)
+
+    dispenser_id = db.Column(db.Integer)
+    product_id = db.Column(db.Integer)
+    slot = db.Column(db.Integer)
+
     mp_payment_id = db.Column(db.String)
     monto = db.Column(db.Float)
     estado = db.Column(db.String)
-    slot_id = db.Column(db.Integer)
-    product_id = db.Column(db.Integer)
-    dispenser_id = db.Column(db.Integer)
     dispensado = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.String)
 
-db.create_all()
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# ------------------------------------
-# MERCADOPAGO
-# ------------------------------------
-MP_TOKEN = os.getenv("MP_ACCESS_TOKEN_TEST", "")
-sdk = mercadopago.SDK(MP_TOKEN)
 
-# ------------------------------------
-# LISTA DISPENSERS
-# ------------------------------------
-@app.route("/api/dispensers")
-def dispensers():
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+
+def admin_required(req):
+    sec = req.headers.get("x-admin-secret")
+    if not sec or sec != ADMIN_SECRET:
+        return False
+    return True
+
+
+# --------------------------------------------------
+# CREAR TABLAS
+# --------------------------------------------------
+with app.app_context():
+    db.create_all()
+
+
+# --------------------------------------------------
+# API
+# --------------------------------------------------
+
+@app.get("/api/dispensers")
+def get_dispensers():
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
     ds = Dispenser.query.all()
     out = []
     for d in ds:
@@ -69,158 +111,228 @@ def dispensers():
         })
     return jsonify(out)
 
-# ------------------------------------
-# LISTA PRODUCTOS POR DISPENSER
-# ------------------------------------
-@app.route("/api/productos")
-def productos():
+
+@app.post("/api/dispensers")
+def add_dispenser():
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json
+    device_id = data.get("device_id")
+    nombre = data.get("nombre")
+
+    d = Dispenser(device_id=device_id, nombre=nombre)
+    db.session.add(d)
+    db.session.commit()
+
+    # Crear automáticamente 2 productos
+    for i in [1, 2]:
+        p = Producto(dispenser_id=d.id, slot=i, nombre="", precio=0, habilitado=True)
+        db.session.add(p)
+    db.session.commit()
+
+    return jsonify({"ok": True, "dispenser": {
+        "id": d.id,
+        "device_id": d.device_id,
+        "nombre": d.nombre,
+        "activo": d.activo
+    }})
+
+
+@app.get("/api/productos")
+def get_productos():
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
     disp = request.args.get("dispenser_id")
-    prods = Producto.query.filter_by(dispenser_id=disp).order_by(Producto.slot).all()
+    ps = Producto.query.filter_by(dispenser_id=disp).order_by(Producto.slot).all()
+
     out = []
-    for p in prods:
+    for p in ps:
         out.append({
             "id": p.id,
             "slot": p.slot,
+            "dispenser_id": p.dispenser_id,
             "nombre": p.nombre,
             "precio": p.precio,
             "habilitado": p.habilitado
         })
     return jsonify(out)
 
-# ------------------------------------
-# CREAR PRODUCTO
-# ------------------------------------
-@app.route("/api/productos", methods=["POST"])
-def crear_producto():
-    data = request.get_json()
-    p = Producto(
-        dispenser_id=data["dispenser_id"],
-        slot=data["slot"],
-        nombre=data["nombre"],
-        precio=data["precio"],
-        habilitado=data.get("habilitado", False)
-    )
-    db.session.add(p)
-    db.session.commit()
-    return jsonify({"producto": {
-        "id": p.id, "slot": p.slot, "nombre": p.nombre,
-        "precio": p.precio, "habilitado": p.habilitado
-    }})
 
-# ------------------------------------
-# EDITAR PRODUCTO
-# ------------------------------------
-@app.route("/api/productos/<int:pid>", methods=["PUT"])
-def editar_producto(pid):
-    data = request.get_json()
+@app.put("/api/productos/<int:pid>")
+def update_prod(pid):
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
     p = Producto.query.get(pid)
     if not p:
-        return jsonify({"error":"no existe"}), 404
+        return jsonify({"error": "no existe"}), 404
 
+    data = request.json
     p.nombre = data.get("nombre", p.nombre)
     p.precio = data.get("precio", p.precio)
     p.habilitado = data.get("habilitado", p.habilitado)
 
     db.session.commit()
-    return jsonify({"producto": {
-        "id": p.id, "slot": p.slot, "nombre": p.nombre,
-        "precio": p.precio, "habilitado": p.habilitado
+    return jsonify({"ok": True, "producto": {
+        "id": p.id,
+        "slot": p.slot,
+        "dispenser_id": p.dispenser_id,
+        "nombre": p.nombre,
+        "precio": p.precio,
+        "habilitado": p.habilitado
     }})
 
-# ------------------------------------
-# GENERAR LINK DE MERCADOPAGO
-# ------------------------------------
-@app.route("/api/pagos/preferencia", methods=["POST"])
-def generar_preferencia():
-    data = request.get_json()
-    producto = Producto.query.get(data["product_id"])
 
-    if not producto or not producto.habilitado:
+# --------------------------------------------------
+# MERCADOPAGO
+# --------------------------------------------------
+
+@app.post("/api/pagos/preferencia")
+def crear_preferencia():
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json
+    producto_id = data.get("product_id")
+
+    p = Producto.query.get(producto_id)
+    if not p or not p.habilitado:
         return jsonify({"error": "producto no disponible"}), 400
 
-    preference_data = {
-        "items": [
-            {
-                "title": producto.nombre,
-                "quantity": 1,
-                "unit_price": float(producto.precio)
-            }
-        ],
-        "back_urls": {
-            "success": "https://google.com",
-            "failure": "https://google.com",
-            "pending": "https://google.com"
-        },
-        "auto_return": "approved",
+    monto = float(p.precio)
+
+    # Crear preferencia MP
+    url = "https://api.mercadopago.com/checkout/preferences"
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-    pref = sdk.preference().create(preference_data)
-    return jsonify({"init_point": pref["response"]["init_point"]})
+    body = {
+        "items": [{
+            "title": p.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": monto
+        }],
+        "notification_url": f"{BASE_URL}/api/webhook"
+    }
 
-# ------------------------------------
-# PAGOS RECIENTES
-# ------------------------------------
-@app.route("/api/pagos")
-def pagos():
-    rows = Pago.query.order_by(Pago.id.desc()).limit(10).all()
+    r = requests.post(url, headers=headers, json=body)
+    pref = r.json()
+
+    # Guardar pago preliminar
+    pg = Pago(
+        dispenser_id=p.dispenser_id,
+        product_id=p.id,
+        slot=p.slot,
+        monto=monto,
+        estado="pending",
+        mp_payment_id=pref.get("id", "0")
+    )
+    db.session.add(pg)
+    db.session.commit()
+
+    return jsonify({
+        "init_point": pref.get("init_point"),
+        "preference_id": pref.get("id"),
+        "pago_id": pg.id
+    })
+
+
+@app.post("/api/webhook")
+def webhook():
+    data = request.json or {}
+    payment_id = str(data.get("data", {}).get("id"))
+
+    if not payment_id:
+        return jsonify({"error": "sin id"}), 200
+
+    # Buscar Pago por mp_payment_id
+    pg = Pago.query.filter_by(mp_payment_id=payment_id).first()
+    if not pg:
+        return jsonify({"msg": "no encontrado"}), 200
+
+    # Pedir a MP detalles
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    info = r.json()
+
+    estado = info.get("status")
+    pg.estado = estado
+    db.session.commit()
+
+    # Si aprobado -> enviar a MQTT
+    if estado == "approved":
+        topic = f"{MQTT_TOPIC_PREFIX}/{pg.dispenser_id}/dispense/{pg.slot}"
+        print("MQTT:", topic)
+
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------
+# PAGOS
+# --------------------------------------------------
+
+@app.get("/api/pagos")
+def get_pagos():
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    q = Pago.query.order_by(Pago.id.desc()).limit(20).all()
     out = []
-    for r in rows:
+    for p in q:
         out.append({
-            "id": r.id,
-            "mp_payment_id": r.mp_payment_id,
-            "estado": r.estado,
-            "monto": r.monto,
-            "slot_id": r.slot_id,
-            "product_id": r.product_id,
-            "device_id": r.dispenser_id,
-            "dispensado": r.dispensado,
-            "created_at": r.created_at
+            "id": p.id,
+            "mp_payment_id": p.mp_payment_id,
+            "estado": p.estado,
+            "monto": p.monto,
+            "slot": p.slot,
+            "product_id": p.product_id,
+            "dispenser_id": p.dispenser_id,
+            "dispensado": p.dispensado,
+            "created_at": p.created_at.isoformat()
         })
     return jsonify(out)
 
-# ------------------------------------
-# WEBHOOK MERCADOPAGO
-# ------------------------------------
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
 
-    pago = Pago(
-        mp_payment_id=data.get("id"),
-        estado="approved",
-        monto=data.get("monto", 0),
-        slot_id=data.get("slot_id", 0),
-        product_id=data.get("product_id", 0),
-        dispenser_id=data.get("dispenser_id", 0),
-        dispensado=False,
-        created_at=datetime.now().isoformat()
-    )
-    db.session.add(pago)
-    db.session.commit()
-
-    return jsonify({"received": True})
-
-# ------------------------------------
-# REENVIAR
-# ------------------------------------
-@app.route("/api/pagos/<int:pid>/reenviar", methods=["POST"])
+@app.post("/api/pagos/<int:pid>/reenviar")
 def reenviar(pid):
+    if not admin_required(request):
+        return jsonify({"error": "unauthorized"}), 401
+
     p = Pago.query.get(pid)
-    if not p:
-        return jsonify({"error":"no existe"}),404
-    if p.estado != "approved":
-        return jsonify({"error":"no aprobado"}),400
-    return jsonify({"msg":"reenviado"})
+    if not p or p.estado != "approved":
+        return jsonify({"error": "no reenviable"}), 400
 
-# ------------------------------------
-# INICIO
-# ------------------------------------
-@app.route("/")
+    topic = f"{MQTT_TOPIC_PREFIX}/{p.dispenser_id}/dispense/{p.slot}"
+    print("REENVIAR MQTT:", topic)
+
+    return jsonify({"msg": "reenviado"})
+
+
+# --------------------------------------------------
+# SSE ONLINE/OFFLINE (Simple)
+# --------------------------------------------------
+
+@app.get("/api/events/stream")
+def sse():
+    sec = request.args.get("secret")
+    if sec != ADMIN_SECRET:
+        return Response("unauthorized", status=401)
+
+    def stream():
+        yield "data: {}\n\n"
+    return Response(stream(), mimetype="text/event-stream")
+
+
+# --------------------------------------------------
+# RUN
+# --------------------------------------------------
+
+@app.get("/")
 def home():
-    return "Dispen-Easy Backend OK"
-
-# ------------------------------------
-# RUN LOCAL
-# ------------------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    return "Dispen-Easy backend OK"
