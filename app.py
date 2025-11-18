@@ -289,6 +289,64 @@ def api_set_mp_mode():
 def api_dispensers_list():
     ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
     return jsonify([serialize_dispenser(d) for d in ds])
+@app.post("/api/dispensers")
+def api_dispensers_create():
+    try:
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("nombre") or "").strip()
+
+        # Generar device_id automático si no se envía
+        if not name:
+            # Buscar último dispen-X
+            all_d = Dispenser.query.order_by(Dispenser.id.asc()).all()
+            next_num = len(all_d) + 1
+            name = f"dispen-{next_num:02d}"
+
+        device_id = name  # device_id = nombre
+
+        # Crear dispenser
+        d = Dispenser(
+            device_id=device_id,
+            nombre=name,
+            activo=True
+        )
+        db.session.add(d)
+        db.session.commit()
+
+        # Crear productos automáticos
+        p1 = Producto(
+            dispenser_id=d.id,
+            nombre="Agua fría",
+            precio=0,
+            cantidad=0,
+            slot_id=1,
+            habilitado=False,
+        )
+        p2 = Producto(
+            dispenser_id=d.id,
+            nombre="Agua caliente",
+            precio=0,
+            cantidad=0,
+            slot_id=2,
+            habilitado=False,
+        )
+        db.session.add(p1)
+        db.session.add(p2)
+        db.session.commit()
+
+        return ok_json({
+            "ok": True,
+            "dispenser": serialize_dispenser(d),
+            "productos": [
+                serialize_producto(p1),
+                serialize_producto(p2)
+            ]
+        }, 201)
+
+    except Exception as e:
+        db.session.rollback()
+        return json_error("error creando dispenser", 500, str(e))
+
 
 @app.put("/api/dispensers/<int:did>")
 def api_dispensers_update(did):
