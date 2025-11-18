@@ -437,6 +437,30 @@ def api_pagos_reenviar(pid):
 
     return ok_json({"ok": True, "msg": "comando reenviado por MQTT"})
 
+# ---------------- Opciones de producto (para generar QR) ----------------
+@app.get("/api/productos/<int:pid>/opciones")
+def api_productos_opciones(pid):
+    prod = Producto.query.get_or_404(pid)
+    disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
+
+    # Si el producto o el dispenser están deshabilitados
+    if not prod.habilitado:
+        return json_error("no_disponible", 400)
+    if not disp or not disp.activo:
+        return json_error("dispenser no disponible", 400)
+
+    # Modelo simple: solo 1 “litro” = 1 servicio
+    options = [{
+        "litros": 1,
+        "disponible": True,
+        "precio_final": int(round(float(prod.precio)))
+    }]
+
+    return ok_json({
+        "ok": True,
+        "producto": serialize_producto(prod),
+        "opciones": options
+    })
 # ---------------- Crear preferencia MP ----------------
 
 @app.post("/api/pagos/preferencia")
