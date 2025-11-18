@@ -54,11 +54,10 @@ class Pago(db.Model):
     fecha = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ------------------------------
-# INICIALIZACIÓN AUTOMÁTICA
+# INICIALIZACIÓN (COMPATIBLE FLASK 3)
 # ------------------------------
 
-@app.before_first_request
-def setup():
+with app.app_context():
     db.create_all()
 
     d = Dispenser.query.filter_by(code="dispen-01").first()
@@ -67,6 +66,7 @@ def setup():
         db.session.add(d)
         db.session.commit()
 
+    # Crear dos slots simples
     for s in [1, 2]:
         p = Producto.query.filter_by(dispenser_id=d.id, slot=s).first()
         if not p:
@@ -85,6 +85,7 @@ def get_productos():
 
     d = Dispenser.query.filter_by(code="dispen-01").first()
     items = []
+
     for p in d.productos:
         items.append({
             "id": p.id,
@@ -92,6 +93,7 @@ def get_productos():
             "nombre": p.nombre,
             "precio": p.precio
         })
+
     return jsonify(items)
 
 
@@ -109,10 +111,11 @@ def guardar_producto(id):
     p.precio = data.get("precio", p.precio)
 
     db.session.commit()
+
     return jsonify({"ok": True})
 
 # ------------------------------
-# MERCADOPAGO: CREAR PREFERENCIA
+# MERCADOPAGO
 # ------------------------------
 
 @app.post("/api/pagos/preferencia")
@@ -221,15 +224,13 @@ def pagos():
         })
     return jsonify(lista)
 
-
 # ------------------------------
-# RUN
+# HOME
 # ------------------------------
 
 @app.get("/")
 def home():
-    return "Dispen-Easy backend OK"
-
+    return "Backend Dispen-Easy simple OK"
 
 if __name__ == "__main__":
     app.run()
