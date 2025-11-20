@@ -822,6 +822,150 @@ def oauth_callback():
     """
     return make_response(html, 200)
 
+# ============================================================
+#  OAuth MercadoPago – Vinculación de cuenta del comercio
+# ============================================================
+
+from urllib.parse import urlencode
+
+# Guarda un valor en KV (clave-valor)
+def kv_set(key, value):
+    row = KV.query.get(key)
+    if row:
+        row.value = value
+    else:
+        row = KV(key=key, value=value)
+        db.session.add(row)
+    db.session.commit()
+
+# Obtiene un valor de KV
+def kv_get(key, default=""):
+    row = KV.query.get(key)
+    return row.value if row else default
+
+
+# ------------------------------------------------------------
+# 1) INICIO DEL FLUJO OAUTH
+#    /api/mp/oauth/init
+# ------------------------------------------------------------
+@app.get("/api/mp/oauth/init")
+def mp_oauth_init():
+    """
+    Genera la URL de autorización de MercadoPago y redirige al usuario.
+    El usuario inicia sesión en su MP y otorga permisos.
+    """
+    client_id = os.getenv("MP_CLIENT_ID", "").strip()
+    client_secret = os.getenv("MP_CLIENT_SECRET", "").strip()
+
+    if not client_id or not client_secret:
+        return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
+
+    redirect_uri = f"{request.url_root.rstrip('/')}/api/mp/oauth/callback"
+
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "platform_id": "mp",
+        "redirect_uri": redirect_uri,
+    }
+
+    url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
+    return ok_json({"auth_url": url})
+
+
+# ------------------------------------------------------------
+# 2) CALLBACK DE MERCADOPAGO
+#    /api/mp/oauth/callback
+# ------------------------------------------------------------
+@app.get("/api/mp/oauth/callback")
+def mp_oauth_callback():
+    """
+    MercadoPago redirige acá con ?code=XXX
+    Intercambiamos ese code por:
+      - access_token
+      - refresh_token
+      - user_id
+    Luego los guardamos en KV.
+    """
+    code = request.args.get("code")
+    if not code:
+        return json_error("Falta code", 400)
+
+    client_id = os.getenv("MP_CLIENT_ID", "")
+    client_secret = os.getenv("MP_CLIENT_SECRET", "")
+    redirect_uri = f"{request.url_root.rstrip('/')}/api/mp/oauth/callback"
+
+    token_url = "https://api.mercadopago.com/oauth/token"
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+
+    try:
+        r = requests.post(token_url, json=payload, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        detail = getattr(e, "response", None)
+        return json_error("oauth_exchange_failed", 502, str(detail))
+
+    data = r.json() or {}
+
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    user_id = str(data.get("user_id"))
+
+    if not access_token:
+        return json_error("oauth_without_access_token", 500, data)
+
+    # Guardar en KV
+    kv_set("mp_oauth_access_token", access_token)
+    kv_set("mp_oauth_refresh_token", refresh_token or "")
+    kv_set("mp_oauth_user_id", user_id or "")
+
+    return """
+    <html>
+    <body style='font-family: sans-serif; background:#0b1220; color:#e5e7eb'>
+        <h2>Cuenta vinculada con éxito</h2>
+        <p>Ya puede cerrar esta ventana y volver al panel.</p>
+    </body>
+    </html>
+    """
+
+
+# ------------------------------------------------------------
+# 3) ESTADO DE VINCULACIÓN
+#    /api/mp/oauth/status
+# ------------------------------------------------------------
+@app.get("/api/mp/oauth/status")
+def mp_oauth_status():
+    """
+    Devuelve si hay una cuenta vinculada o no.
+    """
+    access_token = kv_get("mp_oauth_access_token", "")
+    user_id = kv_get("mp_oauth_user_id", "")
+
+    return ok_json({
+        "vinculado": bool(access_token),
+        "user_id": user_id,
+    })
+
+
+# ------------------------------------------------------------
+# 4) DESVINCULAR
+#    /api/mp/oauth/unlink
+# ------------------------------------------------------------
+@app.post("/api/mp/oauth/unlink")
+def mp_oauth_unlink():
+    """
+    Borra los tokens almacenados.
+    """
+    kv_set("mp_oauth_access_token", "")
+    kv_set("mp_oauth_refresh_token", "")
+    kv_set("mp_oauth_user_id", "")
+    return ok_json({"ok": True, "msg": "Cuenta desvinculada"})
 # ---------------- Página de gracias simple ----------------
 
 @app.get("/gracias")
