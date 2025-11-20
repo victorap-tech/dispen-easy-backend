@@ -768,12 +768,14 @@ def mp_oauth_init():
     if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
         return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
 
-   env_redirect = os.getenv("MP_REDIRECT_URI")
-if env_redirect:
-    redirect_uri = env_redirect
-else:
-    base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-    redirect_uri = f"{base}/api/mp/oauth/callback"
+    # Si el usuario configuró MP_REDIRECT_URI, usarlo
+    env_redirect = os.getenv("MP_REDIRECT_URI")
+    if env_redirect:
+        redirect_uri = env_redirect.strip()
+    else:
+        base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+        redirect_uri = f"{base}/api/mp/oauth/callback"
+
     params = {
         "client_id": MP_CLIENT_ID,
         "response_type": "code",
@@ -783,7 +785,7 @@ else:
 
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"url": url})
-
+    
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     """
