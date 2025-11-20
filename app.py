@@ -26,6 +26,9 @@ BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL", "") or "").rstrip("/")
 MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
 MP_ACCESS_TOKEN_LIVE = os.getenv("MP_ACCESS_TOKEN_LIVE", "").strip()
 
+MP_CLIENT_ID = os.getenv("MP_CLIENT_ID", "").strip()
+MP_CLIENT_SECRET = os.getenv("MP_CLIENT_SECRET", "").strip()
+
 MQTT_HOST = os.getenv("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883") or 1883)
 MQTT_USER = os.getenv("MQTT_USER", "")
