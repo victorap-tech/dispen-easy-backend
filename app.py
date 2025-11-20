@@ -1,4 +1,4 @@
-# app.py – Dispenser Agua (2 productos, sin litros/stock en la UI)
+# app.py – Dispenser Agua (2 productos, sin litros/stock en la UI, con OAuth MP para vincular cuenta del comercio)
 
 import os
 import logging
@@ -23,9 +23,11 @@ if DATABASE_URL.startswith("postgres://"):
 
 BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL", "") or "").rstrip("/")
 
+# Tokens "globales" (fallback). Si hay OAuth activo, se usa el de OAuth.
 MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
 MP_ACCESS_TOKEN_LIVE = os.getenv("MP_ACCESS_TOKEN_LIVE", "").strip()
 
+# Credenciales de OAuth (para el botón Vincular / Desvincular)
 MP_CLIENT_ID = os.getenv("MP_CLIENT_ID", "").strip()
 MP_CLIENT_SECRET = os.getenv("MP_CLIENT_SECRET", "").strip()
 
@@ -169,6 +171,20 @@ def serialize_producto(p: Producto) -> dict:
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
+# Helpers KV sencillos
+def kv_set(key, value):
+    row = KV.query.get(key)
+    if row:
+        row.value = value
+    else:
+        row = KV(key=key, value=value)
+        db.session.add(row)
+    db.session.commit()
+
+def kv_get(key, default=""):
+    row = KV.query.get(key)
+    return row.value if row else default
+
 # =========================
 # Auth simple para Admin
 # =========================
@@ -178,6 +194,8 @@ PUBLIC_PATHS = {
     "/api/config",
     "/api/pagos/preferencia",
     "/api/mp/webhook", "/webhook", "/mp/webhook",
+    "/api/mp/oauth/init",
+    "/api/mp/oauth/callback",
 }
 
 @app.before_request
@@ -202,7 +220,20 @@ def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
     return (row.value if row else "test").lower()
 
+def get_oauth_access_token() -> str:
+    """Token de la cuenta del comercio vinculada por OAuth (si existe)."""
+    return kv_get("mp_oauth_access_token", "").strip()
+
 def get_mp_token_and_base():
+    """
+    Prioridad:
+    1) Si hay token OAuth de comercio vinculado -> usarlo (API prod).
+    2) Si no, usar tokens globales según mp_mode (test/live).
+    """
+    oauth = get_oauth_access_token()
+    if oauth:
+        return oauth, "https://api.mercadopago.com"
+
     mode = get_mp_mode()
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
@@ -268,11 +299,18 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int
 
 @app.get("/")
 def health():
-    return ok_json({"status": "ok", "mp_mode": get_mp_mode()})
+    return ok_json({
+        "status": "ok",
+        "mp_mode": get_mp_mode(),
+        "oauth_linked": bool(get_oauth_access_token()),
+    })
 
 @app.get("/api/config")
 def api_config():
-    return ok_json({"mp_mode": get_mp_mode()})
+    return ok_json({
+        "mp_mode": get_mp_mode(),
+        "oauth_linked": bool(get_oauth_access_token()),
+    })
 
 @app.post("/api/mp/mode")
 def api_set_mp_mode():
@@ -301,14 +339,12 @@ def api_dispensers_create():
 
         # Generar device_id automático si no se envía
         if not name:
-            # Buscar último dispen-X
             all_d = Dispenser.query.order_by(Dispenser.id.asc()).all()
             next_num = len(all_d) + 1
             name = f"dispen-{next_num:02d}"
 
         device_id = name  # device_id = nombre
 
-        # Crear dispenser
         d = Dispenser(
             device_id=device_id,
             nombre=name,
@@ -350,7 +386,6 @@ def api_dispensers_create():
     except Exception as e:
         db.session.rollback()
         return json_error("error creando dispenser", 500, str(e))
-
 
 @app.put("/api/dispensers/<int:did>")
 def api_dispensers_update(did):
@@ -397,8 +432,10 @@ def api_productos_create():
     if precio <= 0:
         return json_error("precio debe ser > 0", 400)
 
-    if Producto.query.filter(Producto.dispenser_id == dispenser_id,
-                             Producto.slot_id == slot).first():
+    if Producto.query.filter(
+        Producto.dispenser_id == dispenser_id,
+        Producto.slot_id == slot
+    ).first():
         return json_error("slot ya usado en este dispenser", 409)
 
     p = Producto(
@@ -501,18 +538,21 @@ def api_pagos_reenviar(pid):
 
 # ---------------- Opciones de producto (para generar QR) ----------------
 
+@app.get("/api/productos/<int:pid>")
+def api_producto_detalle(pid):
+    prod = Producto.query.get_or_404(pid)
+    return ok_json(serialize_producto(prod))
+
 @app.get("/api/productos/<int:pid>/opciones")
 def api_productos_opciones(pid):
     prod = Producto.query.get_or_404(pid)
     disp = Dispenser.query.get(prod.dispenser_id) if prod.dispenser_id else None
 
-    # Si el producto o el dispenser están deshabilitados
     if not prod.habilitado:
         return json_error("no_disponible", 400)
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
 
-    # Modelo simple: solo 1 “litro” = 1 servicio
     options = [{
         "litros": 1,
         "disponible": True,
@@ -608,10 +648,8 @@ def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
     topic = args.get("topic") or body.get("type")
-    live_mode = bool(body.get("live_mode", True))
 
-    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
-    token, _ = get_mp_token_and_base()
+    token, base_api = get_mp_token_and_base()
     if not token:
         return "ok", 200
 
@@ -649,8 +687,7 @@ def mp_webhook():
     monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
     producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
 
-    # 🔒 Filtro: sólo pagos creados por el backend del dispenser
-    # (si no viene metadata mínima, lo ignoramos para no mezclar transferencias propias)
+    # Filtro: sólo pagos creados por el backend del dispenser
     if not (product_id and slot_id and dispenser_id):
         return "ok", 200
 
@@ -717,153 +754,25 @@ def mp_webhook_alias2():
     return mp_webhook()
 
 # ============================================================
-#          OAuth MercadoPago – Vincular / Desvincular
-# ============================================================
-
-from urllib.parse import urlencode
-
-MP_CLIENT_ID = os.getenv("MP_CLIENT_ID", "").strip()
-MP_CLIENT_SECRET = os.getenv("MP_CLIENT_SECRET", "").strip()
-
-def kv_set(key, value):
-    row = KV.query.get(key)
-    if not row:
-        row = KV(key=key, value=value)
-    else:
-        row.value = value
-    db.session.merge(row)
-    db.session.commit()
-
-def kv_get(key):
-    row = KV.query.get(key)
-    return row.value if row else None
-
-@app.get("/api/mp/oauth/status")
-def oauth_status():
-    access = kv_get("mp_oauth_access")
-    user = kv_get("mp_oauth_user")
-    active = bool(access)
-    return ok_json({
-        "active": active,
-        "user": user or ""
-    })
-
-@app.post("/api/mp/oauth/unlink")
-def oauth_unlink():
-    for k in ["mp_oauth_access", "mp_oauth_refresh", "mp_oauth_expires", "mp_oauth_user"]:
-        row = KV.query.get(k)
-        if row:
-            db.session.delete(row)
-    db.session.commit()
-    return ok_json({"ok": True, "msg": "Cuenta MercadoPago desvinculada"})
-
-@app.get("/api/mp/oauth/init")
-def oauth_init():
-    if not MP_CLIENT_ID:
-        return json_error("Falta MP_CLIENT_ID en variables de entorno", 500)
-
-    # URL donde MercadoPago va a devolver el código
-    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth/callback"
-
-    params = urlencode({
-        "client_id": MP_CLIENT_ID,
-        "response_type": "code",
-        "platform_id": "mp",
-        "redirect_uri": redirect_uri
-    })
-
-    auth_url = f"https://auth.mercadopago.com/authorization?{params}"
-    return ok_json({"url": auth_url})
-
-@app.get("/api/mp/oauth/callback")
-def oauth_callback():
-    code = request.args.get("code")
-    if not code:
-        return json_error("Falta code", 400)
-
-    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth/callback"
-
-    # Intercambiar el code por access_token
-    try:
-        r = requests.post(
-            "https://api.mercadopago.com/oauth/token",
-            json={
-                "client_id": MP_CLIENT_ID,
-                "client_secret": MP_CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-    except Exception as e:
-        return json_error("oauth_exchange_failed", 500, str(e))
-
-    tok = r.json() or {}
-    access = tok.get("access_token")
-    refresh = tok.get("refresh_token")
-    user_id = tok.get("user_id")
-    expires = tok.get("expires_in")
-
-    if not access:
-        return json_error("oauth_no_access_token", 500, tok)
-
-    kv_set("mp_oauth_access", access)
-    kv_set("mp_oauth_refresh", refresh or "")
-    kv_set("mp_oauth_user", str(user_id or ""))
-    kv_set("mp_oauth_expires", str(expires or ""))
-
-    html = """
-    <html><body style="background:#0b1220;color:#e5e7eb;font-family:Inter;">
-    <h1>Cuenta vinculada correctamente ✔</h1>
-    <p>Ya podés cerrar esta ventana y volver al panel.</p>
-    </body></html>
-    """
-    return make_response(html, 200)
-
-# ============================================================
 #  OAuth MercadoPago – Vinculación de cuenta del comercio
 # ============================================================
 
 from urllib.parse import urlencode
 
-# Guarda un valor en KV (clave-valor)
-def kv_set(key, value):
-    row = KV.query.get(key)
-    if row:
-        row.value = value
-    else:
-        row = KV(key=key, value=value)
-        db.session.add(row)
-    db.session.commit()
-
-# Obtiene un valor de KV
-def kv_get(key, default=""):
-    row = KV.query.get(key)
-    return row.value if row else default
-
-
-# ------------------------------------------------------------
-# 1) INICIO DEL FLUJO OAUTH
-#    /api/mp/oauth/init
-# ------------------------------------------------------------
 @app.get("/api/mp/oauth/init")
 def mp_oauth_init():
     """
-    Genera la URL de autorización de MercadoPago y redirige al usuario.
-    El usuario inicia sesión en su MP y otorga permisos.
+    Genera la URL de autorización de MercadoPago.
+    El comercio inicia sesión en su cuenta y otorga permisos.
     """
-    client_id = os.getenv("MP_CLIENT_ID", "").strip()
-    client_secret = os.getenv("MP_CLIENT_SECRET", "").strip()
-
-    if not client_id or not client_secret:
+    if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
         return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
 
-    redirect_uri = f"{request.url_root.rstrip('/')}/api/mp/oauth/callback"
+    base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    redirect_uri = f"{base}/api/mp/oauth/callback"
 
     params = {
-        "client_id": client_id,
+        "client_id": MP_CLIENT_ID,
         "response_type": "code",
         "platform_id": "mp",
         "redirect_uri": redirect_uri,
@@ -872,73 +781,68 @@ def mp_oauth_init():
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"auth_url": url})
 
-
-# ------------------------------------------------------------
-# 2) CALLBACK DE MERCADOPAGO
-#    /api/mp/oauth/callback
-# ------------------------------------------------------------
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     """
-    MercadoPago redirige acá con ?code=XXX
+    MercadoPago redirige acá con ?code=XXX.
     Intercambiamos ese code por:
       - access_token
       - refresh_token
       - user_id
-    Luego los guardamos en KV.
+    y los guardamos en KV.
     """
     code = request.args.get("code")
     if not code:
         return json_error("Falta code", 400)
 
-    client_id = os.getenv("MP_CLIENT_ID", "")
-    client_secret = os.getenv("MP_CLIENT_SECRET", "")
-    redirect_uri = f"{request.url_root.rstrip('/')}/api/mp/oauth/callback"
+    if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
+        return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
+
+    base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    redirect_uri = f"{base}/api/mp/oauth/callback"
 
     token_url = "https://api.mercadopago.com/oauth/token"
     payload = {
         "grant_type": "authorization_code",
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "client_id": MP_CLIENT_ID,
+        "client_secret": MP_CLIENT_SECRET,
         "code": code,
         "redirect_uri": redirect_uri,
     }
 
     try:
-        r = requests.post(token_url, json=payload, timeout=15)
+        r = requests.post(token_url, json=payload, timeout=20)
         r.raise_for_status()
     except Exception as e:
         detail = getattr(e, "response", None)
-        return json_error("oauth_exchange_failed", 502, str(detail))
+        txt = getattr(detail, "text", str(e)) if detail is not None else str(e)
+        return json_error("oauth_exchange_failed", 502, txt[:600])
 
     data = r.json() or {}
 
     access_token = data.get("access_token")
-    refresh_token = data.get("refresh_token")
-    user_id = str(data.get("user_id"))
+    refresh_token = data.get("refresh_token") or ""
+    user_id = str(data.get("user_id") or "")
+    expires = str(data.get("expires_in") or "")
 
     if not access_token:
         return json_error("oauth_without_access_token", 500, data)
 
-    # Guardar en KV
     kv_set("mp_oauth_access_token", access_token)
-    kv_set("mp_oauth_refresh_token", refresh_token or "")
-    kv_set("mp_oauth_user_id", user_id or "")
+    kv_set("mp_oauth_refresh_token", refresh_token)
+    kv_set("mp_oauth_user_id", user_id)
+    kv_set("mp_oauth_expires", expires)
 
-    return """
+    html = """
     <html>
-    <body style='font-family: sans-serif; background:#0b1220; color:#e5e7eb'>
-        <h2>Cuenta vinculada con éxito</h2>
-        <p>Ya puede cerrar esta ventana y volver al panel.</p>
-    </body>
+      <body style='font-family: system-ui; background:#0b1220; color:#e5e7eb'>
+        <h2>Cuenta MercadoPago vinculada con éxito ✔</h2>
+        <p>Ya podés cerrar esta ventana y volver al panel de administración.</p>
+      </body>
     </html>
     """
+    return make_response(html, 200)
 
-
-# ------------------------------------------------------------
-# 3) ESTADO DE VINCULACIÓN
-#    /api/mp/oauth/status
-# ------------------------------------------------------------
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
     """
@@ -946,26 +850,22 @@ def mp_oauth_status():
     """
     access_token = kv_get("mp_oauth_access_token", "")
     user_id = kv_get("mp_oauth_user_id", "")
-
     return ok_json({
         "vinculado": bool(access_token),
         "user_id": user_id,
     })
 
-
-# ------------------------------------------------------------
-# 4) DESVINCULAR
-#    /api/mp/oauth/unlink
-# ------------------------------------------------------------
 @app.post("/api/mp/oauth/unlink")
 def mp_oauth_unlink():
     """
-    Borra los tokens almacenados.
+    Borra los tokens almacenados (desvincula la cuenta).
     """
     kv_set("mp_oauth_access_token", "")
     kv_set("mp_oauth_refresh_token", "")
     kv_set("mp_oauth_user_id", "")
-    return ok_json({"ok": True, "msg": "Cuenta desvinculada"})
+    kv_set("mp_oauth_expires", "")
+    return ok_json({"ok": True, "msg": "Cuenta MercadoPago desvinculada"})
+
 # ---------------- Página de gracias simple ----------------
 
 @app.get("/gracias")
