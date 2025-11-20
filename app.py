@@ -787,64 +787,61 @@ else:
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     """
-    MercadoPago redirige acá con ?code=XXX.
-    Intercambiamos ese code por:
+    MercadoPago redirige a este endpoint con ?code=XXXX.
+    Con ese code obtenemos:
       - access_token
-      - refresh_token
-      - user_id
-    y los guardamos en KV.
+      - user_id (la cuenta del comerciante)
+    Y guardamos todo en la DB.
     """
+
     code = request.args.get("code")
     if not code:
         return json_error("Falta code", 400)
 
-    if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
-        return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
-
     base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     redirect_uri = f"{base}/api/mp/oauth/callback"
 
-    token_url = "https://api.mercadopago.com/oauth/token"
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": MP_CLIENT_ID,
-        "client_secret": MP_CLIENT_SECRET,
-        "code": code,
-        "redirect_uri": redirect_uri,
-    }
-
     try:
-        r = requests.post(token_url, json=payload, timeout=20)
+        r = requests.post(
+            "https://api.mercadopago.com/oauth/token",
+            json={
+                "client_id": MP_CLIENT_ID,
+                "client_secret": MP_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=20,
+        )
         r.raise_for_status()
-    except Exception as e:
-        detail = getattr(e, "response", None)
-        txt = getattr(detail, "text", str(e)) if detail is not None else str(e)
-        return json_error("oauth_exchange_failed", 502, txt[:600])
 
-    data = r.json() or {}
+    except Exception as e:
+        return json_error(f"Error OAuth token: {e}", 500)
+
+    data = r.json()
 
     access_token = data.get("access_token")
-    refresh_token = data.get("refresh_token") or ""
-    user_id = str(data.get("user_id") or "")
-    expires = str(data.get("expires_in") or "")
+    user_id = data.get("user_id")
 
     if not access_token:
-        return json_error("oauth_without_access_token", 500, data)
+        return json_error("No se recibió access_token", 500)
 
-    kv_set("mp_oauth_access_token", access_token)
-    kv_set("mp_oauth_refresh_token", refresh_token)
-    kv_set("mp_oauth_user_id", user_id)
-    kv_set("mp_oauth_expires", expires)
+    # Guardamos en DB
+    try:
+        db.session.query(Config).filter_by(key="mp_access_token").delete()
+        db.session.add(Config(key="mp_access_token", value=access_token))
 
-    html = """
-    <html>
-      <body style='font-family: system-ui; background:#0b1220; color:#e5e7eb'>
-        <h2>Cuenta MercadoPago vinculada con éxito ✔</h2>
-        <p>Ya podés cerrar esta ventana y volver al panel de administración.</p>
-      </body>
-    </html>
-    """
-    return make_response(html, 200)
+        db.session.query(Config).filter_by(key="mp_user_id").delete()
+        db.session.add(Config(key="mp_user_id", value=str(user_id)))
+
+        db.session.commit()
+    except Exception as e:
+        return json_error(f"Error guardando token: {e}", 500)
+
+    return ok_json({
+        "msg": "Cuenta de MercadoPago vinculada correctamente",
+        "user_id": user_id
+    })
 
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
