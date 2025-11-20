@@ -782,7 +782,7 @@ else:
     }
 
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
-    return ok_json({"auth_url": url})
+    return ok_json({"url": url})
 
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
