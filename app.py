@@ -289,6 +289,7 @@ def api_set_mp_mode():
 def api_dispensers_list():
     ds = Dispenser.query.order_by(Dispenser.id.asc()).all()
     return jsonify([serialize_dispenser(d) for d in ds])
+
 @app.post("/api/dispensers")
 def api_dispensers_create():
     try:
@@ -496,6 +497,7 @@ def api_pagos_reenviar(pid):
     return ok_json({"ok": True, "msg": "comando reenviado por MQTT"})
 
 # ---------------- Opciones de producto (para generar QR) ----------------
+
 @app.get("/api/productos/<int:pid>/opciones")
 def api_productos_opciones(pid):
     prod = Producto.query.get_or_404(pid)
@@ -519,6 +521,7 @@ def api_productos_opciones(pid):
         "producto": serialize_producto(prod),
         "opciones": options
     })
+
 # ---------------- Crear preferencia MP ----------------
 
 @app.post("/api/pagos/preferencia")
@@ -642,6 +645,11 @@ def mp_webhook():
     device_id = str(md.get("device_id") or "")
     monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
     producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
+
+    # 🔒 Filtro: sólo pagos creados por el backend del dispenser
+    # (si no viene metadata mínima, lo ignoramos para no mezclar transferencias propias)
+    if not (product_id and slot_id and dispenser_id):
+        return "ok", 200
 
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
