@@ -716,6 +716,112 @@ def mp_webhook_alias1():
 def mp_webhook_alias2():
     return mp_webhook()
 
+# ============================================================
+#          OAuth MercadoPago – Vincular / Desvincular
+# ============================================================
+
+from urllib.parse import urlencode
+
+MP_CLIENT_ID = os.getenv("MP_CLIENT_ID", "").strip()
+MP_CLIENT_SECRET = os.getenv("MP_CLIENT_SECRET", "").strip()
+
+def kv_set(key, value):
+    row = KV.query.get(key)
+    if not row:
+        row = KV(key=key, value=value)
+    else:
+        row.value = value
+    db.session.merge(row)
+    db.session.commit()
+
+def kv_get(key):
+    row = KV.query.get(key)
+    return row.value if row else None
+
+@app.get("/api/mp/oauth/status")
+def oauth_status():
+    access = kv_get("mp_oauth_access")
+    user = kv_get("mp_oauth_user")
+    active = bool(access)
+    return ok_json({
+        "active": active,
+        "user": user or ""
+    })
+
+@app.post("/api/mp/oauth/unlink")
+def oauth_unlink():
+    for k in ["mp_oauth_access", "mp_oauth_refresh", "mp_oauth_expires", "mp_oauth_user"]:
+        row = KV.query.get(k)
+        if row:
+            db.session.delete(row)
+    db.session.commit()
+    return ok_json({"ok": True, "msg": "Cuenta MercadoPago desvinculada"})
+
+@app.get("/api/mp/oauth/init")
+def oauth_init():
+    if not MP_CLIENT_ID:
+        return json_error("Falta MP_CLIENT_ID en variables de entorno", 500)
+
+    # URL donde MercadoPago va a devolver el código
+    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth/callback"
+
+    params = urlencode({
+        "client_id": MP_CLIENT_ID,
+        "response_type": "code",
+        "platform_id": "mp",
+        "redirect_uri": redirect_uri
+    })
+
+    auth_url = f"https://auth.mercadopago.com/authorization?{params}"
+    return ok_json({"url": auth_url})
+
+@app.get("/api/mp/oauth/callback")
+def oauth_callback():
+    code = request.args.get("code")
+    if not code:
+        return json_error("Falta code", 400)
+
+    redirect_uri = f"{BACKEND_BASE_URL}/api/mp/oauth/callback"
+
+    # Intercambiar el code por access_token
+    try:
+        r = requests.post(
+            "https://api.mercadopago.com/oauth/token",
+            json={
+                "client_id": MP_CLIENT_ID,
+                "client_secret": MP_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return json_error("oauth_exchange_failed", 500, str(e))
+
+    tok = r.json() or {}
+    access = tok.get("access_token")
+    refresh = tok.get("refresh_token")
+    user_id = tok.get("user_id")
+    expires = tok.get("expires_in")
+
+    if not access:
+        return json_error("oauth_no_access_token", 500, tok)
+
+    kv_set("mp_oauth_access", access)
+    kv_set("mp_oauth_refresh", refresh or "")
+    kv_set("mp_oauth_user", str(user_id or ""))
+    kv_set("mp_oauth_expires", str(expires or ""))
+
+    html = """
+    <html><body style="background:#0b1220;color:#e5e7eb;font-family:Inter;">
+    <h1>Cuenta vinculada correctamente ✔</h1>
+    <p>Ya podés cerrar esta ventana y volver al panel.</p>
+    </body></html>
+    """
+    return make_response(html, 200)
+
 # ---------------- Página de gracias simple ----------------
 
 @app.get("/gracias")
