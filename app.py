@@ -740,7 +740,7 @@ def mp_webhook():
             )
 
             if dev:
-                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros * 5))
+                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, max(30, p.litros * 5))
                 if published:
                     p.procesado = True
                     db.session.commit()
