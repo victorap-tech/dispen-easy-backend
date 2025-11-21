@@ -855,7 +855,7 @@ def mp_oauth_unlink():
 
 @app.get("/pagar/<int:slot>")
 def pagar_slot(slot):
-    # slot válido?
+    # slot válido? 1 = fría, 2 = caliente
     if slot not in (1, 2):
         return {"error": "slot inválido"}, 400
 
@@ -864,42 +864,59 @@ def pagar_slot(slot):
     if not prod:
         return {"error": "producto no encontrado"}, 404
 
-    # Crear preferencia nueva SIEMPRE
-    mp = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST"))
+    # Crear preferencia nueva SIEMPRE (para evitar errores de “ya pagaste”)
+    token = os.getenv("MP_ACCESS_TOKEN_TEST") or os.getenv("MP_ACCESS_TOKEN_LIVE")
+    if not token:
+        return {"error": "token MP no configurado"}, 500
+
+    # Configuracion de callback (WEBHOOK)
+    backend_base = os.getenv("BACKEND_BASE_URL") or request.url_root.rstrip("/")
+    notification_url = f"{backend_base}/api/mp/webhook"
+
     preference_data = {
         "items": [{
             "title": prod.nombre,
+            "description": f"Dispenser Agua Slot {slot}",
             "quantity": 1,
             "currency_id": "ARS",
-            "unit_price": float(prod.precio)
+            "unit_price": float(prod.precio),
         }],
-        "back_urls": {
-            "success": request.url_root + "pago/success",
-            "failure": request.url_root + "pago/failure",
-            "pending": request.url_root + "pago/pending",
+        "metadata": {
+            "slot_id": slot,
+            "product_id": prod.id,
+            "device_id": prod.dispenser_id,
+            "litros": 1    # No usamos litros pero dejamos 1 para compatibilidad
         },
-        "auto_return": "approved",
-        "notification_url": request.url_root + "api/mp/webhook"
+        "notification_url": notification_url,
+        "back_urls": {
+            "success": backend_base + "/gracias?status=success",
+            "failure": backend_base + "/gracias?status=failure",
+            "pending": backend_base + "/gracias?status=pending",
+        },
+        "auto_return": "approved"
     }
 
-    pref = mp.preference().create(preference_data)
-    init_point = pref["response"]["init_point"]
-    payment_id = pref["response"]["id"]
+    # Llamada directa a la API de MercadoPago
+    url = "https://api.mercadopago.com/checkout/preferences"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
 
-    # Guardar en DB
-    pago = Pago(
-        producto_id=prod.id,
-        slot_id=slot,
-        monto=prod.precio,
-        mp_preference_id=payment_id,
-        estado="pending"
-    )
+    r = requests.post(url, json=preference_data, headers=headers)
+    if r.status_code not in (200, 201):
+        return {"error": "mp_preference_failed", "detail": r.text}, 500
 
-    db.session.add(pago)
-    db.session.commit()
+    pref = r.json()
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
 
-    # Redirigir al link de pago
-    return redirect(init_point)
+    if not link:
+        return {"error": "sin_link", "pref": pref}, 500
+
+    return jsonify({
+        "ok": True,
+        "link": link
+    })
 
 # ---------------- Página de gracias simple ----------------
 
