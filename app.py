@@ -225,11 +225,6 @@ def get_oauth_access_token() -> str:
     return kv_get("mp_oauth_access_token", "").strip()
 
 def get_mp_token_and_base():
-    """
-    Prioridad:
-    1) Si hay token OAuth de comercio vinculado -> usarlo (API prod).
-    2) Si no, usar tokens globales según mp_mode (test/live).
-    """
     oauth = get_oauth_access_token()
     if oauth:
         return oauth, "https://api.mercadopago.com"
@@ -237,6 +232,8 @@ def get_mp_token_and_base():
     mode = get_mp_mode()
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
+
+    # Modo test → token test PERO usando la API normal
     return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
 
 # =========================
