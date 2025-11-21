@@ -642,39 +642,94 @@ def api_crear_preferencia():
 
 @app.post("/api/mp/webhook")
 def mp_webhook():
-    data = request.json
-    topic = data.get("topic")
-    res = data.get("resource") or data.get("id")
+    """
+    Webhook oficial de Mercado Pago.
+    Se activa cuando un pago cambia de estado.
+    """
+    try:
+        data = request.json or {}
+        app.logger.info(f"[WEBHOOK] recibido: {data}")
 
-    # Solo pagos (payment)
-    if topic != "payment":
+        # ------------------------------
+        # 1) Determinar si es evento payment
+        # ------------------------------
+        topic = data.get("type") or data.get("topic")
+        if topic not in ["payment", "merchant_order"]:
+            return "ok", 200
+
+        # MP envía a veces:
+        # { "type": "payment", "data": {"id": 12345} }
+        #
+        # Otras veces:
+        # { "topic": "payment", "resource": "https://api.mercadolibre.com/.../payments/12345" }
+
+        payment_id = None
+
+        if data.get("data") and data["data"].get("id"):
+            payment_id = data["data"]["id"]
+
+        if not payment_id and data.get("resource"):
+            # Extraer ID desde la URL resource
+            try:
+                payment_id = data["resource"].split("/")[-1]
+            except:
+                pass
+
+        if not payment_id:
+            app.logger.error("[WEBHOOK] No se pudo extraer payment_id")
+            return "ok", 200
+
+        payment_id = str(payment_id)
+
+        # ------------------------------
+        # 2) Consultar a MercadoPago el estado real del pago
+        # ------------------------------
+        access_token = os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST")
+        mp = mercadopago.SDK(access_token)
+
+        r = mp.payment().get(payment_id)
+        info = r["response"]
+
+        status = info.get("status")
+        app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status}")
+
+        # ------------------------------
+        # 3) Buscar el pago en la base
+        # ------------------------------
+        pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
+        if not pago:
+            app.logger.info("[WEBHOOK] Pago no encontrado en DB")
+            return "ok", 200
+
+        # ------------------------------
+        # 4) Manejar estados
+        # ------------------------------
+        if status == "approved":
+            pago.estado = "approved"
+            db.session.commit()
+
+            app.logger.info(f"[WEBHOOK] Pago aprobado, enviando comando MQTT → dev={pago.device_id}, slot={pago.slot_id}")
+
+            # ------------------------------
+            # 5) Enviar comando al ESP32
+            # ------------------------------
+            try:
+                send_dispense_cmd(
+                    dev=pago.device_id,
+                    slot=pago.slot_id,
+                    tiempo_segundos=23  # tiempo por defecto del dispenser de agua
+                )
+            except Exception as e:
+                app.logger.error(f"[MQTT] error al enviar comando: {e}")
+
+        else:
+            app.logger.info(f"[WEBHOOK] Pago con estado no-aprobado: {status}")
+
         return "ok", 200
 
-    # Obtener detalles del pago
-    mp = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST"))
-    payment_info = mp.payment().get(res)
-    status = payment_info["response"]["status"]
-    external_ref = payment_info["response"].get("external_reference")
-    payment_id = payment_info["response"]["id"]
-
-    # Buscar registro en DB
-    pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
-    if not pago:
+    except Exception as e:
+        app.logger.error(f"[WEBHOOK] ERROR: {e}")
         return "ok", 200
-
-    if status == "approved":
-        pago.estado = "approved"
-        db.session.commit()
-
-        # ENVIAR MQTT para dispensar
-        send_dispense_cmd(
-            dev=pago.device_id,
-            slot=pago.slot_id,
-            pago_id=pago.mp_payment_id,
-            tiempo_segundos=23  # Aquí ajustás
-        )
-
-    return "ok", 200
 @app.post("/webhook")
 def mp_webhook_alias1():
     return mp_webhook()
