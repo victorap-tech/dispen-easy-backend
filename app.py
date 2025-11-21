@@ -872,6 +872,54 @@ def mp_oauth_unlink():
     kv_set("mp_oauth_expires", "")
     return ok_json({"ok": True, "msg": "Cuenta MercadoPago desvinculada"})
 
+@app.get("/pagar/<int:slot>")
+def pagar_slot(slot):
+    # slot válido?
+    if slot not in (1, 2):
+        return {"error": "slot inválido"}, 400
+
+    # Buscar el producto por slot
+    prod = Producto.query.filter_by(slot_id=slot).first()
+    if not prod:
+        return {"error": "producto no encontrado"}, 404
+
+    # Crear preferencia nueva SIEMPRE
+    mp = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST"))
+    preference_data = {
+        "items": [{
+            "title": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(prod.precio)
+        }],
+        "back_urls": {
+            "success": request.url_root + "pago/success",
+            "failure": request.url_root + "pago/failure",
+            "pending": request.url_root + "pago/pending",
+        },
+        "auto_return": "approved",
+        "notification_url": request.url_root + "api/mp/webhook"
+    }
+
+    pref = mp.preference().create(preference_data)
+    init_point = pref["response"]["init_point"]
+    payment_id = pref["response"]["id"]
+
+    # Guardar en DB
+    pago = Pago(
+        producto_id=prod.id,
+        slot_id=slot,
+        monto=prod.precio,
+        mp_preference_id=payment_id,
+        estado="pending"
+    )
+
+    db.session.add(pago)
+    db.session.commit()
+
+    # Redirigir al link de pago
+    return redirect(init_point)
+
 # ---------------- Página de gracias simple ----------------
 
 @app.get("/gracias")
