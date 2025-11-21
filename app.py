@@ -617,13 +617,13 @@ def api_crear_preferencia():
 
     try:
         r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=20,
+           "https://api.mercadopago.com/checkout/preferences",
+           headers={
+             "Authorization": f"Bearer {token}",
+             "Content-Type": "application/json",
+           },
+           json=body,
+           timeout=20,
         )
         r.raise_for_status()
     except Exception as e:
