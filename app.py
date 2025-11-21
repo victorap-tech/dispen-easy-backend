@@ -644,15 +644,17 @@ def api_crear_preferencia():
 def mp_webhook():
     body = request.get_json(silent=True) or {}
     args = request.args or {}
-    topic = args.get("topic") or body.get("type")
 
-    token, base_api = get_mp_token_and_base()
-    if not token:
-        return "ok", 200
+    app.logger.info(f"[WEBHOOK] recibido: body={body} args={args}")
+
+    topic = args.get("topic") or body.get("type")
+    live_mode = bool(body.get("live_mode", True))
+    base_api = "https://api.mercadopago.com" if live_mode else "https://api.sandbox.mercadopago.com"
+    token, _ = get_mp_token_and_base()
 
     payment_id = None
     if topic == "payment":
-        if isinstance(body.get("resource"), str):
+        if "resource" in body and isinstance(body["resource"], str):
             try:
                 payment_id = body["resource"].rstrip("/").split("/")[-1]
             except Exception:
@@ -660,33 +662,34 @@ def mp_webhook():
         payment_id = payment_id or (body.get("data") or {}).get("id") or args.get("id")
 
     if not payment_id:
+        app.logger.info("[WEBHOOK] sin payment_id, OK")
         return "ok", 200
 
     try:
         r_pay = requests.get(
             f"{base_api}/v1/payments/{payment_id}",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
+            timeout=15
         )
         r_pay.raise_for_status()
-    except Exception:
+    except Exception as e:
+        app.logger.error(f"[WEBHOOK] error consultando payment {payment_id}: {e}")
         return "ok", 200
 
     pay = r_pay.json() or {}
+    app.logger.info(f"[WEBHOOK] pago obtenido: {pay}")
+
     estado = (pay.get("status") or "").lower()
     md = pay.get("metadata") or {}
 
     product_id = _to_int(md.get("product_id") or 0)
     slot_id = _to_int(md.get("slot_id") or 0)
-    litros = _to_int(md.get("litros") or 1)
+    litros = _to_int(md.get("litros") or 0)
     dispenser_id = _to_int(md.get("dispenser_id") or 0)
     device_id = str(md.get("device_id") or "")
     monto = _to_int(md.get("precio_final") or 0) or _to_int(pay.get("transaction_amount") or 0)
-    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
 
-    # Filtro: sólo pagos creados por el backend del dispenser
-    if not (product_id and slot_id and dispenser_id):
-        return "ok", 200
+    producto_txt = (md.get("producto") or pay.get("description") or "")[:120]
 
     p = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if not p:
@@ -697,12 +700,12 @@ def mp_webhook():
             dispensado=False,
             procesado=False,
             slot_id=slot_id,
-            litros=litros or 1,
+            litros=litros if litros > 0 else 1,
             monto=monto,
             product_id=product_id,
             dispenser_id=dispenser_id,
             device_id=device_id,
-            raw=pay,
+            raw=pay
         )
         db.session.add(p)
     else:
@@ -710,7 +713,7 @@ def mp_webhook():
         p.producto = producto_txt or p.producto
         p.slot_id = p.slot_id or slot_id
         p.product_id = p.product_id or product_id
-        p.litros = p.litros or (litros or 1)
+        p.litros = p.litros or (litros if litros > 0 else p.litros)
         p.monto = p.monto or monto
         p.dispenser_id = p.dispenser_id or dispenser_id
         p.device_id = p.device_id or device_id
@@ -718,13 +721,13 @@ def mp_webhook():
 
     try:
         db.session.commit()
-    except Exception:
+    except Exception as e:
+        app.logger.error(f"[WEBHOOK] error guardando pago {payment_id}: {e}")
         db.session.rollback()
         return "ok", 200
 
-    # Enviar comando al ESP si está approved
     try:
-        if p.estado == "approved" and not p.dispensado and not p.procesado and p.slot_id:
+        if p.estado == "approved" and not p.dispensado and not p.procesado and p.slot_id and p.litros:
             dev = p.device_id
             if not dev and p.product_id:
                 pr = Producto.query.get(p.product_id)
@@ -732,13 +735,17 @@ def mp_webhook():
                     d = Dispenser.query.get(pr.dispenser_id)
                     dev = d.device_id if d else ""
 
+            app.logger.info(
+                f"[MQTT] enviando comando: dev={dev}, slot={p.slot_id}, litros={p.litros}, payment_id={p.mp_payment_id}"
+            )
+
             if dev:
-                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros or 1)
+                published = send_dispense_cmd(dev, p.mp_payment_id, p.slot_id, p.litros, timeout_s=max(30, p.litros * 5))
                 if published:
                     p.procesado = True
                     db.session.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        app.logger.error(f"[MQTT] error al enviar comando: {e}")
 
     return "ok", 200
 
