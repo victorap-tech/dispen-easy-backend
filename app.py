@@ -237,7 +237,7 @@ def get_mp_token_and_base():
     mode = get_mp_mode()
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-    return MP_ACCESS_TOKEN_TEST, "https://api.sandbox.mercadopago.com"
+    return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
 
 # =========================
 # MQTT
