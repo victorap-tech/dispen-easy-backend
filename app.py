@@ -226,6 +226,11 @@ def get_oauth_access_token() -> str:
     return kv_get("mp_oauth_access_token", "").strip()
 
 def get_mp_token_and_base():
+    """
+    Devuelve (access_token, base_url_api) usando:
+    - OAuth si está vinculado
+    - tokens LIVE / TEST como fallback
+    """
     oauth = get_oauth_access_token()
     if oauth:
         return oauth, "https://api.mercadopago.com"
@@ -234,7 +239,7 @@ def get_mp_token_and_base():
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
 
-    # Modo test → token test PERO usando la API normal
+    # Modo test → token test pero misma API
     return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
 
 # =========================
@@ -277,12 +282,19 @@ def start_mqtt_background():
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
+    """
+    Publica el comando de dispensado al ESP32.
+    - device_id: ej. "dispen-01"
+    - payment_id: id de MP (string)
+    - slot_id: 1 = fría, 2 = caliente
+    - litros: acá lo usamos como “porciones/tiempo”
+    """
     if not MQTT_HOST:
         return False
     payload = _json.dumps({
         "payment_id": str(payment_id),
         "slot_id": int(slot_id),
-        "litros": int(litros or 1),   # el ESP lo interpreta como “porciones/tiempo”
+        "litros": int(litros or 1),
     })
     with _mqtt_lock:
         if not _mqtt_client:
@@ -505,6 +517,7 @@ def api_pagos_list():
             "litros": p.litros,
             "monto": p.monto,
             "dispensado": bool(p.dispensado),
+            "procesado": bool(p.procesado),
             "created_at": p.created_at.isoformat() if p.created_at else None,
         }
         for p in pagos
@@ -515,8 +528,8 @@ def api_pagos_reenviar(pid):
     p = Pago.query.get_or_404(pid)
     if p.estado != "approved":
         return json_error("solo pagos approved se pueden reenviar", 400)
-    if not p.slot_id or not (p.device_id or p.dispenser_id):
-        return json_error("pago sin slot o dispenser", 400)
+    if not p.slot_id:
+        return json_error("pago sin slot", 400)
 
     device = p.device_id
     if not device and p.product_id:
@@ -528,8 +541,8 @@ def api_pagos_reenviar(pid):
     if not device:
         return json_error("sin device_id asociado", 400)
 
-    published = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.litros or 1)
-    if not published:
+    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.litros or 1)
+    if not ok:
         return json_error("no se pudo publicar MQTT", 500)
 
     return ok_json({"ok": True, "msg": "comando reenviado por MQTT"})
@@ -563,10 +576,14 @@ def api_productos_opciones(pid):
         "opciones": options
     })
 
-# ---------------- Crear preferencia MP ----------------
+# ---------------- Crear preferencia MP (para botón "Generar QR") ----------------
 
 @app.post("/api/pagos/preferencia")
 def api_crear_preferencia():
+    """
+    Crea una preferencia nueva PARA ESE PRODUCTO.
+    El admin la usa una vez para generar el link/QR que va pegado en el dispenser.
+    """
     data = request.get_json(silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
@@ -618,7 +635,7 @@ def api_crear_preferencia():
 
     try:
         r = requests.post(
-           "https://api.mercadopago.com/checkout/preferences",
+           f"{base_api}/checkout/preferences",
            headers={
              "Authorization": f"Bearer {token}",
              "Content-Type": "application/json",
@@ -644,36 +661,29 @@ def api_crear_preferencia():
 @app.post("/api/mp/webhook")
 def mp_webhook():
     """
-    Webhook oficial de Mercado Pago.
-    Se activa cuando un pago cambia de estado.
+    Webhook oficial de MercadoPago.
+    - Valida que el evento sea de tipo "payment"
+    - Consulta el pago en MP
+    - Crea/actualiza el registro Pago en la DB
+    - Si está "approved", dispara el comando MQTT al ESP32 (si aún no fue procesado)
     """
     try:
         data = request.json or {}
         app.logger.info(f"[WEBHOOK] recibido: {data}")
 
-        # ------------------------------
-        # 1) Determinar si es evento payment
-        # ------------------------------
         topic = data.get("type") or data.get("topic")
-        if topic not in ["payment", "merchant_order"]:
+        if topic not in ("payment", "merchant_order"):
             return "ok", 200
 
-        # MP envía a veces:
-        # { "type": "payment", "data": {"id": 12345} }
-        #
-        # Otras veces:
-        # { "topic": "payment", "resource": "https://api.mercadolibre.com/.../payments/12345" }
-
+        # --- Obtener payment_id ---
         payment_id = None
-
-        if data.get("data") and data["data"].get("id"):
+        if isinstance(data.get("data"), dict) and data["data"].get("id"):
             payment_id = data["data"]["id"]
 
         if not payment_id and data.get("resource"):
-            # Extraer ID desde la URL resource
             try:
                 payment_id = data["resource"].split("/")[-1]
-            except:
+            except Exception:
                 pass
 
         if not payment_id:
@@ -682,55 +692,110 @@ def mp_webhook():
 
         payment_id = str(payment_id)
 
-        # ------------------------------
-        # 2) Consultar a MercadoPago el estado real del pago
-        # ------------------------------
-        access_token = os.getenv("MP_ACCESS_TOKEN_LIVE") or os.getenv("MP_ACCESS_TOKEN_TEST")
-        mp = mercadopago.SDK(access_token)
-
-        r = mp.payment().get(payment_id)
-        info = r["response"]
-
-        status = info.get("status")
-        app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status}")
-
-        # ------------------------------
-        # 3) Buscar el pago en la base
-        # ------------------------------
-        pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
-        if not pago:
-            app.logger.info("[WEBHOOK] Pago no encontrado en DB")
+        # --- Consultar pago en MP ---
+        token, _ = get_mp_token_and_base()
+        if not token:
+            app.logger.error("[WEBHOOK] MP token no configurado")
             return "ok", 200
 
-        # ------------------------------
-        # 4) Manejar estados
-        # ------------------------------
-        if status == "approved":
-            pago.estado = "approved"
-            db.session.commit()
+        try:
+            mp = mercadopago.SDK(token)
+            r = mp.payment().get(payment_id)
+            info = r.get("response") or {}
+        except Exception as e:
+            app.logger.error(f"[WEBHOOK] Error consultando MP: {e}")
+            return "ok", 200
 
-            app.logger.info(f"[WEBHOOK] Pago aprobado, enviando comando MQTT → dev={pago.device_id}, slot={pago.slot_id}")
+        status = (info.get("status") or "").lower()
+        metadata = info.get("metadata") or {}
+        app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
 
-            # ------------------------------
-            # 5) Enviar comando al ESP32
-            # ------------------------------
-            try:
-                send_dispense_cmd(
-                    dev=pago.device_id,
-                    slot=pago.slot_id,
-                    tiempo_segundos=23  # tiempo por defecto del dispenser de agua
-                )
-            except Exception as e:
-                app.logger.error(f"[MQTT] error al enviar comando: {e}")
+        # --- Extraer datos relevantes ---
+        product_id   = _to_int(metadata.get("product_id") or 0)
+        slot_id      = _to_int(metadata.get("slot_id") or 0)
+        dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
+        device_id    = (metadata.get("device_id") or "").strip()
+        litros       = _to_int(metadata.get("litros") or 1) or 1
+        producto_nom = metadata.get("producto") or info.get("description") or ""
+        monto        = int(round(float(info.get("transaction_amount") or metadata.get("precio_final") or 0)))
 
+        # --- Crear / actualizar Pago en DB ---
+        pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
+        if not pago:
+            pago = Pago(
+                mp_payment_id=payment_id,
+                estado=status,
+                producto=producto_nom,
+                dispensado=False,
+                procesado=False,
+                slot_id=slot_id,
+                litros=litros,
+                monto=monto,
+                product_id=product_id,
+                dispenser_id=dispenser_id,
+                device_id=device_id,
+                raw=info,
+            )
+            db.session.add(pago)
         else:
-            app.logger.info(f"[WEBHOOK] Pago con estado no-aprobado: {status}")
+            pago.estado = status
+            if producto_nom:
+                pago.producto = producto_nom
+            if slot_id:
+                pago.slot_id = slot_id
+            if litros:
+                pago.litros = litros
+            if monto:
+                pago.monto = monto
+            if product_id:
+                pago.product_id = product_id
+            if dispenser_id:
+                pago.dispenser_id = dispenser_id
+            if device_id:
+                pago.device_id = device_id
+            pago.raw = info
+
+        db.session.commit()
+
+        # --- Si aprobado, enviar comando MQTT ---
+        if status == "approved":
+            # Resolver device_id si viene vacío en metadata
+            if not device_id:
+                if pago.device_id:
+                    device_id = pago.device_id
+                elif pago.product_id:
+                    prod = Producto.query.get(pago.product_id)
+                    if prod and prod.dispenser_id:
+                        d = Dispenser.query.get(prod.dispenser_id)
+                        if d:
+                            device_id = d.device_id
+
+            if not slot_id:
+                slot_id = pago.slot_id
+
+            if device_id and slot_id:
+                if not pago.procesado:
+                    ok = send_dispense_cmd(device_id, payment_id, slot_id, pago.litros or 1)
+                    if ok:
+                        pago.procesado = True
+                        db.session.commit()
+                        app.logger.info(f"[WEBHOOK] MQTT enviado OK → dev={device_id}, slot={slot_id}")
+                    else:
+                        app.logger.error("[WEBHOOK] Error publicando MQTT")
+                else:
+                    app.logger.info("[WEBHOOK] Pago ya estaba procesado, no se reenvía automático")
+            else:
+                app.logger.error("[WEBHOOK] Falta device_id o slot_id, no se envía comando MQTT")
+        else:
+            app.logger.info(f"[WEBHOOK] Pago con estado {status}, no se dispara MQTT")
 
         return "ok", 200
 
     except Exception as e:
         app.logger.error(f"[WEBHOOK] ERROR: {e}")
+        db.session.rollback()
         return "ok", 200
+
 @app.post("/webhook")
 def mp_webhook_alias1():
     return mp_webhook()
@@ -754,7 +819,6 @@ def mp_oauth_init():
     if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
         return json_error("Faltan MP_CLIENT_ID o MP_CLIENT_SECRET", 500)
 
-    # Si el usuario configuró MP_REDIRECT_URI, usarlo
     env_redirect = os.getenv("MP_REDIRECT_URI")
     if env_redirect:
         redirect_uri = env_redirect.strip()
@@ -771,17 +835,14 @@ def mp_oauth_init():
 
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"url": url})
-    
+
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     """
     MercadoPago redirige a este endpoint con ?code=XXXX.
-    Con ese code obtenemos:
-      - access_token
-      - user_id (la cuenta del comerciante)
-    Y guardamos todo en la DB.
+    Con ese code obtenemos access_token y user_id
+    y los guardamos en KV.
     """
-
     code = request.args.get("code")
     if not code:
         return json_error("Falta code", 400)
@@ -802,34 +863,36 @@ def mp_oauth_callback():
             timeout=20,
         )
         r.raise_for_status()
-
     except Exception as e:
         return json_error(f"Error OAuth token: {e}", 500)
 
-    data = r.json()
-
-    access_token = data.get("access_token")
-    user_id = data.get("user_id")
+    data = r.json() or {}
+    access_token  = data.get("access_token")
+    refresh_token = data.get("refresh_token", "")
+    user_id       = data.get("user_id")
+    expires_in    = data.get("expires_in")
 
     if not access_token:
         return json_error("No se recibió access_token", 500)
 
-    # Guardamos en DB
-    try:
-        db.session.query(Config).filter_by(key="mp_access_token").delete()
-        db.session.add(Config(key="mp_access_token", value=access_token))
+    kv_set("mp_oauth_access_token", access_token)
+    kv_set("mp_oauth_refresh_token", refresh_token or "")
+    kv_set("mp_oauth_user_id", str(user_id or ""))
+    kv_set("mp_oauth_expires", str(expires_in or ""))
 
-        db.session.query(Config).filter_by(key="mp_user_id").delete()
-        db.session.add(Config(key="mp_user_id", value=str(user_id)))
-
-        db.session.commit()
-    except Exception as e:
-        return json_error(f"Error guardando token: {e}", 500)
-
-    return ok_json({
-        "msg": "Cuenta de MercadoPago vinculada correctamente",
-        "user_id": user_id
-    })
+    html = """<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"/><title>Vinculación exitosa</title></head>
+<body style="font-family:sans-serif;background:#0b1220;color:#e5e7eb">
+<div style="max-width:480px;margin:15vh auto;padding:16px;border-radius:12px;background:rgba(255,255,255,.05)">
+<h2>Cuenta vinculada</h2>
+<p>La cuenta de Mercado Pago se vinculó correctamente. Ya podés cerrar esta ventana y volver al panel de administración.</p>
+</div>
+</body>
+</html>"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
 
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
@@ -853,71 +916,6 @@ def mp_oauth_unlink():
     kv_set("mp_oauth_user_id", "")
     kv_set("mp_oauth_expires", "")
     return ok_json({"ok": True, "msg": "Cuenta MercadoPago desvinculada"})
-
-@app.get("/pagar/<int:slot>")
-def pagar_slot(slot):
-    # slot válido? 1 = fría, 2 = caliente
-    if slot not in (1, 2):
-        return {"error": "slot inválido"}, 400
-
-    # Buscar el producto por slot
-    prod = Producto.query.filter_by(slot_id=slot).first()
-    if not prod:
-        return {"error": "producto no encontrado"}, 404
-
-    # Crear preferencia nueva SIEMPRE (para evitar errores de “ya pagaste”)
-    token = os.getenv("MP_ACCESS_TOKEN_TEST") or os.getenv("MP_ACCESS_TOKEN_LIVE")
-    if not token:
-        return {"error": "token MP no configurado"}, 500
-
-    # Configuracion de callback (WEBHOOK)
-    backend_base = os.getenv("BACKEND_BASE_URL") or request.url_root.rstrip("/")
-    notification_url = f"{backend_base}/api/mp/webhook"
-
-    preference_data = {
-        "items": [{
-            "title": prod.nombre,
-            "description": f"Dispenser Agua Slot {slot}",
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(prod.precio),
-        }],
-        "metadata": {
-            "slot_id": slot,
-            "product_id": prod.id,
-            "device_id": prod.dispenser_id,
-            "litros": 1    # No usamos litros pero dejamos 1 para compatibilidad
-        },
-        "notification_url": notification_url,
-        "back_urls": {
-            "success": backend_base + "/gracias?status=success",
-            "failure": backend_base + "/gracias?status=failure",
-            "pending": backend_base + "/gracias?status=pending",
-        },
-        "auto_return": "approved"
-    }
-
-    # Llamada directa a la API de MercadoPago
-    url = "https://api.mercadopago.com/checkout/preferences"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    r = requests.post(url, json=preference_data, headers=headers)
-    if r.status_code not in (200, 201):
-        return {"error": "mp_preference_failed", "detail": r.text}, 500
-
-    pref = r.json()
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-
-    if not link:
-        return {"error": "sin_link", "pref": pref}, 500
-
-    return jsonify({
-        "ok": True,
-        "link": link
-    })
 
 # ---------------- Página de gracias simple ----------------
 
