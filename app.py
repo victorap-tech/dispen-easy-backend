@@ -23,6 +23,7 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL", "") or "").rstrip("/")
+WEB_URL = os.getenv("WEB_URL", BACKEND_BASE_URL)
 
 # Tokens "globales" (fallback). Si hay OAuth activo, se usa el de OAuth.
 MP_ACCESS_TOKEN_TEST = os.getenv("MP_ACCESS_TOKEN_TEST", "").strip()
@@ -629,9 +630,9 @@ def crear_preferencia_api():
         "external_reference": external_reference,
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{WEB_URL}/gracias?status=success",
-            "failure": f"{WEB_URL}/gracias?status=failure",
-            "pending": f"{WEB_URL}/gracias?status=pending",
+          "success": f"{backend_url}/gracias",
+          "failure": f"{backend_url}/gracias",
+          "pending": f"{backend_url}/gracias"
         },
         "notification_url": f"{backend_url}/api/mp/webhook",
         "statement_descriptor": "DISPENSER-AGUA"
