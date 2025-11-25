@@ -9,8 +9,7 @@ from typing import Optional
 import requests
 import paho.mqtt.client as mqtt
 import mercadopago
-from flask import Flask, jsonify, request, make_response, 
-redirect
+from flask import Flask, jsonify, request, make_response, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
@@ -210,7 +209,7 @@ def _auth_guard():
     # Rutas públicas
     if (
         p in PUBLIC_PATHS
-        or p.startswith("/qr/")          # ← NUEVO: que los QR sean públicos
+        or p.startswith("/qr/")          # ← los QR son públicos
     ):
         return None
 
@@ -608,7 +607,7 @@ def crear_preferencia_api():
     # Precio directo del producto
     monto_final = int(prod.precio)
 
-    # 🔥 Clave para QR infinito: agregar timestamp para evitar cache de MP
+    # 🔥 Clave para QR infinito a nivel MP (evitar cache de pref):
     ts = int(time.time())
     external_reference = (
         f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
@@ -669,14 +668,106 @@ def crear_preferencia_api():
 
 # ---------------- Webhook MercadoPago ----------------
 
+def _procesar_pago_desde_info(payment_id: str, info: dict):
+    """
+    Lógica común para crear/actualizar Pago + disparar MQTT.
+    """
+    status_raw = info.get("status")
+    status = str(status_raw).lower() if status_raw is not None else ""
+    metadata = info.get("metadata") or {}
+    app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
+
+    # --- Extraer datos relevantes ---
+    product_id   = _to_int(metadata.get("product_id") or 0)
+    slot_id_md   = _to_int(metadata.get("slot_id") or 0)
+    dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
+    device_id_md = (metadata.get("device_id") or "").strip()
+    litros_md    = _to_int(metadata.get("litros") or 1) or 1
+    producto_nom = metadata.get("producto") or info.get("description") or ""
+    monto_val    = info.get("transaction_amount") or metadata.get("precio_final") or 0
+    try:
+        monto = int(round(float(monto_val)))
+    except Exception:
+        monto = 0
+
+    # --- Crear / actualizar Pago en DB ---
+    pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
+    if not pago:
+        pago = Pago(
+            mp_payment_id=payment_id,
+            estado=status,
+            producto=producto_nom,
+            dispensado=False,
+            procesado=False,
+            slot_id=slot_id_md,
+            litros=litros_md,
+            monto=monto,
+            product_id=product_id,
+            dispenser_id=dispenser_id,
+            device_id=device_id_md,
+            raw=info,
+        )
+        db.session.add(pago)
+    else:
+        pago.estado = status or pago.estado
+        if producto_nom:
+            pago.producto = producto_nom
+        if slot_id_md:
+            pago.slot_id = slot_id_md
+        if litros_md:
+            pago.litros = litros_md
+        if monto:
+            pago.monto = monto
+        if product_id:
+            pago.product_id = product_id
+        if dispenser_id:
+            pago.dispenser_id = dispenser_id
+        if device_id_md:
+            pago.device_id = device_id_md
+        pago.raw = info
+
+    db.session.commit()
+
+    # --- Si aprobado, enviar comando MQTT ---
+    if status == "approved":
+        device_id = device_id_md or pago.device_id
+        slot_id = slot_id_md or pago.slot_id
+
+        # Resolver device_id si aún está vacío
+        if not device_id and pago.product_id:
+            prod = Producto.query.get(pago.product_id)
+            if prod and prod.dispenser_id:
+                d = Dispenser.query.get(prod.dispenser_id)
+                if d:
+                    device_id = d.device_id
+
+        if not slot_id:
+            slot_id = pago.slot_id
+
+        if device_id and slot_id:
+            if not pago.procesado:
+                ok = send_dispense_cmd(device_id, payment_id, slot_id, pago.litros or 1)
+                if ok:
+                    pago.procesado = True
+                    db.session.commit()
+                    app.logger.info(f"[WEBHOOK] MQTT enviado OK → dev={device_id}, slot={slot_id}")
+                else:
+                    app.logger.error("[WEBHOOK] Error publicando MQTT")
+            else:
+                app.logger.info("[WEBHOOK] Pago ya estaba procesado, no se reenvía automático")
+        else:
+            app.logger.error("[WEBHOOK] Falta device_id o slot_id, no se envía comando MQTT")
+    else:
+        app.logger.info(f"[WEBHOOK] Pago con estado {status}, no se dispara MQTT")
+
+
 @app.post("/api/mp/webhook")
 def mp_webhook():
     """
     Webhook oficial de MercadoPago.
-    - Valida que el evento sea de tipo "payment"
-    - Consulta el pago en MP
-    - Crea/actualiza el registro Pago en la DB
-    - Si está "approved", dispara el comando MQTT al ESP32 (si aún no fue procesado)
+    - Soporta eventos "payment" y "merchant_order".
+    - Para "payment": consulta directamente ese pago.
+    - Para "merchant_order": obtiene la orden y procesa todos los pagos asociados.
     """
     try:
         data = request.json or {}
@@ -686,120 +777,84 @@ def mp_webhook():
         if topic not in ("payment", "merchant_order"):
             return "ok", 200
 
-        # --- Obtener payment_id ---
-        payment_id = None
-        if isinstance(data.get("data"), dict) and data["data"].get("id"):
-            payment_id = data["data"]["id"]
-
-        if not payment_id and data.get("resource"):
-            try:
-                payment_id = data["resource"].split("/")[-1]
-            except Exception:
-                pass
-
-        if not payment_id:
-            app.logger.error("[WEBHOOK] No se pudo extraer payment_id")
-            return "ok", 200
-
-        payment_id = str(payment_id)
-
-        # --- Consultar pago en MP ---
         token, _ = get_mp_token_and_base()
         if not token:
             app.logger.error("[WEBHOOK] MP token no configurado")
             return "ok", 200
 
-        try:
-            mp = mercadopago.SDK(token)
-            r = mp.payment().get(payment_id)
-            info = r.get("response") or {}
-        except Exception as e:
-            app.logger.error(f"[WEBHOOK] Error consultando MP: {e}")
-            return "ok", 200
+        mp_sdk = mercadopago.SDK(token)
 
-        status_raw = info.get("status")
-        status = str(status_raw).lower() if status_raw is not None else ""
-        metadata = info.get("metadata") or {}
-        app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
+        if topic == "payment":
+            # --- Obtener payment_id ---
+            payment_id = None
+            if isinstance(data.get("data"), dict) and data["data"].get("id"):
+                payment_id = data["data"]["id"]
 
-        # --- Extraer datos relevantes ---
-        product_id   = _to_int(metadata.get("product_id") or 0)
-        slot_id      = _to_int(metadata.get("slot_id") or 0)
-        dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
-        device_id    = (metadata.get("device_id") or "").strip()
-        litros       = _to_int(metadata.get("litros") or 1) or 1
-        producto_nom = metadata.get("producto") or info.get("description") or ""
-        monto        = int(round(float(info.get("transaction_amount") or metadata.get("precio_final") or 0)))
+            if not payment_id and data.get("resource"):
+                try:
+                    payment_id = data["resource"].split("/")[-1]
+                except Exception:
+                    pass
 
-        # --- Crear / actualizar Pago en DB ---
-        pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
-        if not pago:
-            pago = Pago(
-                mp_payment_id=payment_id,
-                estado=status,
-                producto=producto_nom,
-                dispensado=False,
-                procesado=False,
-                slot_id=slot_id,
-                litros=litros,
-                monto=monto,
-                product_id=product_id,
-                dispenser_id=dispenser_id,
-                device_id=device_id,
-                raw=info,
-            )
-            db.session.add(pago)
-        else:
-            pago.estado = status
-            if producto_nom:
-                pago.producto = producto_nom
-            if slot_id:
-                pago.slot_id = slot_id
-            if litros:
-                pago.litros = litros
-            if monto:
-                pago.monto = monto
-            if product_id:
-                pago.product_id = product_id
-            if dispenser_id:
-                pago.dispenser_id = dispenser_id
-            if device_id:
-                pago.device_id = device_id
-            pago.raw = info
+            if not payment_id:
+                app.logger.error("[WEBHOOK] (payment) No se pudo extraer payment_id")
+                return "ok", 200
 
-        db.session.commit()
+            payment_id = str(payment_id)
 
-        # --- Si aprobado, enviar comando MQTT ---
-        if status == "approved":
-            # Resolver device_id si viene vacío en metadata
-            if not device_id:
-                if pago.device_id:
-                    device_id = pago.device_id
-                elif pago.product_id:
-                    prod = Producto.query.get(pago.product_id)
-                    if prod and prod.dispenser_id:
-                        d = Dispenser.query.get(prod.dispenser_id)
-                        if d:
-                            device_id = d.device_id
+            try:
+                resp = mp_sdk.payment().get(payment_id)
+                info = resp.get("response") or {}
+            except Exception as e:
+                app.logger.error(f"[WEBHOOK] Error consultando MP payment: {e}")
+                return "ok", 200
 
-            if not slot_id:
-                slot_id = pago.slot_id
+            _procesar_pago_desde_info(payment_id, info)
 
-            if device_id and slot_id:
-                if not pago.procesado:
-                    ok = send_dispense_cmd(device_id, payment_id, slot_id, pago.litros or 1)
-                    if ok:
-                        pago.procesado = True
-                        db.session.commit()
-                        app.logger.info(f"[WEBHOOK] MQTT enviado OK → dev={device_id}, slot={slot_id}")
-                    else:
-                        app.logger.error("[WEBHOOK] Error publicando MQTT")
-                else:
-                    app.logger.info("[WEBHOOK] Pago ya estaba procesado, no se reenvía automático")
-            else:
-                app.logger.error("[WEBHOOK] Falta device_id o slot_id, no se envía comando MQTT")
-        else:
-            app.logger.info(f"[WEBHOOK] Pago con estado {status}, no se dispara MQTT")
+        elif topic == "merchant_order":
+            # Para QR reutilizable, muchas veces MP manda solo merchant_order
+            merchant_order_id = None
+            if isinstance(data.get("data"), dict) and data["data"].get("id"):
+                merchant_order_id = data["data"]["id"]
+
+            if not merchant_order_id and data.get("resource"):
+                try:
+                    merchant_order_id = data["resource"].split("/")[-1]
+                except Exception:
+                    pass
+
+            if not merchant_order_id:
+                app.logger.error("[WEBHOOK] (merchant_order) No se pudo extraer id")
+                return "ok", 200
+
+            merchant_order_id = str(merchant_order_id)
+
+            try:
+                mo_resp = mp_sdk.merchant_order().get(merchant_order_id)
+                mo_info = mo_resp.get("response") or {}
+            except Exception as e:
+                app.logger.error(f"[WEBHOOK] Error consultando merchant_order: {e}")
+                return "ok", 200
+
+            payments = mo_info.get("payments") or []
+            if not payments:
+                app.logger.info("[WEBHOOK] merchant_order sin payments asociados")
+                return "ok", 200
+
+            # Procesar cada pago asociado a la orden
+            for p_ref in payments:
+                p_id = p_ref.get("id")
+                if not p_id:
+                    continue
+                p_id = str(p_id)
+                try:
+                    resp = mp_sdk.payment().get(p_id)
+                    info = resp.get("response") or {}
+                except Exception as e:
+                    app.logger.error(f"[WEBHOOK] Error consultando payment desde merchant_order: {e}")
+                    continue
+
+                _procesar_pago_desde_info(p_id, info)
 
         return "ok", 200
 
