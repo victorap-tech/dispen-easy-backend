@@ -685,7 +685,7 @@ def crear_preferencia_api():
     # -------------------------------------------------------------
     # 🔥 BLOQUE COMPLETO DE PREFERENCIA (con metadata preservada)
     # -------------------------------------------------------------
-   body = {
+  body = {
     "items": [{
         "id": str(prod.id),
         "title": prod.nombre,
