@@ -706,7 +706,8 @@ def mp_webhook():
             app.logger.error(f"[WEBHOOK] Error consultando MP: {e}")
             return "ok", 200
 
-        status = (info.get("status") or "").lower()
+        status_raw = info.get("status")
+        status = str(status_raw).lower() if status_raw is not None else ""
         metadata = info.get("metadata") or {}
         app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
 
