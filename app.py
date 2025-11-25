@@ -612,6 +612,7 @@ def api_crear_preferencia():
             "currency_id": "ARS",
             "unit_price": float(monto_final),
         }],
+        "purpose": "wallet_purchase",
         "description": prod.nombre,
         "metadata": {
             "slot_id": int(prod.slot_id),
