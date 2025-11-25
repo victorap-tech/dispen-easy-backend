@@ -187,14 +187,16 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
 
     db.session.commit()
 
-    # Disparar MQTT si aprobado
+   # Disparar MQTT si aprobado
     if status == "approved":
-        mqtt_topic = f"dispenser/{device_id}/slot/{slot_id}"
-        mqtt_payload = {"accion": "dispensar", "litros": litros_md}
-        app.logger.info(f"[MQTT] → {mqtt_topic} {mqtt_payload}")
-        mqtt_client.publish(mqtt_topic, json.dumps(mqtt_payload), qos=1)
-        pago.procesado = True
-        db.session.commit()
+        ok = send_dispense_cmd(device_id, payment_id, slot_id, litros_md)
+
+        if ok:
+            app.logger.info(f"[MQTT] OK → {device_id} slot={slot_id} litros={litros_md}")
+            pago.procesado = True
+            db.session.commit()
+        else:
+            app.logger.error(f"[MQTT] ERROR → no se pudo enviar a {device_id} slot={slot_id}")
 
 # =========================
 # Helpers
