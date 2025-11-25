@@ -586,8 +586,6 @@ def api_productos_opciones(pid):
 # ---------------- Pagos – Preferencia (QR reutilizable) ----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
-    import time
-
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
@@ -595,7 +593,7 @@ def crear_preferencia_api():
     if not token:
         return json_error("MP token no configurado", 500)
 
-    # Producto simple (sin litros)
+    # Obtener producto
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
@@ -604,44 +602,22 @@ def crear_preferencia_api():
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
 
-    # Precio directo del producto
-    monto_final = int(prod.precio)
+    monto = float(prod.precio)
 
-    # 🔥 Clave para QR infinito a nivel MP (evitar cache de pref):
-    ts = int(time.time())
-    external_reference = (
-        f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
-    )
-
-    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
-
+    # ⚠️ Preferencia ultra simple (REUSABLE infinita)
     body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final),
-        }],
-        "metadata": {
-            "product_id": prod.id,
-            "slot_id": prod.slot_id,
-            "producto": prod.nombre,
-            "litros": 1,          # fijo, no importa
-            "dispenser_id": disp.id,
-            "device_id": disp.device_id,
-            "precio_final": monto_final,
+        "items": [
+            {
+                "title": prod.nombre,
+                "quantity": 1,
+                "unit_price": monto,
+                "currency_id": "ARS",
+            }
+        ],
+        "payment_methods": {
+            "installments": 1
         },
-        "external_reference": external_reference,
-        "auto_return": "approved",
-        "back_urls": {
-          "success": f"{backend_url}/gracias",
-          "failure": f"{backend_url}/gracias",
-          "pending": f"{backend_url}/gracias"
-        },
-        "notification_url": f"{backend_url}/api/mp/webhook",
-        "statement_descriptor": "DISPENSER-AGUA"
+        "notification_url": f"{(BACKEND_BASE_URL or request.url_root.rstrip('/'))}/api/mp/webhook"
     }
 
     try:
@@ -665,100 +641,6 @@ def crear_preferencia_api():
         return json_error("preferencia_sin_link", 502, pref)
 
     return ok_json({"ok": True, "link": link})
-
-# ---------------- Webhook MercadoPago ----------------
-
-def _procesar_pago_desde_info(payment_id: str, info: dict):
-    """
-    Lógica común para crear/actualizar Pago + disparar MQTT.
-    """
-    status_raw = info.get("status")
-    status = str(status_raw).lower() if status_raw is not None else ""
-    metadata = info.get("metadata") or {}
-    app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
-
-    # --- Extraer datos relevantes ---
-    product_id   = _to_int(metadata.get("product_id") or 0)
-    slot_id_md   = _to_int(metadata.get("slot_id") or 0)
-    dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
-    device_id_md = (metadata.get("device_id") or "").strip()
-    litros_md    = _to_int(metadata.get("litros") or 1) or 1
-    producto_nom = metadata.get("producto") or info.get("description") or ""
-    monto_val    = info.get("transaction_amount") or metadata.get("precio_final") or 0
-    try:
-        monto = int(round(float(monto_val)))
-    except Exception:
-        monto = 0
-
-    # --- Crear / actualizar Pago en DB ---
-    pago = Pago.query.filter_by(mp_payment_id=payment_id).first()
-    if not pago:
-        pago = Pago(
-            mp_payment_id=payment_id,
-            estado=status,
-            producto=producto_nom,
-            dispensado=False,
-            procesado=False,
-            slot_id=slot_id_md,
-            litros=litros_md,
-            monto=monto,
-            product_id=product_id,
-            dispenser_id=dispenser_id,
-            device_id=device_id_md,
-            raw=info,
-        )
-        db.session.add(pago)
-    else:
-        pago.estado = status or pago.estado
-        if producto_nom:
-            pago.producto = producto_nom
-        if slot_id_md:
-            pago.slot_id = slot_id_md
-        if litros_md:
-            pago.litros = litros_md
-        if monto:
-            pago.monto = monto
-        if product_id:
-            pago.product_id = product_id
-        if dispenser_id:
-            pago.dispenser_id = dispenser_id
-        if device_id_md:
-            pago.device_id = device_id_md
-        pago.raw = info
-
-    db.session.commit()
-
-    # --- Si aprobado, enviar comando MQTT ---
-    if status == "approved":
-        device_id = device_id_md or pago.device_id
-        slot_id = slot_id_md or pago.slot_id
-
-        # Resolver device_id si aún está vacío
-        if not device_id and pago.product_id:
-            prod = Producto.query.get(pago.product_id)
-            if prod and prod.dispenser_id:
-                d = Dispenser.query.get(prod.dispenser_id)
-                if d:
-                    device_id = d.device_id
-
-        if not slot_id:
-            slot_id = pago.slot_id
-
-        if device_id and slot_id:
-            if not pago.procesado:
-                ok = send_dispense_cmd(device_id, payment_id, slot_id, pago.litros or 1)
-                if ok:
-                    pago.procesado = True
-                    db.session.commit()
-                    app.logger.info(f"[WEBHOOK] MQTT enviado OK → dev={device_id}, slot={slot_id}")
-                else:
-                    app.logger.error("[WEBHOOK] Error publicando MQTT")
-            else:
-                app.logger.info("[WEBHOOK] Pago ya estaba procesado, no se reenvía automático")
-        else:
-            app.logger.error("[WEBHOOK] Falta device_id o slot_id, no se envía comando MQTT")
-    else:
-        app.logger.info(f"[WEBHOOK] Pago con estado {status}, no se dispara MQTT")
 
 
 @app.post("/api/mp/webhook")
