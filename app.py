@@ -206,8 +206,14 @@ def _auth_guard():
     if request.method == "OPTIONS":
         return "", 200
     p = request.path
-    if p in PUBLIC_PATHS:
+
+    # Rutas públicas
+    if (
+        p in PUBLIC_PATHS
+        or p.startswith("/qr/")          # ← NUEVO: que los QR sean públicos
+    ):
         return None
+
     if not ADMIN_SECRET:
         # Sin secreto configurado, todo es público (modo dev)
         return None
