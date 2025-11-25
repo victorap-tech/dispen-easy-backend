@@ -578,19 +578,23 @@ def api_productos_opciones(pid):
 
 # ---------------- Crear preferencia MP (para botón "Generar QR") ----------------
 
+# ---------------- Pagos – Preferencia MP (QR reutilizable) ----------------
 @app.post("/api/pagos/preferencia")
-def api_crear_preferencia():
-    """
-    Crea una preferencia nueva PARA ESE PRODUCTO.
-    El admin la usa una vez para generar el link/QR que va pegado en el dispenser.
-    """
-    data = request.get_json(silent=True) or {}
+def crear_preferencia_api():
+    import time
+
+    data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
-    token, base_api = get_mp_token_and_base()
+    # Para agua: 1 venta = 1 habilitación de salida
+    litros = 1
+
+    # Obtener token segun modo
+    token, _base_api = get_mp_token_and_base()
     if not token:
         return json_error("MP token no configurado", 500)
 
+    # Producto
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
@@ -599,10 +603,18 @@ def api_crear_preferencia():
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
 
-    monto_final = int(round(float(prod.precio)))
+    # Precio final (ya no importa litros)
+    monto_final = int(prod.precio)
+
+    # 🔥 EL SECRETO PARA QUE SIEMPRE FUNCIONE EL MISMO QR
+    # Agregamos timestamp en external_reference
+    ts = int(time.time())
+    external_reference = (
+        f"pid={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
+    )
+
     backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
-    external_ref = f"pid={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id}"
     body = {
         "items": [{
             "id": str(prod.id),
@@ -612,50 +624,47 @@ def api_crear_preferencia():
             "currency_id": "ARS",
             "unit_price": float(monto_final),
         }],
-        "purpose": "wallet_purchase",
-        "description": prod.nombre,
         "metadata": {
-            "slot_id": int(prod.slot_id),
-            "product_id": int(prod.id),
+            "product_id": prod.id,
+            "slot_id": prod.slot_id,
             "producto": prod.nombre,
             "litros": 1,
-            "dispenser_id": int(disp.id),
+            "dispenser_id": disp.id,
             "device_id": disp.device_id,
-            "precio_final": int(monto_final),
+            "precio_final": monto_final,
         },
-        "external_reference": external_ref,
+        "external_reference": external_reference,
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{backend_base}/gracias?status=success",
-            "failure": f"{backend_base}/gracias?status=failure",
-            "pending": f"{backend_base}/gracias?status=pending",
+            "success": f"{WEB_URL}/gracias?status=success",
+            "failure": f"{WEB_URL}/gracias?status=failure",
+            "pending": f"{WEB_URL}/gracias?status=pending",
         },
+        # 🔥 Webhook siempre apunta a tu backend
         "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPEN-AGUA",
+        "statement_descriptor": "DISPENSER-AGUA",
     }
 
+    # Crear preferencia
     try:
         r = requests.post(
-           f"{base_api}/checkout/preferences",
-           headers={
-             "Authorization": f"Bearer {token}",
-             "Content-Type": "application/json",
-           },
-           json=body,
-           timeout=20,
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=20
         )
         r.raise_for_status()
     except Exception as e:
-        detail = getattr(e, "response", None)
-        detail_txt = getattr(detail, "text", str(e))[:600]
-        return json_error("mp_preference_failed", 502, detail_txt)
+        detail = getattr(r, "text", str(e))[:600]
+        return json_error("mp_preference_failed", 502, detail)
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
     if not link:
         return json_error("preferencia_sin_link", 502, pref)
 
-    return ok_json({"ok": True, "link": link, "precio_final": monto_final})
+    return ok_json({"ok": True, "link": link, "raw": pref})
 
 # ---------------- Webhook MercadoPago ----------------
 
