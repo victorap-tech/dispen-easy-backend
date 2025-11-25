@@ -729,7 +729,7 @@ body = {
 
     "binary_mode": False,
     "statement_descriptor": "DISPENSER-AGUA"
-}
+    }
 
     # -------------------------------------------------------------
 
