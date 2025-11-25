@@ -9,6 +9,7 @@ from typing import Optional
 import requests
 import paho.mqtt.client as mqtt
 import mercadopago
+import json
 from flask import Flask, jsonify, request, make_response, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
