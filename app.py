@@ -677,6 +677,8 @@ def api_productos_opciones(pid):
 # ---------------- Pagos – Preferencia (QR reutilizable) ----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
+    import time
+
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
@@ -684,7 +686,7 @@ def crear_preferencia_api():
     if not token:
         return json_error("MP token no configurado", 500)
 
-    # Obtener producto
+    # Producto
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
@@ -693,23 +695,64 @@ def crear_preferencia_api():
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
 
-    monto = float(prod.precio)
+    monto_final = int(prod.precio)
 
-    # ⚠️ Preferencia ultra simple (REUSABLE infinita)
+    # 🔥 Agregamos timestamp para evitar cache de preferencia
+    ts = int(time.time())
+    external_reference = (
+        f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
+    )
+
+    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
+
+    # -------------------------------------------------------------
+    # 🔥 BLOQUE COMPLETO DE PREFERENCIA (con metadata preservada)
+    # -------------------------------------------------------------
     body = {
-        "items": [
-            {
-                "title": prod.nombre,
-                "quantity": 1,
-                "unit_price": monto,
-                "currency_id": "ARS",
-            }
-        ],
+        "items": [{
+            "id": str(prod.id),
+            "title": prod.nombre,
+            "description": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(monto_final),
+        }],
+
+        # METADATA COMPLETA — debe llegar al webhook siempre
+        "metadata": {
+            "product_id": prod.id,
+            "slot_id": prod.slot_id,
+            "producto": prod.nombre,
+            "litros": 1,
+            "dispenser_id": disp.id,
+            "device_id": disp.device_id,
+            "precio_final": monto_final,
+        },
+
+        "external_reference": external_reference,
+
+        "auto_return": "approved",
+
+        "back_urls": {
+            "success": f"{backend_url}/gracias",
+            "failure": f"{backend_url}/gracias",
+            "pending": f"{backend_url}/gracias"
+        },
+
+        "notification_url": f"{backend_url}/api/mp/webhook",
+
+        # ⚠️ FIX CRÍTICO → Evita que MP borre metadata en pagos repetidos
         "payment_methods": {
+            "excluded_payment_types": [],
             "installments": 1
         },
-        "notification_url": f"{(BACKEND_BASE_URL or request.url_root.rstrip('/'))}/api/mp/webhook"
+
+        "binary_mode": False,
+
+        "statement_descriptor": "DISPENSER-AGUA"
     }
+
+    # -------------------------------------------------------------
 
     try:
         r = requests.post(
