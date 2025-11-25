@@ -653,6 +653,7 @@ def api_productos_opciones(pid):
     })
 
 # ---------------- Pagos – Preferencia (QR reutilizable) ----------------
+# ---------------- Pagos – Preferencia (QR reutilizable) ----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
     import time
@@ -675,7 +676,7 @@ def crear_preferencia_api():
 
     monto_final = int(prod.precio)
 
-    # 🔥 Agregamos timestamp para evitar cache de preferencia
+    # Timestamp para evitar cache
     ts = int(time.time())
     external_reference = (
         f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
@@ -684,52 +685,80 @@ def crear_preferencia_api():
     backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
     # -------------------------------------------------------------
-    # 🔥 BLOQUE COMPLETO DE PREFERENCIA (con metadata preservada)
+    # 🔥 BLOQUE DE PREFERENCIA — TOTALMENTE CORREGIDO
     # -------------------------------------------------------------
-body = {
-    "items": [{
-        "id": str(prod.id),
-        "title": prod.nombre,
-        "description": prod.nombre,
-        "quantity": 1,
-        "currency_id": "ARS",
-        "unit_price": float(monto_final),
-    }],
+    body = {
+        "items": [
+            {
+                "id": str(prod.id),
+                "title": prod.nombre,
+                "description": prod.nombre,
+                "quantity": 1,
+                "currency_id": "ARS",
+                "unit_price": float(monto_final),
+            }
+        ],
 
-    "metadata": {
-        "product_id": prod.id,
-        "slot_id": prod.slot_id,
-        "producto": prod.nombre,
-        "litros": 1,
-        "dispenser_id": disp.id,
-        "device_id": disp.device_id,
-        "precio_final": monto_final,
-    },
+        # Metadata completa
+        "metadata": {
+            "product_id": prod.id,
+            "slot_id": prod.slot_id,
+            "producto": prod.nombre,
+            "litros": 1,
+            "dispenser_id": disp.id,
+            "device_id": disp.device_id,
+            "precio_final": monto_final,
+            "ts": ts,   # importante para evitar reuso de metadata vieja
+        },
 
-    "external_reference": external_reference,
+        "external_reference": external_reference,
 
-    "auto_return": "approved",
+        # Back URLs
+        "auto_return": "approved",
+        "back_urls": {
+            "success": f"{backend_url}/gracias",
+            "failure": f"{backend_url}/gracias",
+            "pending": f"{backend_url}/gracias"
+        },
 
-    "back_urls": {
-        "success": f"{backend_url}/gracias",
-        "failure": f"{backend_url}/gracias",
-        "pending": f"{backend_url}/gracias"
-    },
+        "notification_url": f"{backend_url}/api/mp/webhook",
 
-    "notification_url": f"{backend_url}/api/mp/webhook",
+        # 🔥 FIX CLAVE PARA QR REUTILIZABLE 🔥
+        "purpose": "wallet_purchase",
+        "expires": False,
+        "payment_methods": {
+            "excluded_payment_types": [],
+            "installments": 1,
+            "default_payment_method_id": None
+        },
 
-    # 🔥🔥 FIX DEFINITIVO PARA QR REUTILIZABLE 🔥🔥
-    "purpose": "wallet_purchase",      # evita la normalización que borra metadata
-    "expires": False,                  # evita invalidar preferencia
-    "payment_methods": {
-        "excluded_payment_types": [],
-        "installments": 1,
-        "default_payment_method_id": None   # evita cache de método
-    },
-
-    "binary_mode": False,
-    "statement_descriptor": "DISPENSER-AGUA"
+        "binary_mode": False,
+        "statement_descriptor": "DISPENSER-AGUA"
     }
+
+    # -------------------------------------------------------------
+
+    try:
+        r = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=20
+        )
+        r.raise_for_status()
+    except Exception as e:
+        detail = getattr(r, "text", str(e))[:600]
+        return json_error("mp_preference_failed", 502, detail)
+
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    if not link:
+        return json_error("preferencia_sin_link", 502, pref)
+
+    return ok_json({"ok": True, "link": link})
 
     # -------------------------------------------------------------
 
