@@ -685,49 +685,50 @@ def crear_preferencia_api():
     # -------------------------------------------------------------
     # 🔥 BLOQUE COMPLETO DE PREFERENCIA (con metadata preservada)
     # -------------------------------------------------------------
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final),
-        }],
+   body = {
+    "items": [{
+        "id": str(prod.id),
+        "title": prod.nombre,
+        "description": prod.nombre,
+        "quantity": 1,
+        "currency_id": "ARS",
+        "unit_price": float(monto_final),
+    }],
 
-        # METADATA COMPLETA — debe llegar al webhook siempre
-        "metadata": {
-            "product_id": prod.id,
-            "slot_id": prod.slot_id,
-            "producto": prod.nombre,
-            "litros": 1,
-            "dispenser_id": disp.id,
-            "device_id": disp.device_id,
-            "precio_final": monto_final,
-        },
+    "metadata": {
+        "product_id": prod.id,
+        "slot_id": prod.slot_id,
+        "producto": prod.nombre,
+        "litros": 1,
+        "dispenser_id": disp.id,
+        "device_id": disp.device_id,
+        "precio_final": monto_final,
+    },
 
-        "external_reference": external_reference,
+    "external_reference": external_reference,
 
-        "auto_return": "approved",
+    "auto_return": "approved",
 
-        "back_urls": {
-            "success": f"{backend_url}/gracias",
-            "failure": f"{backend_url}/gracias",
-            "pending": f"{backend_url}/gracias"
-        },
+    "back_urls": {
+        "success": f"{backend_url}/gracias",
+        "failure": f"{backend_url}/gracias",
+        "pending": f"{backend_url}/gracias"
+    },
 
-        "notification_url": f"{backend_url}/api/mp/webhook",
+    "notification_url": f"{backend_url}/api/mp/webhook",
 
-        # ⚠️ FIX CRÍTICO → Evita que MP borre metadata en pagos repetidos
-        "payment_methods": {
-            "excluded_payment_types": [],
-            "installments": 1
-        },
+    # 🔥🔥 FIX DEFINITIVO PARA QR REUTILIZABLE 🔥🔥
+    "purpose": "wallet_purchase",      # evita la normalización que borra metadata
+    "expires": False,                  # evita invalidar preferencia
+    "payment_methods": {
+        "excluded_payment_types": [],
+        "installments": 1,
+        "default_payment_method_id": None   # evita cache de método
+    },
 
-        "binary_mode": False,
-
-        "statement_descriptor": "DISPENSER-AGUA"
-    }
+    "binary_mode": False,
+    "statement_descriptor": "DISPENSER-AGUA"
+}
 
     # -------------------------------------------------------------
 
