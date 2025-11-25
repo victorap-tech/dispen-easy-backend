@@ -576,9 +576,7 @@ def api_productos_opciones(pid):
         "opciones": options
     })
 
-# ---------------- Crear preferencia MP (para botón "Generar QR") ----------------
-
-# ---------------- Pagos – Preferencia MP (QR reutilizable) ----------------
+# ---------------- Pagos – Preferencia (QR reutilizable) ----------------
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
     import time
@@ -586,15 +584,11 @@ def crear_preferencia_api():
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
-    # Para agua: 1 venta = 1 habilitación de salida
-    litros = 1
-
-    # Obtener token segun modo
     token, _base_api = get_mp_token_and_base()
     if not token:
         return json_error("MP token no configurado", 500)
 
-    # Producto
+    # Producto simple (sin litros)
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
@@ -603,17 +597,16 @@ def crear_preferencia_api():
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
 
-    # Precio final (ya no importa litros)
+    # Precio directo del producto
     monto_final = int(prod.precio)
 
-    # 🔥 EL SECRETO PARA QUE SIEMPRE FUNCIONE EL MISMO QR
-    # Agregamos timestamp en external_reference
+    # 🔥 Clave para QR infinito: agregar timestamp para evitar cache de MP
     ts = int(time.time())
     external_reference = (
-        f"pid={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
+        f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
     )
 
-    backend_base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
 
     body = {
         "items": [{
@@ -628,7 +621,7 @@ def crear_preferencia_api():
             "product_id": prod.id,
             "slot_id": prod.slot_id,
             "producto": prod.nombre,
-            "litros": 1,
+            "litros": 1,          # fijo, no importa
             "dispenser_id": disp.id,
             "device_id": disp.device_id,
             "precio_final": monto_final,
@@ -640,17 +633,17 @@ def crear_preferencia_api():
             "failure": f"{WEB_URL}/gracias?status=failure",
             "pending": f"{WEB_URL}/gracias?status=pending",
         },
-        # 🔥 Webhook siempre apunta a tu backend
-        "notification_url": f"{backend_base}/api/mp/webhook",
-        "statement_descriptor": "DISPENSER-AGUA",
+        "notification_url": f"{backend_url}/api/mp/webhook",
+        "statement_descriptor": "DISPENSER-AGUA"
     }
 
-    # Crear preferencia
     try:
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
             json=body,
             timeout=20
         )
@@ -664,7 +657,7 @@ def crear_preferencia_api():
     if not link:
         return json_error("preferencia_sin_link", 502, pref)
 
-    return ok_json({"ok": True, "link": link, "raw": pref})
+    return ok_json({"ok": True, "link": link})
 
 # ---------------- Webhook MercadoPago ----------------
 
