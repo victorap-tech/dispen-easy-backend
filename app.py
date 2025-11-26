@@ -712,6 +712,93 @@ def crear_preferencia_api():
 
     return ok_json({"ok": True, "link": link})
 
+# =========================
+# QR UNIVERSAL POR DISPENSER Y SLOT
+# =========================
+
+@app.get("/qr/<device_id>/<int:slot_id>")
+def qr_universal(device_id, slot_id):
+    """
+    Genera siempre una nueva preferencia de MP
+    según el dispenser y el slot (1 = fría, 2 = caliente)
+    """
+
+    # Buscar dispenser por device_id
+    disp = Dispenser.query.filter_by(device_id=device_id).first()
+    if not disp:
+        return json_error("dispenser no encontrado", 404)
+
+    # Buscar producto por slot_id
+    prod = Producto.query.filter_by(
+        dispenser_id=disp.id,
+        slot_id=slot_id
+    ).first()
+
+    if not prod or not prod.habilitado:
+        return json_error("producto no disponible", 400)
+
+    # Obtener token MP
+    token, _base_api = get_mp_token_and_base()
+    if not token:
+        return json_error("MP token no configurado", 500)
+
+    monto_final = int(prod.precio)
+
+    body = {
+        "items": [{
+            "id": str(prod.id),
+            "title": prod.nombre,
+            "description": prod.nombre,
+            "quantity": 1,
+            "currency_id": "ARS",
+            "unit_price": float(monto_final),
+        }],
+
+        "metadata": {
+            "product_id": prod.id,
+            "slot_id": prod.slot_id,
+            "producto": prod.nombre,
+            "litros": 1,
+            "dispenser_id": disp.id,
+            "device_id": disp.device_id,
+            "precio_final": monto_final,
+        },
+
+        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
+
+        "auto_return": "approved",
+        "back_urls": {
+            "success": f"{BACKEND_BASE_URL}/gracias",
+            "failure": f"{BACKEND_BASE_URL}/gracias",
+            "pending": f"{BACKEND_BASE_URL}/gracias"
+        },
+
+        "purpose": "wallet_purchase",
+        "expires": False,
+    }
+
+    # Crear preferencia
+    try:
+        r = requests.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=20
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return json_error("mp_preference_failed", 502, str(e))
+
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    if not link:
+        return json_error("preferencia_sin_link", 502, pref)
+
+    return ok_json({"ok": True, "link": link})
+
 @app.get("/qr/<int:slot_id>")
 def qr_dynamic(slot_id):
     import requests
