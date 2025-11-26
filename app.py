@@ -799,64 +799,103 @@ def qr_universal(device_id, slot_id):
 
     return ok_json({"ok": True, "link": link})
 
-@app.get("/qr/<int:slot_id>")
-def qr_dynamic(slot_id):
-    import requests
+# =========================
+# QR UNIVERSAL POR DISPENSER Y SLOT
+# =========================
 
-    # Buscar el producto real
-    prod = Producto.query.filter_by(slot_id=slot_id).first()
+@app.get("/qr/<device_id>/<int:slot_id>")
+def qr_universal(device_id, slot_id):
+    """
+    Genera SIEMPRE una nueva preferencia de MercadoPago
+    para el dispenser <device_id> y el slot <slot_id>.
+    Este endpoint escala a múltiples máquinas.
+    """
+
+    # 1) Buscar dispenser por device_id
+    disp = Dispenser.query.filter_by(device_id=device_id).first()
+    if not disp:
+        return json_error("dispenser no encontrado", 404)
+
+    if not disp.activo:
+        return json_error("dispenser desactivado", 400)
+
+    # 2) Buscar producto por slot_id para ese dispenser
+    prod = Producto.query.filter_by(
+        dispenser_id=disp.id,
+        slot_id=slot_id
+    ).first()
+
     if not prod or not prod.habilitado:
-        return "Producto no disponible", 404
+        return json_error("producto no disponible", 400)
 
-    disp = Dispenser.query.get(prod.dispenser_id)
-    if not disp or not disp.activo:
-        return "Dispenser no disponible", 404
+    # 3) Token MP (Test / Live / OAuth)
+    token, base_api = get_mp_token_and_base()
+    if not token:
+        return json_error("MP token no configurado", 500)
 
-    # Obtener token (usa test/live o OAuth según tu sistema)
-    token, _ = get_mp_token_and_base()
+    # 4) Precio final (del admin)
+    monto_final = int(prod.precio)
 
-    preferencia = {
+    # 5) Construir la preferencia
+    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
+
+    body = {
         "items": [{
             "id": str(prod.id),
             "title": prod.nombre,
             "description": prod.nombre,
             "quantity": 1,
-            "unit_price": float(prod.precio)
+            "currency_id": "ARS",
+            "unit_price": float(monto_final),
         }],
+
+        # Información que recuperamos en el webhook
         "metadata": {
             "product_id": prod.id,
             "slot_id": prod.slot_id,
+            "producto": prod.nombre,
+            "litros": 1,
             "dispenser_id": disp.id,
             "device_id": disp.device_id,
-            "litros": 1,
-            "precio_final": prod.precio,
+            "precio_final": monto_final,
         },
-        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
+
+        "notification_url": f"{backend_url}/api/mp/webhook",
+
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{BACKEND_BASE_URL}/gracias",
-            "failure": f"{BACKEND_BASE_URL}/gracias",
-            "pending": f"{BACKEND_BASE_URL}/gracias"
-        }
+            "success": f"{backend_url}/gracias",
+            "failure": f"{backend_url}/gracias",
+            "pending": f"{backend_url}/gracias",
+        },
+
+        "purpose": "wallet_purchase",
+        "expires": False
     }
 
-    r = requests.post(
-        "https://api.mercadopago.com/checkout/preferences",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        },
-        json=preferencia
-    )
+    # 6) Crear preferencia en MP
+    try:
+        r = requests.post(
+            f"{base_api}/checkout/preferences",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=20
+        )
+        r.raise_for_status()
+    except Exception as e:
+        detail = getattr(r, "text", str(e))[:600]
+        return json_error("mp_preference_failed", 502, detail)
 
-    if r.status_code >= 300:
-        return f"Error al crear preferencia: {r.text}", 500
+    pref = r.json() or {}
+    link = pref.get("init_point") or pref.get("sandbox_init_point")
+    if not link:
+        return json_error("preferencia_sin_link", 502, pref)
 
-    data = r.json()
-    link = data.get("init_point") or data.get("sandbox_init_point")
-
-    return redirect(link)
-
+    # Devuelve { ok: true, link: "https://..." }
+    return ok_json({"ok": True, "link": link})
 # =========================
 # WEBHOOK MP (payment + merchant_order)
 # =========================
