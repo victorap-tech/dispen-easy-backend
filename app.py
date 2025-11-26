@@ -616,8 +616,28 @@ def api_pagos_reenviar(pid):
 
 
 # =========================
-# PAGOS – PREFERENCIA QR REUTILIZABLE
+# HELPERS BACKEND BASE
 # =========================
+
+def get_backend_base() -> str:
+    """
+    Devuelve la URL base del backend.
+    Usa BACKEND_BASE_URL si está seteada, si no usa request.url_root.
+    Siempre sin / final.
+    """
+    base = (BACKEND_BASE_URL or "").strip()
+    if not base:
+        # request.url_root suele venir con / al final
+        base = (request.url_root or "").rstrip("/")
+    return base
+
+
+# =========================
+# PAGOS – PREFERENCIA (ADMIN)
+# =========================
+# Esta ruta sigue igual que antes, sirve para crear una preferencia
+# puntual desde el Admin si querés generar un link de prueba.
+# NO es el QR universal del dispenser.
 
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
@@ -644,7 +664,7 @@ def crear_preferencia_api():
         f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
     )
 
-    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    backend_url = get_backend_base()
 
     body = {
         "items": [{
@@ -677,6 +697,7 @@ def crear_preferencia_api():
 
         "notification_url": f"{backend_url}/api/mp/webhook",
 
+        # Importante: para dispenser usamos wallet_purchase
         "purpose": "wallet_purchase",
         "expires": False,
 
@@ -712,37 +733,47 @@ def crear_preferencia_api():
 
     return ok_json({"ok": True, "link": link})
 
+
 # =========================
 # QR UNIVERSAL POR DISPENSER Y SLOT
 # =========================
+# ESTE es el QR que vas a imprimir en el dispenser.
+# URL del QR físico:  https://TU_DOMINIO/qr/<device_id>/<slot_id>
+# Ejemplo:            https://dispenagua.com/qr/dispen-01/1
 
 @app.get("/qr/<device_id>/<int:slot_id>")
 def qr_universal(device_id, slot_id):
     """
-    Genera siempre una nueva preferencia de MP
-    según el dispenser y el slot (1 = fría, 2 = caliente)
+    Cada vez que alguien escanea este QR:
+      1) Buscamos el dispenser por device_id
+      2) Buscamos el producto por dispenser_id + slot_id
+      3) Creamos una NUEVA preferencia de MercadoPago
+      4) Redirigimos (302) al init_point de esa preferencia
+
+    Resultado: UN SOLO QR físico por salida, pero infinitas compras.
     """
 
-    # Buscar dispenser por device_id
+    # 1) Buscar dispenser por device_id
     disp = Dispenser.query.filter_by(device_id=device_id).first()
-    if not disp:
-        return json_error("dispenser no encontrado", 404)
+    if not disp or not disp.activo:
+        return "Dispenser no disponible", 404
 
-    # Buscar producto por slot_id
+    # 2) Buscar producto por slot_id
     prod = Producto.query.filter_by(
         dispenser_id=disp.id,
         slot_id=slot_id
     ).first()
 
     if not prod or not prod.habilitado:
-        return json_error("producto no disponible", 400)
+        return "Producto no disponible", 404
 
-    # Obtener token MP
+    # 3) Obtener token MP
     token, _base_api = get_mp_token_and_base()
     if not token:
-        return json_error("MP token no configurado", 500)
+        return "MP token no configurado", 500
 
-    monto_final = int(prod.precio)
+    backend_url = get_backend_base()
+    monto_final = float(prod.precio)
 
     body = {
         "items": [{
@@ -751,7 +782,7 @@ def qr_universal(device_id, slot_id):
             "description": prod.nombre,
             "quantity": 1,
             "currency_id": "ARS",
-            "unit_price": float(monto_final),
+            "unit_price": monto_final,
         }],
 
         "metadata": {
@@ -764,20 +795,22 @@ def qr_universal(device_id, slot_id):
             "precio_final": monto_final,
         },
 
-        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
-
+        "notification_url": f"{backend_url}/api/mp/webhook",
         "auto_return": "approved",
         "back_urls": {
-            "success": f"{BACKEND_BASE_URL}/gracias",
-            "failure": f"{BACKEND_BASE_URL}/gracias",
-            "pending": f"{BACKEND_BASE_URL}/gracias"
+            "success": f"{backend_url}/gracias",
+            "failure": f"{backend_url}/gracias",
+            "pending": f"{backend_url}/gracias"
         },
 
+        # Igual que arriba: pensado para vending tipo wallet
         "purpose": "wallet_purchase",
         "expires": False,
+        "binary_mode": False,
+        "statement_descriptor": "DISPENSER-AGUA"
     }
 
-    # Crear preferencia
+    # 4) Crear preferencia
     try:
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
@@ -790,112 +823,15 @@ def qr_universal(device_id, slot_id):
         )
         r.raise_for_status()
     except Exception as e:
-        return json_error("mp_preference_failed", 502, str(e))
+        return f"Error al crear preferencia: {e}", 500
 
     pref = r.json() or {}
     link = pref.get("init_point") or pref.get("sandbox_init_point")
     if not link:
-        return json_error("preferencia_sin_link", 502, pref)
+        return "Preferencia sin link", 502
 
-    return ok_json({"ok": True, "link": link})
-
-# =========================
-# QR UNIVERSAL POR DISPENSER Y SLOT
-# =========================
-
-@app.get("/qr/<device_id>/<int:slot_id>")
-def qr_universal(device_id, slot_id):
-    """
-    Genera SIEMPRE una nueva preferencia de MercadoPago
-    para el dispenser <device_id> y el slot <slot_id>.
-    Este endpoint escala a múltiples máquinas.
-    """
-
-    # 1) Buscar dispenser por device_id
-    disp = Dispenser.query.filter_by(device_id=device_id).first()
-    if not disp:
-        return json_error("dispenser no encontrado", 404)
-
-    if not disp.activo:
-        return json_error("dispenser desactivado", 400)
-
-    # 2) Buscar producto por slot_id para ese dispenser
-    prod = Producto.query.filter_by(
-        dispenser_id=disp.id,
-        slot_id=slot_id
-    ).first()
-
-    if not prod or not prod.habilitado:
-        return json_error("producto no disponible", 400)
-
-    # 3) Token MP (Test / Live / OAuth)
-    token, base_api = get_mp_token_and_base()
-    if not token:
-        return json_error("MP token no configurado", 500)
-
-    # 4) Precio final (del admin)
-    monto_final = int(prod.precio)
-
-    # 5) Construir la preferencia
-    backend_url = BACKEND_BASE_URL or request.url_root.rstrip("/")
-
-    body = {
-        "items": [{
-            "id": str(prod.id),
-            "title": prod.nombre,
-            "description": prod.nombre,
-            "quantity": 1,
-            "currency_id": "ARS",
-            "unit_price": float(monto_final),
-        }],
-
-        # Información que recuperamos en el webhook
-        "metadata": {
-            "product_id": prod.id,
-            "slot_id": prod.slot_id,
-            "producto": prod.nombre,
-            "litros": 1,
-            "dispenser_id": disp.id,
-            "device_id": disp.device_id,
-            "precio_final": monto_final,
-        },
-
-        "notification_url": f"{backend_url}/api/mp/webhook",
-
-        "auto_return": "approved",
-        "back_urls": {
-            "success": f"{backend_url}/gracias",
-            "failure": f"{backend_url}/gracias",
-            "pending": f"{backend_url}/gracias",
-        },
-
-        "purpose": "wallet_purchase",
-        "expires": False
-    }
-
-    # 6) Crear preferencia en MP
-    try:
-        r = requests.post(
-            f"{base_api}/checkout/preferences",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            },
-            json=body,
-            timeout=20
-        )
-        r.raise_for_status()
-    except Exception as e:
-        detail = getattr(r, "text", str(e))[:600]
-        return json_error("mp_preference_failed", 502, detail)
-
-    pref = r.json() or {}
-    link = pref.get("init_point") or pref.get("sandbox_init_point")
-    if not link:
-        return json_error("preferencia_sin_link", 502, pref)
-
-    # Devuelve { ok: true, link: "https://..." }
-    return ok_json({"ok": True, "link": link})
+    # Redirigimos directo al flujo de pago de MP
+    return redirect(link)
 # =========================
 # WEBHOOK MP (payment + merchant_order)
 # =========================
