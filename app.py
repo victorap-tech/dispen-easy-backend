@@ -344,13 +344,23 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int
         "litros": int(litros or 1),
     })
 
-    with _mqtt_lock:
-        if not _mqtt_client:
-            return False
-        t = topic_cmd(device_id)
-        info = _mqtt_client.publish(t, payload, qos=1, retain=False)
-        return info.rc == mqtt.MQTT_ERR_SUCCESS
+    for i in range(10):  # reintenta hasta 10 veces
+        with _mqtt_lock:
+            if _mqtt_client:
+                t = topic_cmd(device_id)
+                info = _mqtt_client.publish(t, payload, qos=1, retain=False)
+                if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    app.logger.info(f"[MQTT] Publicado OK → {t} {payload}")
+                    return True
+                else:
+                    app.logger.error(f"[MQTT] ERROR rc={info.rc}")
 
+        app.logger.info("[MQTT] Cliente no listo, reintentando...")
+        import time
+        time.sleep(0.5)
+
+    app.logger.error("[MQTT] No se pudo publicar comando después de reintentos")
+    return False
 
 # =========================
 # RUTAS BÁSICAS
