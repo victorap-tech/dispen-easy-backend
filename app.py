@@ -711,77 +711,79 @@ def mp_webhook():
         data = request.json or {}
         app.logger.info(f"[WEBHOOK] recibido: {data}")
 
-        topic = data.get("type") or data.get("topic")
-        if topic not in ("payment", "merchant_order"):
+        # Detecta cualquier formato de MP
+        tipo = (
+            data.get("type") or
+            data.get("topic") or
+            data.get("action") or ""
+        ).lower()
+
+        if not ("payment" in tipo or "merchant_order" in tipo):
             return "ok", 200
 
         token, _ = get_mp_token_and_base()
-        if not token:
-            app.logger.error("[WEBHOOK] MP token no configurado")
-            return "ok", 200
-
         mp_sdk = mercadopago.SDK(token)
 
-        if topic == "payment":
+        # ---- PAYMENT ----
+        if "payment" in tipo:
             payment_id = None
-            if isinstance(data.get("data"), dict) and data["data"].get("id"):
-                payment_id = data["data"]["id"]
+
+            if isinstance(data.get("data"), dict):
+                payment_id = data["data"].get("id")
+
             if not payment_id and data.get("resource"):
-                try:
-                    payment_id = data["resource"].split("/")[-1]
-                except:
-                    pass
+                payment_id = str(data["resource"]).split("/")[-1]
 
             if not payment_id:
                 return "ok", 200
 
             payment_id = str(payment_id)
+
             try:
                 resp = mp_sdk.payment().get(payment_id)
                 info = resp.get("response") or {}
-            except Exception as e:
+            except:
                 return "ok", 200
 
             _procesar_pago_desde_info(payment_id, info)
 
-        elif topic == "merchant_order":
-            merchant_order_id = None
-            if isinstance(data.get("data"), dict) and data["data"].get("id"):
-                merchant_order_id = data["data"]["id"]
-            if not merchant_order_id and data.get("resource"):
-                try:
-                    merchant_order_id = data["resource"].split("/")[-1]
-                except:
-                    pass
-            if not merchant_order_id:
+        # ---- MERCHANT ORDER ----
+        if "merchant_order" in tipo:
+            mo_id = None
+
+            if isinstance(data.get("data"), dict):
+                mo_id = data["data"].get("id")
+
+            if not mo_id and data.get("resource"):
+                mo_id = str(data["resource"]).split("/")[-1]
+
+            if not mo_id:
                 return "ok", 200
 
-            merchant_order_id = str(merchant_order_id)
+            mo_id = str(mo_id)
 
             try:
-                mo_resp = mp_sdk.merchant_order().get(merchant_order_id)
+                mo_resp = mp_sdk.merchant_order().get(mo_id)
                 mo_info = mo_resp.get("response") or {}
             except:
                 return "ok", 200
 
-            payments = mo_info.get("payments") or []
-            for p_ref in payments:
-                p_id = p_ref.get("id")
+            for pay in mo_info.get("payments") or []:
+                p_id = pay.get("id")
                 if not p_id:
                     continue
-                p_id = str(p_id)
+
                 try:
-                    resp = mp_sdk.payment().get(p_id)
+                    resp = mp_sdk.payment().get(str(p_id))
                     info = resp.get("response") or {}
+                    _procesar_pago_desde_info(str(p_id), info)
                 except:
                     continue
-
-                _procesar_pago_desde_info(p_id, info)
 
         return "ok", 200
 
     except Exception as e:
-        db.session.rollback()
+        app.logger.error(f"[WEBHOOK ERROR] {e}")
         return "ok", 200
 
 @app.post("/webhook")
