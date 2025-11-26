@@ -144,19 +144,25 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
         except Exception as e:
             app.logger.error(f"[WEBHOOK] No se pudo recuperar metadata: {e}")
 
-    product_id = _to_int(metadata.get("product_id") or 0)
-    slot_id = _to_int(metadata.get("slot_id") or 0)
+    product_id   = _to_int(metadata.get("product_id") or 0)
+    slot_id      = _to_int(metadata.get("slot_id") or 0)
     dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
-    device_id = (metadata.get("device_id") or "").strip()
-    litros_md = _to_int(metadata.get("litros") or 1)
+    device_id    = (metadata.get("device_id") or "").strip()
+    litros_md    = _to_int(metadata.get("litros") or 1)
     producto_nom = metadata.get("producto") or info.get("description") or ""
-    monto_val = info.get("transaction_amount") or metadata.get("precio_final") or 0
+    monto_val    = info.get("transaction_amount") or metadata.get("precio_final") or 0
 
     if not device_id or not slot_id:
         app.logger.error("[WEBHOOK] Falta device_id o slot_id")
         return
 
+    # 🔐 ANTI-DUPLICADOS: si ya está procesado y viene otra vez approved, no hago nada
     pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
+    if pago and pago.procesado and status == "approved":
+        app.logger.info(f"[WEBHOOK] Pago {payment_id} ya procesado, ignorando duplicado")
+        return
+
+    # Crear o actualizar registro
     if not pago:
         pago = Pago(
             mp_payment_id=str(payment_id),
@@ -174,17 +180,23 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
         db.session.add(pago)
     else:
         pago.estado = status
+        pago.producto = producto_nom or pago.producto
+        pago.slot_id = slot_id or pago.slot_id
+        pago.litros = litros_md or pago.litros
+        pago.monto = monto_val or pago.monto
         pago.raw = info
+
     db.session.commit()
 
-    if status == "approved":
+    # Solo cuando queda en approved y NO estaba procesado todavía
+    if status == "approved" and not pago.procesado:
         ok = send_dispense_cmd(device_id, payment_id, slot_id, litros_md)
         if ok:
             pago.procesado = True
             db.session.commit()
+            app.logger.info(f"[WEBHOOK] Pago {payment_id} marcado como procesado")
         else:
             app.logger.error(f"[MQTT] ERROR al enviar comando a {device_id}")
-
 # -----------------------
 # Helpers
 # -----------------------
