@@ -712,6 +712,63 @@ def crear_preferencia_api():
 
     return ok_json({"ok": True, "link": link})
 
+@app.get("/qr/<int:slot_id>")
+def qr_dynamic(slot_id):
+    import requests
+
+    # Buscar el producto real
+    prod = Producto.query.filter_by(slot_id=slot_id).first()
+    if not prod or not prod.habilitado:
+        return "Producto no disponible", 404
+
+    disp = Dispenser.query.get(prod.dispenser_id)
+    if not disp or not disp.activo:
+        return "Dispenser no disponible", 404
+
+    # Obtener token (usa test/live o OAuth según tu sistema)
+    token, _ = get_mp_token_and_base()
+
+    preferencia = {
+        "items": [{
+            "id": str(prod.id),
+            "title": prod.nombre,
+            "description": prod.nombre,
+            "quantity": 1,
+            "unit_price": float(prod.precio)
+        }],
+        "metadata": {
+            "product_id": prod.id,
+            "slot_id": prod.slot_id,
+            "dispenser_id": disp.id,
+            "device_id": disp.device_id,
+            "litros": 1,
+            "precio_final": prod.precio,
+        },
+        "notification_url": f"{BACKEND_BASE_URL}/api/mp/webhook",
+        "auto_return": "approved",
+        "back_urls": {
+            "success": f"{BACKEND_BASE_URL}/gracias",
+            "failure": f"{BACKEND_BASE_URL}/gracias",
+            "pending": f"{BACKEND_BASE_URL}/gracias"
+        }
+    }
+
+    r = requests.post(
+        "https://api.mercadopago.com/checkout/preferences",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        json=preferencia
+    )
+
+    if r.status_code >= 300:
+        return f"Error al crear preferencia: {r.text}", 500
+
+    data = r.json()
+    link = data.get("init_point") or data.get("sandbox_init_point")
+
+    return redirect(link)
 
 # =========================
 # WEBHOOK MP (payment + merchant_order)
