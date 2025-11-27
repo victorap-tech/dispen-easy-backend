@@ -85,10 +85,14 @@ class Producto(db.Model):
     precio = db.Column(db.Float, nullable=False)
     cantidad = db.Column(db.Integer, nullable=False)
     slot_id = db.Column(db.Integer, nullable=False)
+
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
     bundle_precios = db.Column(JSONB, nullable=True)
+
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
-    tiempo_ms = db.Column(db.Integer, nullable=False, default=1000)   # ⬅ NUEVO
+
+    # 👉 NUEVO CAMPO (tiempo de dispensado configurable desde admin)
+    tiempo_ms = db.Column(db.Integer, nullable=False, server_default="2000")
 
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
@@ -520,6 +524,7 @@ def api_productos_create():
         porcion_litros=1,
         bundle_precios={},
         habilitado=habilitado,
+        tiempo_ms=tiempo_ms,
     )
     db.session.add(p)
     db.session.commit()
