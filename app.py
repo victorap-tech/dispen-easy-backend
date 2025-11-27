@@ -88,6 +88,8 @@ class Producto(db.Model):
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
     bundle_precios = db.Column(JSONB, nullable=True)
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
+    tiempo_ms = db.Column(db.Integer, nullable=False, default=1000)   # ⬅ NUEVO
+
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
 
