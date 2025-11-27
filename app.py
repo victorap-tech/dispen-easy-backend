@@ -489,11 +489,14 @@ def api_dispensers_create():
 @app.get("/api/productos")
 def api_productos_list():
     disp_id = _to_int(request.args.get("dispenser_id") or 0)
+
     q = Producto.query
     if disp_id:
         q = q.filter(Producto.dispenser_id == disp_id)
-    prods = q.order_by(Producto.dispenser_id.asc(), Producto.slot_id.asc()).all()
-    return jsonify([serialize_producto(p) for p in prods])
+
+    q = q.order_by(Producto.slot_id.asc()).all()
+
+    return jsonify([serialize_producto(p) for p in q])
 
 @app.post("/api/productos")
 def api_productos_create():
