@@ -523,9 +523,12 @@ def api_productos_create():
     ).first():
         return json_error("slot ya usado en este dispenser", 409)
 
-   # Normalizar tiempo_ms
+# Normalizar tiempo_ms
 try:
-    tiempo_final = int(tiempo_ms) if tiempo_ms not in (None, "", []) else 1000
+    if tiempo_ms not in (None, "", []):
+        tiempo_final = int(tiempo_ms)
+    else:
+        tiempo_final = 1000
 except:
     tiempo_final = 1000
 
@@ -541,10 +544,10 @@ p = Producto(
     tiempo_ms=tiempo_final,
 )
 
-    db.session.add(p)
-    db.session.commit()
+db.session.add(p)
+db.session.commit()
 
-    return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
+return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
 
 @app.put("/api/productos/<int:pid>")
 def api_productos_update(pid):
