@@ -561,6 +561,11 @@ def api_productos_update(pid):
                 ).first():
                     return json_error("slot ya usado en este dispenser", 409)
                 p.slot_id = new_slot
+
+        # 👉 NUEVO: actualizar el tiempo de dispensado
+        if "tiempo_ms" in data:
+            p.tiempo_ms = _to_int(data["tiempo_ms"])
+
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
