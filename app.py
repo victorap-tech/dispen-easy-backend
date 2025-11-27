@@ -523,17 +523,23 @@ def api_productos_create():
     ).first():
         return json_error("slot ya usado en este dispenser", 409)
 
-    p = Producto(
-        dispenser_id=dispenser_id,
-        nombre=nombre,
-        precio=precio,
-        cantidad=0,
-        slot_id=slot,
-        porcion_litros=1,
-        bundle_precios={},
-        habilitado=habilitado,
-        tiempo_ms=tiempo_ms,          # 👈 agregado
-    )
+   # Normalizar tiempo_ms
+try:
+    tiempo_final = int(tiempo_ms) if tiempo_ms not in (None, "", []) else 1000
+except:
+    tiempo_final = 1000
+
+p = Producto(
+    dispenser_id=dispenser_id,
+    nombre=nombre,
+    precio=precio,
+    cantidad=0,
+    slot_id=slot,
+    porcion_litros=1,
+    bundle_precios={},
+    habilitado=habilitado,
+    tiempo_ms=tiempo_final,
+)
 
     db.session.add(p)
     db.session.commit()
