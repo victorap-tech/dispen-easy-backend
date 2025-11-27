@@ -495,6 +495,7 @@ def api_productos_list():
 @app.post("/api/productos")
 def api_productos_create():
     data = request.get_json(silent=True) or {}
+
     dispenser_id = _to_int(data.get("dispenser_id") or 0)
     if not dispenser_id or not Dispenser.query.get(dispenser_id):
         return json_error("dispenser_id inválido", 400)
@@ -504,11 +505,15 @@ def api_productos_create():
     slot = _to_int(data.get("slot") or 0) or 1
     habilitado = bool(data.get("habilitado", True))
 
+    # 👉 nuevo parámetro opcional
+    tiempo_ms = _to_int(data.get("tiempo_ms") or 2000)
+
     if not nombre:
         return json_error("nombre requerido", 400)
     if precio <= 0:
         return json_error("precio debe ser > 0", 400)
 
+    # evitar slot duplicado
     if Producto.query.filter(
         Producto.dispenser_id == dispenser_id,
         Producto.slot_id == slot
@@ -524,13 +529,13 @@ def api_productos_create():
         porcion_litros=1,
         bundle_precios={},
         habilitado=habilitado,
-        tiempo_ms=tiempo_ms,
+        tiempo_ms=tiempo_ms,          # 👈 agregado
     )
+
     db.session.add(p)
     db.session.commit()
 
     return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
-
 
 @app.put("/api/productos/<int:pid>")
 def api_productos_update(pid):
