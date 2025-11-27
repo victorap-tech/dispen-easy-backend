@@ -1,4 +1,4 @@
-# app.py – Dispenser Agua (2 productos, con tiempo_segundos configurable)
+# app.py – Dispenser Agua (2 productos, sin litros/stock en la UI, con OAuth MP para vincular cuenta del comercio)
 
 import os
 import logging
@@ -88,10 +88,6 @@ class Producto(db.Model):
     porcion_litros = db.Column(db.Integer, nullable=False, server_default="1")
     bundle_precios = db.Column(JSONB, nullable=True)
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
-
-    # *** NUEVO ***
-    tiempo_segundos = db.Column(db.Integer, nullable=False, default=23)
-
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
 
@@ -128,7 +124,7 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
 
     app.logger.info(f"[WEBHOOK] payment_id={payment_id} status={status} metadata={metadata}")
 
-    # Recuperar metadata si no vino
+    # Recuperar metadata si MP no la envía
     if not metadata:
         try:
             pref_id = info.get("order", {}).get("id") or info.get("preference_id")
@@ -140,8 +136,11 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
                     timeout=10
                 )
                 r2.raise_for_status()
-                metadata = (r2.json() or {}).get("metadata") or {}
-                app.logger.info("[WEBHOOK] Metadata recuperada desde preferencia")
+                pref_info = r2.json() or {}
+                meta2 = pref_info.get("metadata") or {}
+                if meta2:
+                    metadata = meta2
+                    app.logger.info("[WEBHOOK] Metadata recuperada desde preferencia")
         except Exception as e:
             app.logger.error(f"[WEBHOOK] No se pudo recuperar metadata: {e}")
 
@@ -150,18 +149,20 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
     dispenser_id = _to_int(metadata.get("dispenser_id") or 0)
     device_id    = (metadata.get("device_id") or "").strip()
     litros_md    = _to_int(metadata.get("litros") or 1)
-    tiempo_seg   = _to_int(metadata.get("tiempo_segundos") or 23)
     producto_nom = metadata.get("producto") or info.get("description") or ""
     monto_val    = info.get("transaction_amount") or metadata.get("precio_final") or 0
 
     if not device_id or not slot_id:
+        app.logger.error("[WEBHOOK] Falta device_id o slot_id")
         return
 
+    # 🔐 ANTI-DUPLICADOS: si ya está procesado y viene otra vez approved, no hago nada
     pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
-
     if pago and pago.procesado and status == "approved":
+        app.logger.info(f"[WEBHOOK] Pago {payment_id} ya procesado, ignorando duplicado")
         return
 
+    # Crear o actualizar registro
     if not pago:
         pago = Pago(
             mp_payment_id=str(payment_id),
@@ -187,13 +188,15 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
 
     db.session.commit()
 
+    # Solo cuando queda en approved y NO estaba procesado todavía
     if status == "approved" and not pago.procesado:
-        ok = send_dispense_cmd(device_id, payment_id, slot_id, litros_md, tiempo_seg)
+        ok = send_dispense_cmd(device_id, payment_id, slot_id, litros_md)
         if ok:
             pago.procesado = True
             db.session.commit()
-
-
+            app.logger.info(f"[WEBHOOK] Pago {payment_id} marcado como procesado")
+        else:
+            app.logger.error(f"[MQTT] ERROR al enviar comando a {device_id}")
 # -----------------------
 # Helpers
 # -----------------------
@@ -233,7 +236,6 @@ def serialize_producto(p: Producto) -> dict:
         "precio": float(p.precio),
         "slot": int(p.slot_id),
         "habilitado": bool(p.habilitado),
-        "tiempo_segundos": int(p.tiempo_segundos or 23),  # *** NUEVO ***
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
@@ -250,7 +252,6 @@ def kv_set(key, value):
 def kv_get(key, default=""):
     row = KV.query.get(key)
     return row.value if row else default
-
 
 # -----------------------
 # Auth simple Admin
@@ -282,7 +283,8 @@ def _auth_guard():
         return json_error("unauthorized", 401)
 
     return None
-    # -----------------------
+
+# -----------------------
 # MP: Tokens
 # -----------------------
 
@@ -303,9 +305,7 @@ def get_mp_token_and_base():
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
 
     return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
-
-
-# =========================
+    # =========================
 # MQTT
 # =========================
 
@@ -346,17 +346,7 @@ def start_mqtt_background():
 
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
-def send_dispense_cmd(
-    device_id: str,
-    payment_id: str,
-    slot_id: int,
-    litros: int = 1,
-    tiempo_segundos: int = 23
-) -> bool:
-    """
-    Publica en MQTT el comando de dispensado.
-    Ahora incluye tiempo_segundos para que el ESP32 lo use.
-    """
+def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
     if not MQTT_HOST:
         return False
 
@@ -364,7 +354,6 @@ def send_dispense_cmd(
         "payment_id": str(payment_id),
         "slot_id": int(slot_id),
         "litros": int(litros or 1),
-        "tiempo_segundos": int(tiempo_segundos or 23),
     })
 
     for i in range(10):  # reintenta hasta 10 veces
@@ -384,7 +373,6 @@ def send_dispense_cmd(
 
     app.logger.error("[MQTT] No se pudo publicar comando después de reintentos")
     return False
-
 
 # =========================
 # RUTAS BÁSICAS
@@ -450,7 +438,6 @@ def api_dispensers_create():
         db.session.add(d)
         db.session.commit()
 
-        # Por defecto 23 segundos en ambos slots
         p1 = Producto(
             dispenser_id=d.id,
             nombre="Agua fría",
@@ -458,7 +445,6 @@ def api_dispensers_create():
             cantidad=0,
             slot_id=1,
             habilitado=False,
-            tiempo_segundos=23,
         )
         p2 = Producto(
             dispenser_id=d.id,
@@ -467,7 +453,6 @@ def api_dispensers_create():
             cantidad=0,
             slot_id=2,
             habilitado=False,
-            tiempo_segundos=23,
         )
         db.session.add(p1)
         db.session.add(p2)
@@ -511,14 +496,11 @@ def api_productos_create():
     precio = float(data.get("precio") or 0)
     slot = _to_int(data.get("slot") or 0) or 1
     habilitado = bool(data.get("habilitado", True))
-    tiempo_seg = _to_int(data.get("tiempo_segundos") or 23)
 
     if not nombre:
         return json_error("nombre requerido", 400)
     if precio <= 0:
         return json_error("precio debe ser > 0", 400)
-    if tiempo_seg <= 0:
-        return json_error("tiempo_segundos debe ser > 0", 400)
 
     if Producto.query.filter(
         Producto.dispenser_id == dispenser_id,
@@ -535,7 +517,6 @@ def api_productos_create():
         porcion_litros=1,
         bundle_precios={},
         habilitado=habilitado,
-        tiempo_segundos=tiempo_seg,
     )
     db.session.add(p)
     db.session.commit()
@@ -567,12 +548,6 @@ def api_productos_update(pid):
                 ).first():
                     return json_error("slot ya usado en este dispenser", 409)
                 p.slot_id = new_slot
-        if "tiempo_segundos" in data:
-            t = _to_int(data["tiempo_segundos"])
-            if t <= 0:
-                return json_error("tiempo_segundos debe ser > 0", 400)
-            p.tiempo_segundos = t
-
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
@@ -624,22 +599,16 @@ def api_pagos_reenviar(pid):
         return json_error("pago sin slot", 400)
 
     device = p.device_id
-    tiempo_seg = 23
-
-    # Recuperar tiempo desde el producto si es posible
-    if p.product_id:
+    if not device and p.product_id:
         prod = Producto.query.get(p.product_id)
-        if prod:
-            tiempo_seg = int(prod.tiempo_segundos or 23)
-            if prod.dispenser_id and not device:
-                d = Dispenser.query.get(prod.dispenser_id)
-                if d:
-                    device = d.device_id
+        if prod and prod.dispenser_id:
+            d = Dispenser.query.get(prod.dispenser_id)
+            device = d.device_id if d else ""
 
     if not device:
         return json_error("sin device_id", 400)
 
-    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.litros or 1, tiempo_seg)
+    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.litros or 1)
     if not ok:
         return json_error("no se pudo publicar MQTT", 500)
 
@@ -658,6 +627,7 @@ def get_backend_base() -> str:
     """
     base = (BACKEND_BASE_URL or "").strip()
     if not base:
+        # request.url_root suele venir con / al final
         base = (request.url_root or "").rstrip("/")
     return base
 
@@ -665,6 +635,9 @@ def get_backend_base() -> str:
 # =========================
 # PAGOS – PREFERENCIA (ADMIN)
 # =========================
+# Esta ruta sigue igual que antes, sirve para crear una preferencia
+# puntual desde el Admin si querés generar un link de prueba.
+# NO es el QR universal del dispenser.
 
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
@@ -686,7 +659,6 @@ def crear_preferencia_api():
 
     monto_final = int(prod.precio)
     ts = int(time.time())
-    tiempo_seg = int(prod.tiempo_segundos or 23)
 
     external_reference = (
         f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
@@ -712,7 +684,6 @@ def crear_preferencia_api():
             "dispenser_id": disp.id,
             "device_id": disp.device_id,
             "precio_final": monto_final,
-            "tiempo_segundos": tiempo_seg,
         },
 
         "external_reference": external_reference,
@@ -725,6 +696,8 @@ def crear_preferencia_api():
         },
 
         "notification_url": f"{backend_url}/api/mp/webhook",
+
+        # Importante: para dispenser usamos wallet_purchase
         "purpose": "wallet_purchase",
         "expires": False,
 
@@ -764,18 +737,28 @@ def crear_preferencia_api():
 # =========================
 # QR UNIVERSAL POR DISPENSER Y SLOT
 # =========================
+# ESTE es el QR que vas a imprimir en el dispenser.
+# URL del QR físico:  https://TU_DOMINIO/qr/<device_id>/<slot_id>
+# Ejemplo:            https://dispenagua.com/qr/dispen-01/1
 
 @app.get("/qr/<device_id>/<int:slot_id>")
 def qr_universal(device_id, slot_id):
     """
-    QR físico: https://TU_DOMINIO/qr/<device_id>/<slot_id>
-    Siempre crea una nueva preferencia para ese dispenser+slot.
+    Cada vez que alguien escanea este QR:
+      1) Buscamos el dispenser por device_id
+      2) Buscamos el producto por dispenser_id + slot_id
+      3) Creamos una NUEVA preferencia de MercadoPago
+      4) Redirigimos (302) al init_point de esa preferencia
+
+    Resultado: UN SOLO QR físico por salida, pero infinitas compras.
     """
 
+    # 1) Buscar dispenser por device_id
     disp = Dispenser.query.filter_by(device_id=device_id).first()
     if not disp or not disp.activo:
         return "Dispenser no disponible", 404
 
+    # 2) Buscar producto por slot_id
     prod = Producto.query.filter_by(
         dispenser_id=disp.id,
         slot_id=slot_id
@@ -784,13 +767,13 @@ def qr_universal(device_id, slot_id):
     if not prod or not prod.habilitado:
         return "Producto no disponible", 404
 
+    # 3) Obtener token MP
     token, _base_api = get_mp_token_and_base()
     if not token:
         return "MP token no configurado", 500
 
     backend_url = get_backend_base()
     monto_final = float(prod.precio)
-    tiempo_seg = int(prod.tiempo_segundos or 23)
 
     body = {
         "items": [{
@@ -810,7 +793,6 @@ def qr_universal(device_id, slot_id):
             "dispenser_id": disp.id,
             "device_id": disp.device_id,
             "precio_final": monto_final,
-            "tiempo_segundos": tiempo_seg,
         },
 
         "notification_url": f"{backend_url}/api/mp/webhook",
@@ -821,12 +803,14 @@ def qr_universal(device_id, slot_id):
             "pending": f"{backend_url}/gracias"
         },
 
+        # Igual que arriba: pensado para vending tipo wallet
         "purpose": "wallet_purchase",
         "expires": False,
         "binary_mode": False,
         "statement_descriptor": "DISPENSER-AGUA"
     }
 
+    # 4) Crear preferencia
     try:
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
@@ -846,9 +830,8 @@ def qr_universal(device_id, slot_id):
     if not link:
         return "Preferencia sin link", 502
 
+    # Redirigimos directo al flujo de pago de MP
     return redirect(link)
-
-
 # =========================
 # WEBHOOK MP (payment + merchant_order)
 # =========================
@@ -859,6 +842,7 @@ def mp_webhook():
         data = request.json or {}
         app.logger.info(f"[WEBHOOK] recibido: {data}")
 
+        # Detecta cualquier formato de MP
         tipo = (
             data.get("type") or
             data.get("topic") or
