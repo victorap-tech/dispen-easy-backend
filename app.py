@@ -497,57 +497,70 @@ def api_productos_list():
 
 @app.post("/api/productos")
 def api_productos_create():
+    require_admin()
+
     data = request.get_json(silent=True) or {}
-
-    dispenser_id = _to_int(data.get("dispenser_id") or 0)
-    if not dispenser_id or not Dispenser.query.get(dispenser_id):
-        return json_error("dispenser_id inválido", 400)
-
-    nombre = str(data.get("nombre") or "").strip()
-    precio = float(data.get("precio") or 0)
-    slot = _to_int(data.get("slot") or 0) or 1
+    dispenser_id = data.get("dispenser_id")
+    nombre = (data.get("nombre") or "").strip()
+    precio = data.get("precio")
+    slot = data.get("slot")
     habilitado = bool(data.get("habilitado", True))
+    tiempo_ms = data.get("tiempo_ms")
 
-    # 👉 nuevo parámetro opcional
-    tiempo_ms = _to_int(data.get("tiempo_ms") or 2000)
+    if not dispenser_id:
+        return json_error("dispenser_id requerido", 400)
 
     if not nombre:
         return json_error("nombre requerido", 400)
+
+    try:
+        precio = float(precio)
+    except:
+        return json_error("precio debe ser número", 400)
+
     if precio <= 0:
         return json_error("precio debe ser > 0", 400)
 
-    # evitar slot duplicado
+    try:
+        slot = int(slot)
+    except:
+        return json_error("slot debe ser número", 400)
+
+    if not 1 <= slot <= 2:
+        return json_error("slot inválido (1–2)", 400)
+
+    # Revisar que no exista otro producto en ese slot
     if Producto.query.filter(
         Producto.dispenser_id == dispenser_id,
         Producto.slot_id == slot
     ).first():
         return json_error("slot ya usado en este dispenser", 409)
 
-# Normalizar tiempo_ms
-try:
-    if tiempo_ms not in (None, "", []):
-        tiempo_final = int(tiempo_ms)
-    else:
+    # Normalizar tiempo_ms
+    try:
+        if tiempo_ms not in (None, "", []):
+            tiempo_final = int(tiempo_ms)
+        else:
+            tiempo_final = 1000
+    except:
         tiempo_final = 1000
-except:
-    tiempo_final = 1000
 
-p = Producto(
-    dispenser_id=dispenser_id,
-    nombre=nombre,
-    precio=precio,
-    cantidad=0,
-    slot_id=slot,
-    porcion_litros=1,
-    bundle_precios={},
-    habilitado=habilitado,
-    tiempo_ms=tiempo_final,
-)
+    p = Producto(
+        dispenser_id=dispenser_id,
+        nombre=nombre,
+        precio=precio,
+        cantidad=0,
+        slot_id=slot,
+        porcion_litros=1,
+        bundle_precios={},
+        habilitado=habilitado,
+        tiempo_ms=tiempo_final,
+    )
 
-db.session.add(p)
-db.session.commit()
+    db.session.add(p)
+    db.session.commit()
 
-return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
+    return ok_json({"ok": True, "producto": serialize_producto(p)}, 201)
 
 @app.put("/api/productos/<int:pid>")
 def api_productos_update(pid):
