@@ -573,7 +573,10 @@ def api_productos_update(pid):
 
         # 👉 NUEVO: actualizar el tiempo de dispensado
         if "tiempo_ms" in data:
-            p.tiempo_ms = _to_int(data["tiempo_ms"])
+           try:
+             p.tiempo_ms = int(data["tiempo_ms"]) if data["tiempo_ms"] not in ("", None) else p.tiempo_ms
+           except:
+             p.tiempo_ms = p.tiempo_ms
 
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
