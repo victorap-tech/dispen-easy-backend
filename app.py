@@ -238,6 +238,7 @@ def serialize_producto(p: Producto) -> dict:
         "precio": float(p.precio),
         "slot": int(p.slot_id),
         "habilitado": bool(p.habilitado),
+        "tiempo_ms": int(getattr(p, "tiempo_ms", 1000)),   # ⬅ NUEVO
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
