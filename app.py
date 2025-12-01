@@ -111,7 +111,12 @@ class Producto(db.Model):
     tiempo_ms = db.Column(db.Integer, nullable=False, server_default="2000")
 
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-    updated_at = db.Column(db.DateTime(timezone=True), onupdate=db.func.now())
+    updated_at = db.Column(
+    db.DateTime(timezone=True),
+    nullable=False,
+    server_default=db.func.now(),
+    onupdate=db.func.now()
+)
 
     __table_args__ = (
         db.UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),
