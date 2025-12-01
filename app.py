@@ -95,8 +95,10 @@ class Dispenser(db.Model):
 
 class Producto(db.Model):
     __tablename__ = "producto"
+
     id = db.Column(db.Integer, primary_key=True)
     dispenser_id = db.Column(db.Integer, db.ForeignKey("dispenser.id", ondelete="SET NULL"), nullable=True, index=True)
+
     nombre = db.Column(db.String(100), nullable=False)
     precio = db.Column(db.Float, nullable=False)
     cantidad = db.Column(db.Integer, nullable=False)
@@ -107,16 +109,21 @@ class Producto(db.Model):
 
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
 
-    # 👉 NUEVO CAMPO (tiempo de dispensado configurable desde admin)
+    # NUEVO CAMPO
     tiempo_ms = db.Column(db.Integer, nullable=False, server_default="2000")
 
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.func.now(),
+    )
+
     updated_at = db.Column(
-    db.DateTime(timezone=True),
-    nullable=False,
-    server_default=db.func.now(),
-    onupdate=db.func.now()
-)
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.func.now(),   # <- ESTA ES LA CLAVE
+        onupdate=db.func.now()          # <- Y ESTA TAMBIÉN
+    )
 
     __table_args__ = (
         db.UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),
