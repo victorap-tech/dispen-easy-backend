@@ -59,6 +59,22 @@ logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
 # =========================
+# Auth simple manual (para proteger Admin)
+# =========================
+
+from flask import abort
+
+def require_admin():
+    """
+    Verifica el header x-admin-secret contra ADMIN_SECRET.
+    """
+    secret = request.headers.get("x-admin-secret", "")
+    if not ADMIN_SECRET:
+        return  # admin desactivado
+    if secret != ADMIN_SECRET:
+        abort(401)
+
+# =========================
 # Modelos
 # =========================
 
