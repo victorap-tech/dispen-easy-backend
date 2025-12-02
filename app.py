@@ -377,11 +377,30 @@ def _mqtt_on_message(client, userdata, msg):
     # ONLINE CHECK
     # --------------------------
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-        try:
-            payload = msg.payload.decode().strip()
-            device_id = msg.topic.split("/")[1]
+    try:
+        raw = msg.payload.decode().strip()
+        device_id = msg.topic.split("/")[1]
 
-            if payload == "online":
+        if raw == "online":
+            disp = Dispenser.query.filter_by(device_id=device_id).first()
+            if disp:
+                disp.online = True
+                db.session.commit()
+            return
+
+        # Si viene JSON
+        data = json.loads(raw)
+        status = (data.get("status") or "").lower()
+
+        if status in ("online", "reconnected", "wifi_reconnected"):
+            disp = Dispenser.query.filter_by(device_id=device_id).first()
+            if disp:
+                disp.online = True
+                db.session.commit()
+            return
+
+    except:
+        pass
                 disp = Dispenser.query.filter_by(device_id=device_id).first()
                 if disp:
                     disp.online = True
