@@ -344,6 +344,7 @@ def get_mp_token_and_base():
 
     return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
     # =========================
+# =========================
 # MQTT
 # =========================
 
@@ -366,28 +367,22 @@ def _mqtt_on_message(client, userdata, msg):
         app.logger.error(f"[MQTT] Error al decodificar JSON: {e}")
         return
 
-    # Esperamos ACK del ESP
     pago_id = data.get("pago_id")
     slot_id = data.get("slot_id")
     dispensado = data.get("dispensado")
 
-    # Solo procesamos mensajes de ACK correctos
     if not pago_id or dispensado is not True:
         app.logger.info("[MQTT] Mensaje ignorado (no es ACK de dispensado)")
         return
 
     app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
 
-    # Marcar pago como DISPENSADO en la base
-    from app import Pago  # evitar import circular
-
-    pago = Pago.query.filter_by(merchant_order_id=str(pago_id)).first()
+    pago = Pago.query.filter_by(mp_payment_id=str(pago_id)).first()
     if not pago:
         app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
         return
 
     pago.dispensado = True
-    pago.updated_at = datetime.utcnow()
 
     try:
         db.session.commit()
@@ -414,6 +409,7 @@ def start_mqtt_background():
                 _mqtt_client.tls_set()
             except Exception as e:
                 app.logger.error(f"[MQTT] TLS error: {e}")
+
         _mqtt_client.on_connect = _mqtt_on_connect
         _mqtt_client.on_message = _mqtt_on_message
         _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
@@ -422,9 +418,6 @@ def start_mqtt_background():
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
-    """
-    Envía el comando MQTT para iniciar un ciclo de dispensado
-    """
     if not MQTT_HOST:
         app.logger.error("[MQTT] MQTT_HOST no configurado")
         return False
@@ -440,7 +433,7 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int
     app.logger.info(f"[MQTT] Enviando comando: topic={topic}, payload={payload}")
 
     for intento in range(10):
-        with mqtt_lock:
+        with _mqtt_lock:
             if _mqtt_client:
                 info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
 
