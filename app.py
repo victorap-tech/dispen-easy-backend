@@ -396,7 +396,7 @@ def start_mqtt_background():
         app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
         return
 
-    def _run():
+def _run():
     """Hilo principal del cliente MQTT — CORREGIDO CON CONTEXTO"""
     global _mqtt_client
 
