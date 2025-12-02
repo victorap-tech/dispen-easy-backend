@@ -489,12 +489,17 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int
         app.logger.error("[MQTT] MQTT_HOST no configurado")
         return False
 
+    # Buscar el producto para obtener tiempo_ms
+    prod = Producto.query.filter_by(dispenser_id=pago.dispenser_id, slot_id=slot_id).first()
+    tiempo_ms = prod.tiempo_ms if prod else 1000
+    tiempo_segundos = int(tiempo_ms / 1000)
+
     topic = f"dispen/{device_id}/cmd/dispense"
 
     payload = json.dumps({
         "payment_id": str(payment_id),
         "slot_id": int(slot_id),
-        "litros": int(litros)
+        "tiempo_segundos": tiempo_segundos
     })
 
     app.logger.info(f"[MQTT] Enviando comando: topic={topic}, payload={payload}")
@@ -503,16 +508,10 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int
         with _mqtt_lock:
             if _mqtt_client:
                 info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
-
                 if info.rc == mqtt.MQTT_ERR_SUCCESS:
-                    app.logger.info(f"[MQTT] OK → {payload}")
                     return True
-                else:
-                    app.logger.error(f"[MQTT] ERROR rc={info.rc}, intento={intento+1}/10")
-
         time.sleep(0.3)
 
-    app.logger.error("[MQTT] No se pudo publicar comando después de 10 intentos")
     return False
 # =========================
 # RUTAS BÁSICAS
