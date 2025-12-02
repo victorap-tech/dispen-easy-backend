@@ -469,6 +469,21 @@ def start_mqtt_background():
 
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
+# WATCHDOG: si en 40s no llegó ONLINE, marcamos OFFLINE
+    def offline_watchdog():
+        import time
+        while True:
+            try:
+                ds = Dispenser.query.all()
+                for d in ds:
+                    d.online = False
+                db.session.commit()
+            except Exception:
+                pass
+            time.sleep(40)
+
+    threading.Thread(target=offline_watchdog, daemon=True).start()
+
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
     if not MQTT_HOST:
         app.logger.error("[MQTT] MQTT_HOST no configurado")
