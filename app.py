@@ -397,13 +397,22 @@ def start_mqtt_background():
         return
 
     def _run():
-        global _mqtt_client
+    """Hilo principal del cliente MQTT — CORREGIDO CON CONTEXTO"""
+    global _mqtt_client
+
+    # IMPORTANTE: Todo lo que use la DB o el contexto Flask
+    # debe ejecutarse dentro de este bloque
+    with app.app_context():
+
         _mqtt_client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="dispen-agua-backend"
         )
+
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+        # TLS
         if MQTT_PORT == 8883:
             try:
                 _mqtt_client.tls_set()
@@ -413,25 +422,16 @@ def start_mqtt_background():
         _mqtt_client.on_connect = _mqtt_on_connect
         _mqtt_client.on_message = _mqtt_on_message
 
-        _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        try:
+            app.logger.info("[MQTT] Conectando con HiveMQ...")
+            _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        except Exception as e:
+            app.logger.error(f"[MQTT] ERROR al conectar: {e}")
+            return
+
+        # 🔥🔥🔥 IMPORTANTE
+        # loop_forever debe correr dentro del app_context()
         _mqtt_client.loop_forever()
-
-    threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
-
-    # WATCHDOG: marca offline cada 40s si no recibe ONLINE
-    def offline_watchdog():
-        while True:
-            try:
-                ds = Dispenser.query.all()
-                for d in ds:
-                    d.online = False
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
-            time.sleep(40)
-
-    threading.Thread(target=offline_watchdog, name="offline-watchdog", daemon=True).start()
-
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_id: int, litros: int = 1) -> bool:
     """
     Envía comando por MQTT al ESP32:
