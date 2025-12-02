@@ -412,12 +412,13 @@ def start_mqtt_background():
 
         _mqtt_client.on_connect = _mqtt_on_connect
         _mqtt_client.on_message = _mqtt_on_message
+
         _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
         _mqtt_client.loop_forever()
 
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
-    # WATCHDOG: si en 40s no llegó ONLINE, marcamos OFFLINE
+    # WATCHDOG: marca offline cada 40s si no recibe ONLINE
     def offline_watchdog():
         while True:
             try:
