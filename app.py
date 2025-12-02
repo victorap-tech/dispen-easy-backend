@@ -391,18 +391,26 @@ def _mqtt_on_message(client, userdata, msg):
 
     # Otros topics (si los hubiera) se podrían manejar aquí
 
+# =========================
+# MQTT THREAD – DEFINITIVO
+# =========================
+
 def start_mqtt_background():
+    """Inicia el hilo del cliente MQTT correctamente."""
     if not MQTT_HOST:
         app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
         return
+
+    app.logger.info("[MQTT] Iniciando hilo MQTT...")
+    th = threading.Thread(target=_run, name="mqtt-thread", daemon=True)
+    th.start()
+
 
 def _run():
     """Hilo principal del cliente MQTT — CORREGIDO CON CONTEXTO"""
     global _mqtt_client
 
-    # IMPORTANTE: Todo lo que use la DB o el contexto Flask
-    # debe ejecutarse dentro de este bloque
-    with app.app_context():
+    with app.app_context():  # 🔥 FIX CRÍTICO
 
         _mqtt_client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -412,7 +420,7 @@ def _run():
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        # TLS
+        # TLS si se usa 8883
         if MQTT_PORT == 8883:
             try:
                 _mqtt_client.tls_set()
@@ -423,14 +431,13 @@ def _run():
         _mqtt_client.on_message = _mqtt_on_message
 
         try:
-            app.logger.info("[MQTT] Conectando con HiveMQ...")
+            app.logger.info(f"[MQTT] Conectando a {MQTT_HOST}:{MQTT_PORT} ...")
             _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
         except Exception as e:
             app.logger.error(f"[MQTT] ERROR al conectar: {e}")
             return
 
-        # 🔥🔥🔥 IMPORTANTE
-        # loop_forever debe correr dentro del app_context()
+        # 🔥 loop_forever debe correr dentro del app_context
         _mqtt_client.loop_forever()
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_id: int, litros: int = 1) -> bool:
     """
