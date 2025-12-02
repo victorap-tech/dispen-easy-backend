@@ -377,11 +377,11 @@ def _mqtt_on_message(client, userdata, msg):
     # ONLINE CHECK
     # --------------------------
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-    try:
-        raw = msg.payload.decode().strip()
-        device_id = msg.topic.split("/")[1]
+       try:
+         raw = msg.payload.decode().strip()
+         device_id = msg.topic.split("/")[1]
 
-        if raw == "online":
+         if raw == "online":
             disp = Dispenser.query.filter_by(device_id=device_id).first()
             if disp:
                 disp.online = True
