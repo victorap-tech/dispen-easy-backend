@@ -373,34 +373,54 @@ def _mqtt_on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode()
         data = json.loads(payload)
-    except Exception as e:
-        app.logger.error(f"[MQTT] Error al decodificar JSON: {e}")
+    except:
+        app.logger.error("[MQTT] JSON inválido")
         return
 
+    # -----------------------------------------------------
+    # 🔥 DETECCIÓN DE ONLINE / OFFLINE DESDE ESP32
+    # -----------------------------------------------------
+    device = data.get("device")
+    status = str(data.get("status") or "").lower()
+
+    if device and status:
+        disp = Dispenser.query.filter_by(device_id=device).first()
+        if disp:
+            if status in ("online", "reconnected", "wifi_reconnected"):
+                disp.online = True
+            elif status == "offline":
+                disp.online = False
+
+            try:
+                db.session.commit()
+                app.logger.info(f"[ONLINE] {device} → {disp.online}")
+            except Exception as e:
+                db.session.rollback()
+                app.logger.error(f"[ONLINE] Error guardando estado: {e}")
+
+    # -----------------------------------------------------
+    # 🔥 PROCESAR ACK DE DISPENSADO (lo viejo se mantiene)
+    # -----------------------------------------------------
     pago_id = data.get("pago_id")
     slot_id = data.get("slot_id")
     dispensado = data.get("dispensado")
 
-    if not pago_id or dispensado is not True:
-        app.logger.info("[MQTT] Mensaje ignorado (no es ACK de dispensado)")
-        return
+    if pago_id and dispensado is True:
+        app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
 
-    app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
+        pago = Pago.query.filter_by(mp_payment_id=str(pago_id)).first()
+        if not pago:
+            app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
+            return
 
-    pago = Pago.query.filter_by(mp_payment_id=str(pago_id)).first()
-    if not pago:
-        app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
-        return
+        pago.dispensado = True
 
-    pago.dispensado = True
-
-    try:
-        db.session.commit()
-        app.logger.info(f"[MQTT] Pago {pago_id} marcado como DISPENSADO ✔")
-    except Exception as e:
-        app.logger.error(f"[MQTT] Error guardando DISPENSADO: {e}")
-        db.session.rollback()
-
+        try:
+            db.session.commit()
+            app.logger.info(f"[MQTT] Pago {pago_id} marcado como DISPENSADO ✔")
+        except Exception as e:
+            app.logger.error(f"[MQTT] Error guardando DISPENSADO: {e}")
+            db.session.rollback()
 def start_mqtt_background():
     if not MQTT_HOST:
         app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
