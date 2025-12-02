@@ -39,36 +39,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
 MQTT_USER = os.getenv("MQTT_USER", "").strip()
 MQTT_PASS = os.getenv("MQTT_PASS", "").strip()
 
-mqtt_client = mqtt.Client()
 
-# TLS INSEGURO (igual que ESP32.setInsecure())
-mqtt_client.tls_set(
-    certfile=None,
-    keyfile=None,
-    cert_reqs=ssl.CERT_NONE,
-    tls_version=ssl.PROTOCOL_TLS,
-    ciphers=None
-)
-mqtt_client.tls_insecure_set(True)
-
-# Usuario / contraseña
-mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-
-# Callback conexión
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        app.logger.info("[MQTT] Conectado OK a HiveMQ Cloud")
-    else:
-        app.logger.error(f"[MQTT] Error al conectar rc={rc}")
-
-mqtt_client.on_connect = on_connect
-
-# Conexión
-try:
-    mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()
-except Exception as e:
-    app.logger.error(f"[MQTT] Error al iniciar: {e}")
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
