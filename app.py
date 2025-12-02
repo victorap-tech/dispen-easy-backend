@@ -3,6 +3,7 @@
 import os
 import logging
 import threading
+import time
 import json as _json
 from typing import Optional
 
@@ -10,7 +11,7 @@ import requests
 import paho.mqtt.client as mqtt
 import mercadopago
 import json
-from flask import Flask, jsonify, request, make_response, redirect
+from flask import Flask, jsonify, request, make_response, redirect, abort
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy.dialects.postgresql import JSONB
@@ -62,8 +63,6 @@ app.logger.setLevel(logging.INFO)
 # Auth simple manual (para proteger Admin)
 # =========================
 
-from flask import abort
-
 def require_admin():
     """
     Verifica el header x-admin-secret contra ADMIN_SECRET.
@@ -92,7 +91,7 @@ class Dispenser(db.Model):
     nombre = db.Column(db.String(100), nullable=False, default="")
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
 
-    # NUEVO → indica si el dispenser está conectado por MQTT
+    # indica si el dispenser está conectado por MQTT
     online = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
 
     created_at = db.Column(
@@ -118,7 +117,7 @@ class Producto(db.Model):
 
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
 
-    # NUEVO CAMPO
+    # tiempo de dispensado configurado para ese slot
     tiempo_ms = db.Column(db.Integer, nullable=False, server_default="2000")
 
     created_at = db.Column(
@@ -130,8 +129,8 @@ class Producto(db.Model):
     updated_at = db.Column(
         db.DateTime(timezone=True),
         nullable=False,
-        server_default=db.func.now(),   # <- ESTA ES LA CLAVE
-        onupdate=db.func.now()          # <- Y ESTA TAMBIÉN
+        server_default=db.func.now(),
+        onupdate=db.func.now()
     )
 
     __table_args__ = (
@@ -157,8 +156,330 @@ class Pago(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 # -----------------------
-# PROCESAR PAGO
+# Helpers básicos
 # -----------------------
+
+def ok_json(data, status=200):
+    return jsonify(data), status
+
+def json_error(msg, status=400, extra=None):
+    payload = {"error": msg}
+    if extra is not None:
+        payload["detail"] = extra
+    return jsonify(payload), status
+
+def _to_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+def serialize_dispenser(d: Dispenser) -> dict:
+    return {
+        "id": d.id,
+        "device_id": d.device_id,
+        "nombre": d.nombre,
+        "activo": bool(d.activo),
+        "online": bool(d.online),
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+    }
+
+def serialize_producto(p: Producto) -> dict:
+    return {
+        "id": p.id,
+        "dispenser_id": p.dispenser_id,
+        "nombre": p.nombre,
+        "precio": float(p.precio),
+        "slot": int(p.slot_id),
+        "habilitado": bool(p.habilitado),
+        "tiempo_ms": int(p.tiempo_ms),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+def kv_set(key, value):
+    row = KV.query.get(key)
+    if row:
+        row.value = value
+    else:
+        row = KV(key=key, value=value)
+        db.session.add(row)
+    db.session.commit()
+
+def kv_get(key, default=""):
+    row = KV.query.get(key)
+    return row.value if row else default
+
+# -----------------------
+# Auth simple Admin
+# -----------------------
+
+PUBLIC_PATHS = {
+    "/", "/gracias",
+    "/api/config",
+    "/api/pagos/preferencia",
+    "/api/mp/webhook", "/webhook", "/mp/webhook",
+    "/api/mp/oauth/init",
+    "/api/mp/oauth/callback",
+}
+
+@app.before_request
+def _auth_guard():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    p = request.path
+
+    if p in PUBLIC_PATHS or p.startswith("/qr/"):
+        return None
+
+    if not ADMIN_SECRET:
+        return None
+
+    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
+        return json_error("unauthorized", 401)
+
+    return None
+
+# -----------------------
+# MP: Tokens
+# -----------------------
+
+def get_mp_mode() -> str:
+    row = KV.query.get("mp_mode")
+    return (row.value if row else "test").lower()
+
+def get_oauth_access_token() -> str:
+    return kv_get("mp_oauth_access_token", "").strip()
+
+def get_mp_token_and_base():
+    oauth = get_oauth_access_token()
+    if oauth:
+        return oauth, "https://api.mercadopago.com"
+
+    mode = get_mp_mode()
+    if mode == "live":
+        return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
+
+    return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
+
+# =========================
+# MQTT
+# =========================
+
+_mqtt_client: Optional[mqtt.Client] = None
+_mqtt_lock = threading.Lock()
+
+def topic_cmd(device_id: str) -> str:
+    return f"dispen/{device_id}/cmd/dispense"
+
+def _mqtt_on_connect(client, userdata, flags, rc, props=None):
+    app.logger.info(f"[MQTT] backend conectado al broker rc={rc}")
+    # Pings de estado online/offline
+    client.subscribe("dispen/+/status", qos=1)
+    # ACK de dispensado
+    client.subscribe("dispen/+/state/dispense", qos=1)
+
+def _handle_status_message(topic: str, payload_raw: bytes):
+    """
+    Maneja mensajes en dispen/<device_id>/status
+    Puede ser:
+      - "online"
+      - JSON {"device": "...", "status": "online|offline|wifi_reconnected|reconnected"}
+    """
+    try:
+        raw = payload_raw.decode().strip()
+    except Exception:
+        raw = ""
+
+    device_id = topic.split("/")[1] if "/" in topic else ""
+
+    # Caso simple: texto plano
+    if raw == "online":
+        if device_id:
+            disp = Dispenser.query.filter_by(device_id=device_id).first()
+            if disp:
+                disp.online = True
+                db.session.commit()
+                app.logger.info(f"[MQTT] {device_id} marcado ONLINE (raw)")
+        return
+
+    # Caso JSON
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+
+    status = str(data.get("status") or "").lower()
+    dev = (data.get("device") or device_id).strip()
+
+    if not dev or not status:
+        return
+
+    disp = Dispenser.query.filter_by(device_id=dev).first()
+    if not disp:
+        return
+
+    if status in ("online", "reconnected", "wifi_reconnected"):
+        disp.online = True
+    elif status == "offline":
+        disp.online = False
+
+    try:
+        db.session.commit()
+        app.logger.info(f"[ONLINE] {dev} → {disp.online}")
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"[ONLINE] Error guardando estado: {e}")
+
+def _handle_ack_message(topic: str, payload_raw: bytes):
+    """
+    Maneja ACK de dispensado en dispen/<device_id>/state/dispense
+    Espera JSON:
+      { "pago_id": "...", "slot_id": 1, "dispensado": true }
+    """
+    try:
+        raw = payload_raw.decode().strip()
+    except Exception:
+        raw = ""
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        app.logger.error(f"[MQTT] ACK JSON inválido: {raw!r}")
+        return
+
+    pago_id = data.get("pago_id") or data.get("payment_id")
+    slot_id = data.get("slot_id")
+    dispensado = data.get("dispensado")
+
+    if not pago_id or dispensado is not True:
+        return
+
+    app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
+
+    pago = Pago.query.filter_by(mp_payment_id=str(pago_id)).first()
+    if not pago:
+        app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
+        return
+
+    pago.dispensado = True
+
+    try:
+        db.session.commit()
+        app.logger.info(f"[MQTT] Pago {pago_id} marcado como DISPENSADO ✔")
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"[MQTT] Error guardando DISPENSADO: {e}")
+
+def _mqtt_on_message(client, userdata, msg):
+    app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
+
+    if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
+        _handle_status_message(msg.topic, msg.payload)
+        return
+
+    if msg.topic.startswith("dispen/") and msg.topic.endswith("/state/dispense"):
+        _handle_ack_message(msg.topic, msg.payload)
+        return
+
+    # Otros topics (si los hubiera) se podrían manejar aquí
+
+def start_mqtt_background():
+    if not MQTT_HOST:
+        app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
+        return
+
+    def _run():
+        global _mqtt_client
+        _mqtt_client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id="dispen-agua-backend"
+        )
+        if MQTT_USER or MQTT_PASS:
+            _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+        if MQTT_PORT == 8883:
+            try:
+                _mqtt_client.tls_set()
+            except Exception as e:
+                app.logger.error(f"[MQTT] TLS error: {e}")
+
+        _mqtt_client.on_connect = _mqtt_on_connect
+        _mqtt_client.on_message = _mqtt_on_message
+        _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        _mqtt_client.loop_forever()
+
+    threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
+
+    # WATCHDOG: si en 40s no llegó ONLINE, marcamos OFFLINE
+    def offline_watchdog():
+        while True:
+            try:
+                ds = Dispenser.query.all()
+                for d in ds:
+                    d.online = False
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+            time.sleep(40)
+
+    threading.Thread(target=offline_watchdog, name="offline-watchdog", daemon=True).start()
+
+def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_id: int, litros: int = 1) -> bool:
+    """
+    Envía comando por MQTT al ESP32:
+      - payment_id
+      - slot_id
+      - tiempo_segundos (tomado desde producto.tiempo_ms para ese dispenser+slot)
+    """
+
+    if not MQTT_HOST:
+        app.logger.error("[MQTT] MQTT_HOST no configurado")
+        return False
+
+    # Buscar el producto para obtener tiempo configurado
+    prod = Producto.query.filter_by(
+        dispenser_id=dispenser_id,
+        slot_id=slot_id
+    ).first()
+
+    if prod:
+        tiempo_ms = int(prod.tiempo_ms or 1000)
+    else:
+        tiempo_ms = 1000  # fallback seguro
+
+    tiempo_segundos = max(1, int(tiempo_ms / 1000))
+
+    topic = f"dispen/{device_id}/cmd/dispense"
+
+    payload = json.dumps({
+        "payment_id": str(payment_id),
+        "slot_id": int(slot_id),
+        "tiempo_segundos": tiempo_segundos
+    })
+
+    app.logger.info(
+        f"[MQTT] → {topic} | tiempo_ms={tiempo_ms}, tiempo_segundos={tiempo_segundos}, payload={payload}"
+    )
+
+    # Publicación MQTT robusta
+    for intento in range(10):
+        with _mqtt_lock:
+            if _mqtt_client:
+                info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
+                if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    return True
+        time.sleep(0.3)
+
+    app.logger.error("[MQTT] ERROR: no se pudo publicar el comando después de 10 intentos")
+    return False
+
+# =========================
+# PROCESAR PAGO
+# =========================
 
 def _procesar_pago_desde_info(payment_id: str, info: dict):
     status_raw = info.get("status")
@@ -233,301 +554,14 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
 
     # Solo cuando queda en approved y NO estaba procesado todavía
     if status == "approved" and not pago.procesado:
-        ok = send_dispense_cmd(device_id, payment_id, slot_id, litros_md)
+        ok = send_dispense_cmd(device_id, payment_id, slot_id, dispenser_id, litros_md)
         if ok:
             pago.procesado = True
             db.session.commit()
             app.logger.info(f"[WEBHOOK] Pago {payment_id} marcado como procesado")
         else:
             app.logger.error(f"[MQTT] ERROR al enviar comando a {device_id}")
-# -----------------------
-# Helpers
-# -----------------------
 
-def ok_json(data, status=200):
-    return jsonify(data), status
-
-def json_error(msg, status=400, extra=None):
-    payload = {"error": msg}
-    if extra is not None:
-        payload["detail"] = extra
-    return jsonify(payload), status
-
-def _to_int(x, default=0):
-    try:
-        return int(x)
-    except:
-        try:
-            return int(float(x))
-        except:
-            return default
-
-def serialize_dispenser(d: Dispenser) -> dict:
-    return {
-        "id": d.id,
-        "device_id": d.device_id,
-        "nombre": d.nombre,
-        "activo": bool(d.activo),
-        "online": bool(d.online),     # ← AÑADIDO
-        "created_at": d.created_at.isoformat() if d.created_at else None,
-    }
-
-def serialize_producto(p: Producto) -> dict:
-    return {
-        "id": p.id,
-        "dispenser_id": p.dispenser_id,
-        "nombre": p.nombre,
-        "precio": float(p.precio),
-        "slot": int(p.slot_id),
-        "habilitado": bool(p.habilitado),
-
-        # 👉 NUEVO
-        "tiempo_ms": int(p.tiempo_ms),
-
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-    }
-
-def kv_set(key, value):
-    row = KV.query.get(key)
-    if row:
-        row.value = value
-    else:
-        row = KV(key=key, value=value)
-        db.session.add(row)
-    db.session.commit()
-
-def kv_get(key, default=""):
-    row = KV.query.get(key)
-    return row.value if row else default
-
-# -----------------------
-# Auth simple Admin
-# -----------------------
-
-PUBLIC_PATHS = {
-    "/", "/gracias",
-    "/api/config",
-    "/api/pagos/preferencia",
-    "/api/mp/webhook", "/webhook", "/mp/webhook",
-    "/api/mp/oauth/init",
-    "/api/mp/oauth/callback",
-}
-
-@app.before_request
-def _auth_guard():
-    if request.method == "OPTIONS":
-        return "", 200
-
-    p = request.path
-
-    if p in PUBLIC_PATHS or p.startswith("/qr/"):
-        return None
-
-    if not ADMIN_SECRET:
-        return None
-
-    if request.headers.get("x-admin-secret") != ADMIN_SECRET:
-        return json_error("unauthorized", 401)
-
-    return None
-
-# -----------------------
-# MP: Tokens
-# -----------------------
-
-def get_mp_mode() -> str:
-    row = KV.query.get("mp_mode")
-    return (row.value if row else "test").lower()
-
-def get_oauth_access_token() -> str:
-    return kv_get("mp_oauth_access_token", "").strip()
-
-def get_mp_token_and_base():
-    oauth = get_oauth_access_token()
-    if oauth:
-        return oauth, "https://api.mercadopago.com"
-
-    mode = get_mp_mode()
-    if mode == "live":
-        return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-
-    return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
-    # =========================
-# =========================
-# MQTT
-# =========================
-
-_mqtt_client: Optional[mqtt.Client] = None
-_mqtt_lock = threading.Lock()
-
-def topic_cmd(device_id: str) -> str:
-    return f"dispen/{device_id}/cmd/dispense"
-
-def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] backend conectado al broker rc={rc}")
-
-    # SUBSCRIPCIÓN GLOBAL A MENSAJES DE PING DE ESP
-    client.subscribe("dispen/+/status", qos=1)
-
-def _mqtt_on_message(client, userdata, msg):
-    app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
-
-# --------------------------
-    # ONLINE CHECK (ESP32 → Backend)
-    # --------------------------
-    if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-        try:
-            raw = msg.payload.decode().strip()
-            device_id = msg.topic.split("/")[1]
-
-            # Caso simple → solo texto: "online"
-            if raw == "online":
-                disp = Dispenser.query.filter_by(device_id=device_id).first()
-                if disp:
-                    disp.online = True
-                    db.session.commit()
-                    app.logger.info(f"[MQTT] {device_id} marcado como ONLINE (raw)")
-                return
-
-            # Caso JSON
-            data = json.loads(raw)
-            status = str(data.get("status") or "").lower()
-
-            if status in ("online", "reconnected", "wifi_reconnected"):
-                disp = Dispenser.query.filter_by(device_id=device_id).first()
-                if disp:
-                    disp.online = True
-                    db.session.commit()
-                    app.logger.info(f"[MQTT] {device_id} ONLINE (json)")
-                return
-
-        except Exception as e:
-            app.logger.error(f"[MQTT] Error procesando status online: {e}")
-            return
-
-        # Si no entró ningún caso anterior → igual marcamos online por seguridad
-        disp = Dispenser.query.filter_by(device_id=device_id).first()
-        if disp:
-            disp.online = True
-            db.session.commit()
-            app.logger.info(f"[MQTT] {device_id} marcado como ONLINE (fallback)")
-        return
-
-    # -----------------------------------------------------
-    # 🔥 DETECCIÓN DE ONLINE / OFFLINE DESDE ESP32
-    # -----------------------------------------------------
-    device = data.get("device")
-    status = str(data.get("status") or "").lower()
-
-    if device and status:
-        disp = Dispenser.query.filter_by(device_id=device).first()
-        if disp:
-            if status in ("online", "reconnected", "wifi_reconnected"):
-                disp.online = True
-            elif status == "offline":
-                disp.online = False
-
-            try:
-                db.session.commit()
-                app.logger.info(f"[ONLINE] {device} → {disp.online}")
-            except Exception as e:
-                db.session.rollback()
-                app.logger.error(f"[ONLINE] Error guardando estado: {e}")
-
-    # -----------------------------------------------------
-    # 🔥 PROCESAR ACK DE DISPENSADO (lo viejo se mantiene)
-    # -----------------------------------------------------
-    pago_id = data.get("pago_id")
-    slot_id = data.get("slot_id")
-    dispensado = data.get("dispensado")
-
-    if pago_id and dispensado is True:
-        app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
-
-        pago = Pago.query.filter_by(mp_payment_id=str(pago_id)).first()
-        if not pago:
-            app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
-            return
-
-        pago.dispensado = True
-
-        try:
-            db.session.commit()
-            app.logger.info(f"[MQTT] Pago {pago_id} marcado como DISPENSADO ✔")
-        except Exception as e:
-            app.logger.error(f"[MQTT] Error guardando DISPENSADO: {e}")
-            db.session.rollback()
-def start_mqtt_background():
-    if not MQTT_HOST:
-        app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
-        return
-
-    def _run():
-        global _mqtt_client
-        _mqtt_client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2,
-            client_id="dispen-agua-backend"
-        )
-        if MQTT_USER or MQTT_PASS:
-            _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-        if MQTT_PORT == 8883:
-            try:
-                _mqtt_client.tls_set()
-            except Exception as e:
-                app.logger.error(f"[MQTT] TLS error: {e}")
-
-        _mqtt_client.on_connect = _mqtt_on_connect
-        _mqtt_client.on_message = _mqtt_on_message
-        _mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
-        _mqtt_client.loop_forever()
-
-    threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
-
-# WATCHDOG: si en 40s no llegó ONLINE, marcamos OFFLINE
-    def offline_watchdog():
-        import time
-        while True:
-            try:
-                ds = Dispenser.query.all()
-                for d in ds:
-                    d.online = False
-                db.session.commit()
-            except Exception:
-                pass
-            time.sleep(40)
-
-    threading.Thread(target=offline_watchdog, daemon=True).start()
-
-def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
-    if not MQTT_HOST:
-        app.logger.error("[MQTT] MQTT_HOST no configurado")
-        return False
-
-    # Buscar el producto para obtener tiempo_ms
-    prod = Producto.query.filter_by(dispenser_id=pago.dispenser_id, slot_id=slot_id).first()
-    tiempo_ms = prod.tiempo_ms if prod else 1000
-    tiempo_segundos = int(tiempo_ms / 1000)
-
-    topic = f"dispen/{device_id}/cmd/dispense"
-
-    payload = json.dumps({
-        "payment_id": str(payment_id),
-        "slot_id": int(slot_id),
-        "tiempo_segundos": tiempo_segundos
-    })
-
-    app.logger.info(f"[MQTT] Enviando comando: topic={topic}, payload={payload}")
-
-    for intento in range(10):
-        with _mqtt_lock:
-            if _mqtt_client:
-                info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
-                if info.rc == mqtt.MQTT_ERR_SUCCESS:
-                    return True
-        time.sleep(0.3)
-
-    return False
 # =========================
 # RUTAS BÁSICAS
 # =========================
@@ -561,7 +595,6 @@ def api_set_mp_mode():
 
     return ok_json({"ok": True, "mp_mode": mode})
 
-
 # =========================
 # DISPENSERS
 # =========================
@@ -592,6 +625,7 @@ def api_dispensers_create():
         db.session.add(d)
         db.session.commit()
 
+        # Creamos 2 productos base para ese dispenser
         p1 = Producto(
             dispenser_id=d.id,
             nombre="Agua fría",
@@ -624,7 +658,6 @@ def api_dispensers_create():
     except Exception as e:
         db.session.rollback()
         return json_error("error creando dispenser", 500, str(e))
-
 
 # =========================
 # PRODUCTOS
@@ -662,7 +695,7 @@ def api_productos_create():
 
     try:
         precio = float(precio)
-    except:
+    except Exception:
         return json_error("precio debe ser número", 400)
 
     if precio <= 0:
@@ -670,7 +703,7 @@ def api_productos_create():
 
     try:
         slot = int(slot)
-    except:
+    except Exception:
         return json_error("slot debe ser número", 400)
 
     if not 1 <= slot <= 2:
@@ -689,7 +722,7 @@ def api_productos_create():
             tiempo_final = int(tiempo_ms)
         else:
             tiempo_final = 1000
-    except:
+    except Exception:
         tiempo_final = 1000
 
     p = Producto(
@@ -734,19 +767,19 @@ def api_productos_update(pid):
                     return json_error("slot ya usado en este dispenser", 409)
                 p.slot_id = new_slot
 
-        # 👉 NUEVO: actualizar el tiempo de dispensado
+        # Actualizar el tiempo de dispensado
         if "tiempo_ms" in data:
-           try:
-             p.tiempo_ms = int(data["tiempo_ms"]) if data["tiempo_ms"] not in ("", None) else p.tiempo_ms
-           except:
-             p.tiempo_ms = p.tiempo_ms
+            try:
+                if data["tiempo_ms"] not in ("", None):
+                    p.tiempo_ms = int(data["tiempo_ms"])
+            except Exception:
+                pass
 
         db.session.commit()
         return ok_json({"ok": True, "producto": serialize_producto(p)})
     except Exception as e:
         db.session.rollback()
         return json_error("error actualizando producto", 500, str(e))
-
 
 # =========================
 # PAGOS – HISTORIAL
@@ -757,7 +790,7 @@ def api_pagos_list():
     try:
         limit = int(request.args.get("limit", 50))
         limit = max(1, min(limit, 200))
-    except:
+    except Exception:
         limit = 50
 
     q = Pago.query.order_by(Pago.id.desc()).limit(limit)
@@ -801,12 +834,11 @@ def api_pagos_reenviar(pid):
     if not device:
         return json_error("sin device_id", 400)
 
-    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.litros or 1)
+    ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.dispenser_id, p.litros or 1)
     if not ok:
         return json_error("no se pudo publicar MQTT", 500)
 
     return ok_json({"ok": True, "msg": "comando reenviado"})
-
 
 # =========================
 # HELPERS BACKEND BASE
@@ -820,21 +852,16 @@ def get_backend_base() -> str:
     """
     base = (BACKEND_BASE_URL or "").strip()
     if not base:
-        # request.url_root suele venir con / al final
         base = (request.url_root or "").rstrip("/")
     return base
-
 
 # =========================
 # PAGOS – PREFERENCIA (ADMIN)
 # =========================
-# Esta ruta sigue igual que antes, sirve para crear una preferencia
-# puntual desde el Admin si querés generar un link de prueba.
-# NO es el QR universal del dispenser.
 
 @app.post("/api/pagos/preferencia")
 def crear_preferencia_api():
-    import time
+    import time as _time
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
@@ -851,7 +878,7 @@ def crear_preferencia_api():
         return json_error("dispenser no disponible", 400)
 
     monto_final = int(prod.precio)
-    ts = int(time.time())
+    ts = int(_time.time())
 
     external_reference = (
         f"product_id={prod.id};slot={prod.slot_id};disp={disp.id};dev={disp.device_id};ts={ts}"
@@ -890,7 +917,6 @@ def crear_preferencia_api():
 
         "notification_url": f"{backend_url}/api/mp/webhook",
 
-        # Importante: para dispenser usamos wallet_purchase
         "purpose": "wallet_purchase",
         "expires": False,
 
@@ -926,13 +952,9 @@ def crear_preferencia_api():
 
     return ok_json({"ok": True, "link": link})
 
-
 # =========================
 # QR UNIVERSAL POR DISPENSER Y SLOT
 # =========================
-# ESTE es el QR que vas a imprimir en el dispenser.
-# URL del QR físico:  https://TU_DOMINIO/qr/<device_id>/<slot_id>
-# Ejemplo:            https://dispenagua.com/qr/dispen-01/1
 
 @app.get("/qr/<device_id>/<int:slot_id>")
 def qr_universal(device_id, slot_id):
@@ -942,8 +964,6 @@ def qr_universal(device_id, slot_id):
       2) Buscamos el producto por dispenser_id + slot_id
       3) Creamos una NUEVA preferencia de MercadoPago
       4) Redirigimos (302) al init_point de esa preferencia
-
-    Resultado: UN SOLO QR físico por salida, pero infinitas compras.
     """
 
     # 1) Buscar dispenser por device_id
@@ -996,7 +1016,6 @@ def qr_universal(device_id, slot_id):
             "pending": f"{backend_url}/gracias"
         },
 
-        # Igual que arriba: pensado para vending tipo wallet
         "purpose": "wallet_purchase",
         "expires": False,
         "binary_mode": False,
@@ -1023,8 +1042,8 @@ def qr_universal(device_id, slot_id):
     if not link:
         return "Preferencia sin link", 502
 
-    # Redirigimos directo al flujo de pago de MP
     return redirect(link)
+
 # =========================
 # WEBHOOK MP (payment + merchant_order)
 # =========================
@@ -1066,7 +1085,7 @@ def mp_webhook():
             try:
                 resp = mp_sdk.payment().get(payment_id)
                 info = resp.get("response") or {}
-            except:
+            except Exception:
                 return "ok", 200
 
             _procesar_pago_desde_info(payment_id, info)
@@ -1089,7 +1108,7 @@ def mp_webhook():
             try:
                 mo_resp = mp_sdk.merchant_order().get(mo_id)
                 mo_info = mo_resp.get("response") or {}
-            except:
+            except Exception:
                 return "ok", 200
 
             for pay in mo_info.get("payments") or []:
@@ -1101,7 +1120,7 @@ def mp_webhook():
                     resp = mp_sdk.payment().get(str(p_id))
                     info = resp.get("response") or {}
                     _procesar_pago_desde_info(str(p_id), info)
-                except:
+                except Exception:
                     continue
 
         return "ok", 200
@@ -1117,7 +1136,6 @@ def mp_webhook_alias1():
 @app.post("/mp/webhook")
 def mp_webhook_alias2():
     return mp_webhook()
-
 
 # =========================
 # OAUTH MERCADOPAGO
@@ -1145,7 +1163,6 @@ def mp_oauth_init():
     }
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"url": url})
-
 
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
@@ -1200,7 +1217,6 @@ def mp_oauth_callback():
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
 
-
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
     access_token = kv_get("mp_oauth_access_token", "")
@@ -1210,7 +1226,6 @@ def mp_oauth_status():
         "user_id": user_id,
     })
 
-
 @app.post("/api/mp/oauth/unlink")
 def mp_oauth_unlink():
     kv_set("mp_oauth_access_token", "")
@@ -1218,7 +1233,6 @@ def mp_oauth_unlink():
     kv_set("mp_oauth_user_id", "")
     kv_set("mp_oauth_expires", "")
     return ok_json({"ok": True, "msg": "Desvinculado"})
-
 
 # =========================
 # GRACIAS PAGE
@@ -1253,7 +1267,6 @@ def pagina_gracias():
     r.headers["Content-Type"] = "text/html; charset=utf-8"
     return r
 
-
 # =========================
 # INIT MQTT
 # =========================
@@ -1263,7 +1276,6 @@ with app.app_context():
         start_mqtt_background()
     except Exception:
         app.logger.exception("[MQTT] error iniciando thread")
-
 
 # =========================
 # RUN
