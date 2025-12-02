@@ -268,6 +268,7 @@ def serialize_dispenser(d: Dispenser) -> dict:
         "device_id": d.device_id,
         "nombre": d.nombre,
         "activo": bool(d.activo),
+        "online": bool(d.online),     # ← AÑADIDO
         "created_at": d.created_at.isoformat() if d.created_at else None,
     }
 
