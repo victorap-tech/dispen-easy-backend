@@ -86,11 +86,20 @@ class KV(db.Model):
 
 class Dispenser(db.Model):
     __tablename__ = "dispenser"
+
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String(80), nullable=False, unique=True, index=True)
     nombre = db.Column(db.String(100), nullable=False, default="")
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
-    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+
+    # NUEVO → indica si el dispenser está conectado por MQTT
+    online = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        server_default=db.func.now(),
+        nullable=False
+    )
 
 
 class Producto(db.Model):
