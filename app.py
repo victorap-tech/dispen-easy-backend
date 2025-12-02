@@ -373,49 +373,45 @@ def _mqtt_on_connect(client, userdata, flags, rc, props=None):
 def _mqtt_on_message(client, userdata, msg):
     app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
 
-    # --------------------------
-    # ONLINE CHECK
+# --------------------------
+    # ONLINE CHECK (ESP32 → Backend)
     # --------------------------
     if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
-       try:
-         raw = msg.payload.decode().strip()
-         device_id = msg.topic.split("/")[1]
+        try:
+            raw = msg.payload.decode().strip()
+            device_id = msg.topic.split("/")[1]
 
-         if raw == "online":
-            disp = Dispenser.query.filter_by(device_id=device_id).first()
-            if disp:
-                disp.online = True
-                db.session.commit()
-            return
-
-        # Si viene JSON
-        data = json.loads(raw)
-        status = (data.get("status") or "").lower()
-
-        if status in ("online", "reconnected", "wifi_reconnected"):
-            disp = Dispenser.query.filter_by(device_id=device_id).first()
-            if disp:
-                disp.online = True
-                db.session.commit()
-            return
-
-    except:
-        pass
+            # Caso simple → solo texto: "online"
+            if raw == "online":
                 disp = Dispenser.query.filter_by(device_id=device_id).first()
                 if disp:
                     disp.online = True
                     db.session.commit()
-                    app.logger.info(f"[MQTT] {device_id} marcado como ONLINE")
-            return
+                    app.logger.info(f"[MQTT] {device_id} marcado como ONLINE (raw)")
+                return
+
+            # Caso JSON
+            data = json.loads(raw)
+            status = str(data.get("status") or "").lower()
+
+            if status in ("online", "reconnected", "wifi_reconnected"):
+                disp = Dispenser.query.filter_by(device_id=device_id).first()
+                if disp:
+                    disp.online = True
+                    db.session.commit()
+                    app.logger.info(f"[MQTT] {device_id} ONLINE (json)")
+                return
+
         except Exception as e:
             app.logger.error(f"[MQTT] Error procesando status online: {e}")
             return
 
-    try:
-        payload = msg.payload.decode()
-        data = json.loads(payload)
-    except:
-        app.logger.error("[MQTT] JSON inválido")
+        # Si no entró ningún caso anterior → igual marcamos online por seguridad
+        disp = Dispenser.query.filter_by(device_id=device_id).first()
+        if disp:
+            disp.online = True
+            db.session.commit()
+            app.logger.info(f"[MQTT] {device_id} marcado como ONLINE (fallback)")
         return
 
     # -----------------------------------------------------
