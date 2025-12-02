@@ -359,6 +359,43 @@ def _mqtt_on_connect(client, userdata, flags, rc, props=None):
 def _mqtt_on_message(client, userdata, msg):
     app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
 
+    try:
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+    except Exception as e:
+        app.logger.error(f"[MQTT] Error al decodificar JSON: {e}")
+        return
+
+    # Esperamos ACK del ESP
+    pago_id = data.get("pago_id")
+    slot_id = data.get("slot_id")
+    dispensado = data.get("dispensado")
+
+    # Solo procesamos mensajes de ACK correctos
+    if not pago_id or dispensado is not True:
+        app.logger.info("[MQTT] Mensaje ignorado (no es ACK de dispensado)")
+        return
+
+    app.logger.info(f"[MQTT] ACK recibido para pago_id={pago_id}, slot={slot_id}")
+
+    # Marcar pago como DISPENSADO en la base
+    from app import Pago  # evitar import circular
+
+    pago = Pago.query.filter_by(merchant_order_id=str(pago_id)).first()
+    if not pago:
+        app.logger.error(f"[MQTT] Pago {pago_id} no encontrado en DB")
+        return
+
+    pago.dispensado = True
+    pago.updated_at = datetime.utcnow()
+
+    try:
+        db.session.commit()
+        app.logger.info(f"[MQTT] Pago {pago_id} marcado como DISPENSADO ✔")
+    except Exception as e:
+        app.logger.error(f"[MQTT] Error guardando DISPENSADO: {e}")
+        db.session.rollback()
+
 def start_mqtt_background():
     if not MQTT_HOST:
         app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
