@@ -373,6 +373,25 @@ def _mqtt_on_connect(client, userdata, flags, rc, props=None):
 def _mqtt_on_message(client, userdata, msg):
     app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
 
+    # --------------------------
+    # ONLINE CHECK
+    # --------------------------
+    if msg.topic.startswith("dispen/") and msg.topic.endswith("/status"):
+        try:
+            payload = msg.payload.decode().strip()
+            device_id = msg.topic.split("/")[1]
+
+            if payload == "online":
+                disp = Dispenser.query.filter_by(device_id=device_id).first()
+                if disp:
+                    disp.online = True
+                    db.session.commit()
+                    app.logger.info(f"[MQTT] {device_id} marcado como ONLINE")
+            return
+        except Exception as e:
+            app.logger.error(f"[MQTT] Error procesando status online: {e}")
+            return
+
     try:
         payload = msg.payload.decode()
         data = json.loads(payload)
