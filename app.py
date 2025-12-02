@@ -196,8 +196,8 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
     monto_val    = info.get("transaction_amount") or metadata.get("precio_final") or 0
 
     if not device_id or not slot_id:
-        app.logger.error("[WEBHOOK] Falta device_id o slot_id")
-        return
+        app.logger.error(f"[WEBHOOK] Falta device_id o slot_id en payment_id={payment_id}")
+        return "ok", 200
 
     # 🔐 ANTI-DUPLICADOS: si ya está procesado y viene otra vez approved, no hago nada
     pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
