@@ -384,15 +384,42 @@ def start_mqtt_background():
 
     threading.Thread(target=_run, name="mqtt-thread", daemon=True).start()
 
-def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1) -> bool:
+def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, litros: int = 1, tiempo_ms: int = None) -> bool:
     if not MQTT_HOST:
         return False
 
-    payload = _json.dumps({
+    # Armamos payload limpio
+    data = {
         "payment_id": str(payment_id),
         "slot_id": int(slot_id),
         "litros": int(litros or 1),
-    })
+    }
+
+    # >>> AGREGADO IMPORTANTE <<<
+    if tiempo_ms:
+        # enviar tiempo en segundos al ESP
+        data["tiempo_segundos"] = max(1, int(tiempo_ms / 1000))
+
+    payload = _json.dumps(data)
+
+    topic = topic_cmd(device_id)
+
+    app.logger.info(f"[MQTT] Enviando comando: topic={topic}, payload={payload}")
+
+    # Reintentos (tu código original)
+    for i in range(10):
+        with mqtt_lock:
+            if _mqtt_client:
+                info = _mqtt_client.publish(topic, payload, qos=1, retain=False)
+                if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    app.logger.info(f"[MQTT] Publicado OK (try {i}) {payload}")
+                    return True
+                else:
+                    app.logger.error(f"[MQTT] Error rc={info.rc}")
+
+        time.sleep(0.3)
+
+    return False
 
     for i in range(10):  # reintenta hasta 10 veces
         with _mqtt_lock:
