@@ -365,7 +365,10 @@ def topic_cmd(device_id: str) -> str:
     return f"dispen/{device_id}/cmd/dispense"
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
-    app.logger.info(f"[MQTT] conectado rc={rc}")
+    app.logger.info(f"[MQTT] backend conectado al broker rc={rc}")
+
+    # SUBSCRIPCIÓN GLOBAL A MENSAJES DE PING DE ESP
+    client.subscribe("dispen/+/status", qos=1)
 
 def _mqtt_on_message(client, userdata, msg):
     app.logger.info(f"[MQTT RX] {msg.topic}: {msg.payload!r}")
