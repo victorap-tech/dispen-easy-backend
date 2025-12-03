@@ -130,6 +130,7 @@ class Dispenser(db.Model):
 
     # estado online/offline por MQTT
     online = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+    last_seen = db.Column(db.DateTime(timezone=True), nullable=True)
 
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
