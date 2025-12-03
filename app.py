@@ -1446,6 +1446,21 @@ def watchdog_offline():
 
 
 threading.Thread(target=watchdog_offline, daemon=True).start()
+
+# =========================
+# INICIAR WATCHDOG (OFFLINE DETECTOR)
+# =========================
+
+def start_watchdog():
+    try:
+        with app.app_context():
+        # hilo que marca offline cuando no hay last_seen por 45 segundos
+            threading.Thread(target=watchdog_offline, daemon=True).start()
+            print("[WATCHDOG] iniciado correctamente")
+    except Exception as e:
+        print("[WATCHDOG] error iniciando:", e)
+
+start_watchdog()
 # =========================
 # RUN
 # =========================
