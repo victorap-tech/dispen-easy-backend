@@ -650,10 +650,8 @@ def crear_cliente():
 
 @app.get("/api/clientes")
 def listar_clientes():
-    return jsonify([
-        {"id": c.id, "nombre": c.nombre, "contacto": c.contacto}
-        for c in Cliente.query.order_by(Cliente.id.asc()).all()
-    ])
+    return jsonify([c.serialize() for c in Cliente.query.order_by(Cliente.id.asc()).all()])
+
 @app.route("/api/clientes/<int:cid>", methods=["DELETE"])
 def delete_cliente(cid):
     _check_admin()
