@@ -90,7 +90,7 @@ class Cliente(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     nombre = db.Column(db.String(200), nullable=False)
     contacto = db.Column(db.String(200), nullable=True)
-    creado = db.Column(db.DateTime, server_default=db.func.now())
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 # ---------- TOKENS MP por cliente ----------
 class MpTokenPorCliente(db.Model):
@@ -105,7 +105,7 @@ class MpTokenPorCliente(db.Model):
     expires_in = db.Column(db.Integer, nullable=True)
     expires_at = db.Column(db.DateTime, nullable=True)
 
-    creado = db.Column(db.DateTime, server_default=db.func.now())
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
     actualizado = db.Column(db.DateTime, server_default=db.func.now(), onupdate=db.func.now())
 
 # ---------- DISPENSER con cliente_id ----------
