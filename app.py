@@ -682,8 +682,8 @@ def actualizar_cliente(cid):
     if "nombre" in data:
         c.nombre = (data["nombre"] or "").strip()
 
-    if "contacto" in data:
-        c.contacto = (data["contacto"] or "").strip()
+    if "descripcion" in data:
+       c.descripcion = (data["descripcion"] or "").strip()
 
     db.session.commit()
 
