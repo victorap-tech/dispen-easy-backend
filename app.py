@@ -1443,7 +1443,7 @@ def watchdog_offline():
         except Exception as e:
             print("Error en watchdog:", e)
 
-        time.sleep(20)
+        time.sleep(5)
 
 
 threading.Thread(target=watchdog_offline, daemon=True).start()
