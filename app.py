@@ -670,7 +670,7 @@ def delete_cliente(cid):
 
     return jsonify({"msg": "Cliente eliminado correctamente"})
 
-@app.put("/api/clientes/<int:cid>")
+@app.put("/api/cliente/<int:cid>")
 def actualizar_cliente(cid):
     require_admin()
     c = Cliente.query.get(cid)
