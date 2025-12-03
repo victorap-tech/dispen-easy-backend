@@ -1,10 +1,13 @@
-# app.py – Dispenser Agua (2 productos, sin litros/stock en la UI, con OAuth MP para vincular cuenta del comercio)
+# ============================================================
+# Dispen-Agua – Backend MULTI-CLIENTE con OAuth por cliente
+# ============================================================
 
 import os
 import logging
 import threading
 import time
 import json as _json
+from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
@@ -39,8 +42,6 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
 MQTT_USER = os.getenv("MQTT_USER", "").strip()
 MQTT_PASS = os.getenv("MQTT_PASS", "").strip()
 
-
-
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 
 # =========================
@@ -63,21 +64,18 @@ logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
 # =========================
-# Auth simple manual (para proteger Admin)
+# Auth simple manual (Admin)
 # =========================
 
 def require_admin():
-    """
-    Verifica el header x-admin-secret contra ADMIN_SECRET.
-    """
     secret = request.headers.get("x-admin-secret", "")
     if not ADMIN_SECRET:
-        return  # admin desactivado
+        return
     if secret != ADMIN_SECRET:
         abort(401)
 
 # =========================
-# Modelos
+# MODELOS
 # =========================
 
 class KV(db.Model):
@@ -85,7 +83,32 @@ class KV(db.Model):
     key = db.Column(db.String(50), primary_key=True)
     value = db.Column(db.String(200), nullable=False)
 
+# ---------- NUEVO: CLIENTES ----------
+class Cliente(db.Model):
+    __tablename__ = "cliente"
 
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(200), nullable=False)
+    contacto = db.Column(db.String(200), nullable=True)
+    creado = db.Column(db.DateTime, server_default=db.func.now())
+
+# ---------- TOKENS MP por cliente ----------
+class MpTokenPorCliente(db.Model):
+    __tablename__ = "mp_token_cliente"
+
+    id = db.Column(db.Integer, primary_key=True)
+    cliente_id = db.Column(db.Integer, db.ForeignKey("cliente.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    access_token = db.Column(db.String(500), nullable=False)
+    refresh_token = db.Column(db.String(500), nullable=True)
+    user_id_mp = db.Column(db.String(200), nullable=True)
+    expires_in = db.Column(db.Integer, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+
+    creado = db.Column(db.DateTime, server_default=db.func.now())
+    actualizado = db.Column(db.DateTime, server_default=db.func.now(), onupdate=db.func.now())
+
+# ---------- DISPENSER con cliente_id ----------
 class Dispenser(db.Model):
     __tablename__ = "dispenser"
 
@@ -94,15 +117,13 @@ class Dispenser(db.Model):
     nombre = db.Column(db.String(100), nullable=False, default="")
     activo = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
 
-    # indica si el dispenser está conectado por MQTT
+    # NUEVO → A quién pertenece este dispenser
+    cliente_id = db.Column(db.Integer, db.ForeignKey("cliente.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # estado online/offline por MQTT
     online = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
 
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        server_default=db.func.now(),
-        nullable=False
-    )
-
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 class Producto(db.Model):
     __tablename__ = "producto"
@@ -120,26 +141,14 @@ class Producto(db.Model):
 
     habilitado = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
 
-    # tiempo de dispensado configurado para ese slot
     tiempo_ms = db.Column(db.Integer, nullable=False, server_default="2000")
 
-    created_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        server_default=db.func.now(),
-    )
-
-    updated_at = db.Column(
-        db.DateTime(timezone=True),
-        nullable=False,
-        server_default=db.func.now(),
-        onupdate=db.func.now()
-    )
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now(), onupdate=db.func.now())
 
     __table_args__ = (
         db.UniqueConstraint("dispenser_id", "slot_id", name="uq_disp_slot"),
     )
-
 
 class Pago(db.Model):
     __tablename__ = "pago"
@@ -157,7 +166,6 @@ class Pago(db.Model):
     device_id = db.Column(db.String(80), nullable=True, default="")
     raw = db.Column(JSONB, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
-
 # -----------------------
 # Helpers básicos
 # -----------------------
@@ -187,6 +195,7 @@ def serialize_dispenser(d: Dispenser) -> dict:
         "nombre": d.nombre,
         "activo": bool(d.activo),
         "online": bool(d.online),
+        "cliente_id": d.cliente_id,
         "created_at": d.created_at.isoformat() if d.created_at else None,
     }
 
@@ -217,7 +226,7 @@ def kv_get(key, default=""):
     return row.value if row else default
 
 # -----------------------
-# Auth simple Admin
+# Auth simple Admin / rutas públicas
 # -----------------------
 
 PUBLIC_PATHS = {
@@ -248,26 +257,48 @@ def _auth_guard():
     return None
 
 # -----------------------
-# MP: Tokens
+# MP: modo global (fallback)
 # -----------------------
 
 def get_mp_mode() -> str:
     row = KV.query.get("mp_mode")
     return (row.value if row else "test").lower()
 
-def get_oauth_access_token() -> str:
-    return kv_get("mp_oauth_access_token", "").strip()
-
-def get_mp_token_and_base():
-    oauth = get_oauth_access_token()
-    if oauth:
-        return oauth, "https://api.mercadopago.com"
-
+def get_global_mp_token_and_base():
+    """
+    Fallback por si un dispenser no tiene cliente ni OAuth.
+    Usa MP_ACCESS_TOKEN_TEST / LIVE.
+    """
     mode = get_mp_mode()
     if mode == "live":
         return MP_ACCESS_TOKEN_LIVE, "https://api.mercadopago.com"
-
     return MP_ACCESS_TOKEN_TEST, "https://api.mercadopago.com"
+
+# -----------------------
+# MP: Obtener token por dispenser (MULTI-CLIENTE)
+# -----------------------
+
+def get_token_por_dispenser(dispenser_id: int) -> str:
+    """
+    Devuelve el access_token de MP correspondiente al cliente dueño del dispenser.
+    Si el dispenser no tiene cliente o el cliente no tiene OAuth, usa token global.
+    """
+    disp = Dispenser.query.get(dispenser_id)
+    if not disp:
+        raise Exception("Dispenser no encontrado")
+
+    # Si tiene cliente asignado, buscamos token OAuth de ese cliente
+    if disp.cliente_id:
+        tok = MpTokenPorCliente.query.filter_by(cliente_id=disp.cliente_id).first()
+        if tok and tok.access_token:
+            # Si quisieras, acá podrías refrescar el token si expired.
+            return tok.access_token
+
+    # Fallback: tokens globales (modo test/live)
+    token, _ = get_global_mp_token_and_base()
+    if not token:
+        raise Exception("MP token no configurado para este dispenser")
+    return token
 
 # =========================
 # MQTT
@@ -281,9 +312,7 @@ def topic_cmd(device_id: str) -> str:
 
 def _mqtt_on_connect(client, userdata, flags, rc, props=None):
     app.logger.info(f"[MQTT] backend conectado al broker rc={rc}")
-    # Pings de estado online/offline
     client.subscribe("dispen/+/status", qos=1)
-    # ACK de dispensado
     client.subscribe("dispen/+/state/dispense", qos=1)
 
 def _handle_status_message(topic: str, payload_raw: bytes):
@@ -389,29 +418,23 @@ def _mqtt_on_message(client, userdata, msg):
         _handle_ack_message(msg.topic, msg.payload)
         return
 
-    # Otros topics (si los hubiera) se podrían manejar aquí
-
 # =========================
-# MQTT THREAD – DEFINITIVO
+# MQTT THREAD
 # =========================
 
 def start_mqtt_background():
-    """Inicia el hilo del cliente MQTT correctamente."""
     if not MQTT_HOST:
         app.logger.warning("[MQTT] MQTT_HOST no configurado; no se inicia MQTT")
         return
 
     app.logger.info("[MQTT] Iniciando hilo MQTT...")
-    th = threading.Thread(target=_run, name="mqtt-thread", daemon=True)
+    th = threading.Thread(target=_run_mqtt, name="mqtt-thread", daemon=True)
     th.start()
 
-
-def _run():
-    """Hilo principal del cliente MQTT — CORREGIDO CON CONTEXTO"""
+def _run_mqtt():
     global _mqtt_client
 
-    with app.app_context():  # 🔥 FIX CRÍTICO
-
+    with app.app_context():
         _mqtt_client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="dispen-agua-backend"
@@ -420,7 +443,6 @@ def _run():
         if MQTT_USER or MQTT_PASS:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        # TLS si se usa 8883
         if MQTT_PORT == 8883:
             try:
                 _mqtt_client.tls_set()
@@ -437,21 +459,19 @@ def _run():
             app.logger.error(f"[MQTT] ERROR al conectar: {e}")
             return
 
-        # 🔥 loop_forever debe correr dentro del app_context
         _mqtt_client.loop_forever()
+
 def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_id: int, litros: int = 1) -> bool:
     """
     Envía comando por MQTT al ESP32:
       - payment_id
       - slot_id
-      - tiempo_segundos (tomado desde producto.tiempo_ms para ese dispenser+slot)
+      - tiempo_segundos (tomado desde producto.tiempo_ms)
     """
-
     if not MQTT_HOST:
         app.logger.error("[MQTT] MQTT_HOST no configurado")
         return False
 
-    # Buscar el producto para obtener tiempo configurado
     prod = Producto.query.filter_by(
         dispenser_id=dispenser_id,
         slot_id=slot_id
@@ -460,12 +480,11 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_i
     if prod:
         tiempo_ms = int(prod.tiempo_ms or 1000)
     else:
-        tiempo_ms = 1000  # fallback seguro
+        tiempo_ms = 1000
 
     tiempo_segundos = max(1, int(tiempo_ms / 1000))
 
     topic = f"dispen/{device_id}/cmd/dispense"
-
     payload = json.dumps({
         "payment_id": str(payment_id),
         "slot_id": int(slot_id),
@@ -476,7 +495,6 @@ def send_dispense_cmd(device_id: str, payment_id: str, slot_id: int, dispenser_i
         f"[MQTT] → {topic} | tiempo_ms={tiempo_ms}, tiempo_segundos={tiempo_segundos}, payload={payload}"
     )
 
-    # Publicación MQTT robusta
     for intento in range(10):
         with _mqtt_lock:
             if _mqtt_client:
@@ -504,10 +522,10 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
         try:
             pref_id = info.get("order", {}).get("id") or info.get("preference_id")
             if pref_id:
-                token, _ = get_mp_token_and_base()
+                token_global, _ = get_global_mp_token_and_base()
                 r2 = requests.get(
                     f"https://api.mercadopago.com/checkout/preferences/{pref_id}",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers={"Authorization": f"Bearer {token_global}"},
                     timeout=10
                 )
                 r2.raise_for_status()
@@ -531,13 +549,11 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
         app.logger.error(f"[WEBHOOK] Falta device_id o slot_id en payment_id={payment_id}")
         return "ok", 200
 
-    # 🔐 ANTI-DUPLICADOS: si ya está procesado y viene otra vez approved, no hago nada
     pago = Pago.query.filter_by(mp_payment_id=str(payment_id)).first()
     if pago and pago.procesado and status == "approved":
         app.logger.info(f"[WEBHOOK] Pago {payment_id} ya procesado, ignorando duplicado")
         return
 
-    # Crear o actualizar registro
     if not pago:
         pago = Pago(
             mp_payment_id=str(payment_id),
@@ -563,7 +579,6 @@ def _procesar_pago_desde_info(payment_id: str, info: dict):
 
     db.session.commit()
 
-    # Solo cuando queda en approved y NO estaba procesado todavía
     if status == "approved" and not pago.procesado:
         ok = send_dispense_cmd(device_id, payment_id, slot_id, dispenser_id, litros_md)
         if ok:
@@ -582,14 +597,12 @@ def health():
     return ok_json({
         "status": "ok",
         "mp_mode": get_mp_mode(),
-        "oauth_linked": bool(get_oauth_access_token()),
     })
 
 @app.get("/api/config")
 def api_config():
     return ok_json({
         "mp_mode": get_mp_mode(),
-        "oauth_linked": bool(get_oauth_access_token()),
     })
 
 @app.post("/api/mp/mode")
@@ -607,6 +620,34 @@ def api_set_mp_mode():
     return ok_json({"ok": True, "mp_mode": mode})
 
 # =========================
+# CLIENTES (Admin)
+# =========================
+
+@app.post("/api/clientes")
+def crear_cliente():
+    require_admin()
+    data = request.get_json(silent=True) or {}
+    nombre = (data.get("nombre") or "").strip()
+
+    if not nombre:
+        return json_error("nombre requerido", 400)
+
+    contacto = (data.get("contacto") or "").strip()
+
+    c = Cliente(nombre=nombre, contacto=contacto)
+    db.session.add(c)
+    db.session.commit()
+
+    return ok_json({"ok": True, "cliente": {"id": c.id, "nombre": c.nombre, "contacto": c.contacto}})
+
+@app.get("/api/clientes")
+def listar_clientes():
+    return jsonify([
+        {"id": c.id, "nombre": c.nombre, "contacto": c.contacto}
+        for c in Cliente.query.order_by(Cliente.id.asc()).all()
+    ])
+
+# =========================
 # DISPENSERS
 # =========================
 
@@ -620,6 +661,7 @@ def api_dispensers_create():
     try:
         data = request.get_json(silent=True) or {}
         name = str(data.get("nombre") or "").strip()
+        cliente_id = data.get("cliente_id")
 
         if not name:
             all_d = Dispenser.query.order_by(Dispenser.id.asc()).all()
@@ -631,12 +673,12 @@ def api_dispensers_create():
         d = Dispenser(
             device_id=device_id,
             nombre=name,
-            activo=True
+            activo=True,
+            cliente_id=cliente_id
         )
         db.session.add(d)
         db.session.commit()
 
-        # Creamos 2 productos base para ese dispenser
         p1 = Producto(
             dispenser_id=d.id,
             nombre="Agua fría",
@@ -669,6 +711,21 @@ def api_dispensers_create():
     except Exception as e:
         db.session.rollback()
         return json_error("error creando dispenser", 500, str(e))
+
+@app.post("/api/dispensers/<int:disp_id>/asignar_cliente")
+def asignar_cliente(disp_id):
+    require_admin()
+    data = request.get_json(silent=True) or {}
+    cliente_id = data.get("cliente_id")
+
+    if not cliente_id:
+        return json_error("cliente_id requerido", 400)
+
+    disp = Dispenser.query.get_or_404(disp_id)
+    disp.cliente_id = cliente_id
+    db.session.commit()
+
+    return ok_json({"ok": True, "dispenser_id": disp.id, "cliente_id": disp.cliente_id})
 
 # =========================
 # PRODUCTOS
@@ -720,14 +777,12 @@ def api_productos_create():
     if not 1 <= slot <= 2:
         return json_error("slot inválido (1–2)", 400)
 
-    # Revisar que no exista otro producto en ese slot
     if Producto.query.filter(
         Producto.dispenser_id == dispenser_id,
         Producto.slot_id == slot
     ).first():
         return json_error("slot ya usado en este dispenser", 409)
 
-    # Normalizar tiempo_ms
     try:
         if tiempo_ms not in (None, "", []):
             tiempo_final = int(tiempo_ms)
@@ -778,7 +833,6 @@ def api_productos_update(pid):
                     return json_error("slot ya usado en este dispenser", 409)
                 p.slot_id = new_slot
 
-        # Actualizar el tiempo de dispensado
         if "tiempo_ms" in data:
             try:
                 if data["tiempo_ms"] not in ("", None):
@@ -867,7 +921,7 @@ def get_backend_base() -> str:
     return base
 
 # =========================
-# PAGOS – PREFERENCIA (ADMIN)
+# PAGOS – PREFERENCIA (Admin) MULTI-CLIENTE
 # =========================
 
 @app.post("/api/pagos/preferencia")
@@ -876,10 +930,6 @@ def crear_preferencia_api():
     data = request.get_json(force=True, silent=True) or {}
     product_id = _to_int(data.get("product_id") or 0)
 
-    token, _base_api = get_mp_token_and_base()
-    if not token:
-        return json_error("MP token no configurado", 500)
-
     prod = Producto.query.get(product_id)
     if not prod or not prod.habilitado:
         return json_error("producto no disponible", 400)
@@ -887,6 +937,12 @@ def crear_preferencia_api():
     disp = Dispenser.query.get(prod.dispenser_id)
     if not disp or not disp.activo:
         return json_error("dispenser no disponible", 400)
+
+    # TOKEN MULTI-CLIENTE
+    try:
+        token = get_token_por_dispenser(disp.id)
+    except Exception as e:
+        return json_error("mp_token_error", 500, str(e))
 
     monto_final = int(prod.precio)
     ts = int(_time.time())
@@ -906,7 +962,6 @@ def crear_preferencia_api():
             "currency_id": "ARS",
             "unit_price": float(monto_final),
         }],
-
         "metadata": {
             "product_id": prod.id,
             "slot_id": prod.slot_id,
@@ -916,29 +971,18 @@ def crear_preferencia_api():
             "device_id": disp.device_id,
             "precio_final": monto_final,
         },
-
         "external_reference": external_reference,
         "auto_return": "approved",
-
         "back_urls": {
             "success": f"{backend_url}/gracias",
             "failure": f"{backend_url}/gracias",
             "pending": f"{backend_url}/gracias"
         },
-
         "notification_url": f"{backend_url}/api/mp/webhook",
-
         "purpose": "wallet_purchase",
         "expires": False,
-
-        "payment_methods": {
-            "excluded_payment_types": [],
-            "installments": 1,
-            "default_payment_method_id": None
-        },
-
         "binary_mode": False,
-        "statement_descriptor": "DISPENSER-AGUA"
+        "statement_descriptor": "DISPEN-AGUA"
     }
 
     try:
@@ -964,25 +1008,22 @@ def crear_preferencia_api():
     return ok_json({"ok": True, "link": link})
 
 # =========================
-# QR UNIVERSAL POR DISPENSER Y SLOT
+# QR UNIVERSAL MULTI-CLIENTE
 # =========================
 
 @app.get("/qr/<device_id>/<int:slot_id>")
 def qr_universal(device_id, slot_id):
     """
-    Cada vez que alguien escanea este QR:
-      1) Buscamos el dispenser por device_id
-      2) Buscamos el producto por dispenser_id + slot_id
-      3) Creamos una NUEVA preferencia de MercadoPago
-      4) Redirigimos (302) al init_point de esa preferencia
+    Flujo QR 100% multi-cliente.
+    Cada dispenser usa el token del cliente dueño.
     """
 
-    # 1) Buscar dispenser por device_id
+    # 1) Dispenser
     disp = Dispenser.query.filter_by(device_id=device_id).first()
     if not disp or not disp.activo:
         return "Dispenser no disponible", 404
 
-    # 2) Buscar producto por slot_id
+    # 2) Producto
     prod = Producto.query.filter_by(
         dispenser_id=disp.id,
         slot_id=slot_id
@@ -991,10 +1032,11 @@ def qr_universal(device_id, slot_id):
     if not prod or not prod.habilitado:
         return "Producto no disponible", 404
 
-    # 3) Obtener token MP
-    token, _base_api = get_mp_token_and_base()
-    if not token:
-        return "MP token no configurado", 500
+    # 3) TOKEN DEL CLIENTE
+    try:
+        token = get_token_por_dispenser(disp.id)
+    except Exception as e:
+        return f"MP token no configurado: {e}", 500
 
     backend_url = get_backend_base()
     monto_final = float(prod.precio)
@@ -1008,7 +1050,6 @@ def qr_universal(device_id, slot_id):
             "currency_id": "ARS",
             "unit_price": monto_final,
         }],
-
         "metadata": {
             "product_id": prod.id,
             "slot_id": prod.slot_id,
@@ -1018,7 +1059,6 @@ def qr_universal(device_id, slot_id):
             "device_id": disp.device_id,
             "precio_final": monto_final,
         },
-
         "notification_url": f"{backend_url}/api/mp/webhook",
         "auto_return": "approved",
         "back_urls": {
@@ -1026,14 +1066,12 @@ def qr_universal(device_id, slot_id):
             "failure": f"{backend_url}/gracias",
             "pending": f"{backend_url}/gracias"
         },
-
         "purpose": "wallet_purchase",
         "expires": False,
         "binary_mode": False,
-        "statement_descriptor": "DISPENSER-AGUA"
+        "statement_descriptor": "DISPEN-AGUA"
     }
 
-    # 4) Crear preferencia
     try:
         r = requests.post(
             "https://api.mercadopago.com/checkout/preferences",
@@ -1065,7 +1103,6 @@ def mp_webhook():
         data = request.json or {}
         app.logger.info(f"[WEBHOOK] recibido: {data}")
 
-        # Detecta cualquier formato de MP
         tipo = (
             data.get("type") or
             data.get("topic") or
@@ -1075,8 +1112,9 @@ def mp_webhook():
         if not ("payment" in tipo or "merchant_order" in tipo):
             return "ok", 200
 
-        token, _ = get_mp_token_and_base()
-        mp_sdk = mercadopago.SDK(token)
+        # Siempre usamos token GLOBAL solo para consultar info.
+        token_global, _ = get_global_mp_token_and_base()
+        mp_sdk = mercadopago.SDK(token_global)
 
         # ---- PAYMENT ----
         if "payment" in tipo:
@@ -1091,15 +1129,12 @@ def mp_webhook():
             if not payment_id:
                 return "ok", 200
 
-            payment_id = str(payment_id)
-
             try:
-                resp = mp_sdk.payment().get(payment_id)
+                resp = mp_sdk.payment().get(str(payment_id))
                 info = resp.get("response") or {}
+                _procesar_pago_desde_info(str(payment_id), info)
             except Exception:
                 return "ok", 200
-
-            _procesar_pago_desde_info(payment_id, info)
 
         # ---- MERCHANT ORDER ----
         if "merchant_order" in tipo:
@@ -1114,10 +1149,8 @@ def mp_webhook():
             if not mo_id:
                 return "ok", 200
 
-            mo_id = str(mo_id)
-
             try:
-                mo_resp = mp_sdk.merchant_order().get(mo_id)
+                mo_resp = mp_sdk.merchant_order().get(str(mo_id))
                 mo_info = mo_resp.get("response") or {}
             except Exception:
                 return "ok", 200
@@ -1126,7 +1159,6 @@ def mp_webhook():
                 p_id = pay.get("id")
                 if not p_id:
                     continue
-
                 try:
                     resp = mp_sdk.payment().get(str(p_id))
                     info = resp.get("response") or {}
@@ -1149,37 +1181,50 @@ def mp_webhook_alias2():
     return mp_webhook()
 
 # =========================
-# OAUTH MERCADOPAGO
+# OAUTH MERCADOPAGO (MULTI-CLIENTE)
 # =========================
 
 from urllib.parse import urlencode
 
+# ---- INIT ----
 @app.get("/api/mp/oauth/init")
 def mp_oauth_init():
+    """
+    Recibe ?cliente_id=XX
+    """
+    cliente_id = request.args.get("cliente_id", type=int)
+    if not cliente_id:
+        return json_error("cliente_id requerido", 400)
+
     if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
         return json_error("Faltan CLIENT_ID o CLIENT_SECRET", 500)
 
-    env_redirect = os.getenv("MP_REDIRECT_URI")
-    if env_redirect:
-        redirect_uri = env_redirect.strip()
-    else:
-        base = BACKEND_BASE_URL or request.url_root.rstrip("/")
-        redirect_uri = f"{base}/api/mp/oauth/callback"
+    # redirect URL
+    base = BACKEND_BASE_URL or request.url_root.rstrip("/")
+    redirect_uri = f"{base}/api/mp/oauth/callback"
 
+    # state = cliente_id  (IMPORTANTE!)
     params = {
         "client_id": MP_CLIENT_ID,
         "response_type": "code",
         "platform_id": "mp",
         "redirect_uri": redirect_uri,
+        "state": cliente_id,   # 🔥 Esto permite saber para quién es el token
     }
+
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"url": url})
 
+# ---- CALLBACK ----
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     code = request.args.get("code")
+    cliente_id = request.args.get("state", type=int)
+
     if not code:
         return json_error("Falta code", 400)
+    if not cliente_id:
+        return json_error("Falta state=cliente_id", 400)
 
     base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     redirect_uri = f"{base}/api/mp/oauth/callback"
@@ -1209,40 +1254,63 @@ def mp_oauth_callback():
     if not access_token:
         return json_error("No se recibió access_token", 500)
 
-    kv_set("mp_oauth_access_token", access_token)
-    kv_set("mp_oauth_refresh_token", refresh_token)
-    kv_set("mp_oauth_user_id", str(user_id or ""))
-    kv_set("mp_oauth_expires", str(expires_in or ""))
+    # Guardar en tabla multi-cliente
+    tok = MpTokenPorCliente.query.filter_by(cliente_id=cliente_id).first()
+    if not tok:
+        tok = MpTokenPorCliente(cliente_id=cliente_id)
 
-    html = """<!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"/><title>Vinculación correcta</title></head>
-<body style="background:#0b1220;color:#e5e7eb;font-family:sans-serif">
-<div style="max-width:420px;margin:15vh auto;padding:18px;background:rgba(255,255,255,.05);border-radius:12px">
-<h2>Cuenta vinculada</h2>
-<p>La cuenta de MercadoPago se vinculó correctamente. Ya podés cerrar esta ventana.</p>
-</div>
-</body>
-</html>"""
+    tok.access_token = access_token
+    tok.refresh_token = refresh_token
+    tok.user_id = str(user_id or "")
+    tok.expires_at = expires_in
+
+    db.session.add(tok)
+    db.session.commit()
+
+    html = """
+    <!doctype html>
+    <html lang="es">
+    <head><meta charset="utf-8"/><title>Vinculación correcta</title></head>
+    <body style="background:#0b1220;color:#e5e7eb;font-family:sans-serif">
+    <div style="max-width:420px;margin:15vh auto;padding:18px;background:rgba(255,255,255,.05);border-radius:12px">
+    <h2>Cuenta vinculada</h2>
+    <p>La cuenta de MercadoPago se vinculó correctamente para este cliente. Ya podés cerrar esta ventana.</p>
+    </div>
+    </body>
+    </html>
+    """
     resp = make_response(html, 200)
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
 
+# ---- STATUS POR CLIENTE ----
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
-    access_token = kv_get("mp_oauth_access_token", "")
-    user_id = kv_get("mp_oauth_user_id", "")
+    cliente_id = request.args.get("cliente_id", type=int)
+    if not cliente_id:
+        return json_error("cliente_id requerido", 400)
+
+    tok = MpTokenPorCliente.query.filter_by(cliente_id=cliente_id).first()
+    if not tok:
+        return ok_json({"vinculado": False})
+
     return ok_json({
-        "vinculado": bool(access_token),
-        "user_id": user_id,
+        "vinculado": bool(tok.access_token),
+        "user_id": tok.user_id,
     })
 
+# ---- UNLINK ----
 @app.post("/api/mp/oauth/unlink")
 def mp_oauth_unlink():
-    kv_set("mp_oauth_access_token", "")
-    kv_set("mp_oauth_refresh_token", "")
-    kv_set("mp_oauth_user_id", "")
-    kv_set("mp_oauth_expires", "")
+    cliente_id = request.args.get("cliente_id", type=int)
+    if not cliente_id:
+        return json_error("cliente_id requerido", 400)
+
+    tok = MpTokenPorCliente.query.filter_by(cliente_id=cliente_id).first()
+    if tok:
+        db.session.delete(tok)
+        db.session.commit()
+
     return ok_json({"ok": True, "msg": "Desvinculado"})
 
 # =========================
@@ -1263,16 +1331,18 @@ def pagina_gracias():
         title = "Pago no completado"
         msg = "<p>El pago fue cancelado o rechazado.</p>"
 
-    html = f"""<!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"/></head>
-<body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui">
-<div style="max-width:720px;margin:16vh auto;padding:20px;background:rgba(255,255,255,.05);border-radius:16px">
-<h1>{title}</h1>
-{msg}
-</div>
-</body>
-</html>"""
+    html = f"""
+    <!doctype html>
+    <html lang="es">
+    <head><meta charset="utf-8"/></head>
+    <body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui">
+    <div style="max-width:720px;margin:16vh auto;padding:20px;background:rgba(255,255,255,.05);border-radius:16px">
+    <h1>{title}</h1>
+    {msg}
+    </div>
+    </body>
+    </html>
+    """
 
     r = make_response(html, 200)
     r.headers["Content-Type"] = "text/html; charset=utf-8"
