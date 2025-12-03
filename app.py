@@ -646,7 +646,18 @@ def listar_clientes():
         {"id": c.id, "nombre": c.nombre, "contacto": c.contacto}
         for c in Cliente.query.order_by(Cliente.id.asc()).all()
     ])
+@app.route("/api/clientes/<int:cid>", methods=["DELETE"])
+def delete_cliente(cid):
+    _check_admin()
 
+    cli = Cliente.query.get(cid)
+    if not cli:
+        return jsonify({"error": "Cliente no encontrado"}), 404
+
+    db.session.delete(cli)
+    db.session.commit()
+
+    return jsonify({"msg": "Cliente eliminado correctamente"})
 # =========================
 # DISPENSERS
 # =========================
