@@ -1429,17 +1429,21 @@ with app.app_context():
 def watchdog_offline():
     while True:
         try:
-            limite = datetime.utcnow() - timedelta(seconds=45)
-            disps = Dispenser.query.all()
+            with app.app_context():   # ← ESTA ES LA CLAVE
+                limite = datetime.utcnow() - timedelta(seconds=45)
+                disps = Dispenser.query.all()
 
-            for d in disps:
-                if d.last_seen and d.last_seen < limite and d.online:
-                    d.online = False
-            db.session.commit()
+                for d in disps:
+                    if d.last_seen and d.last_seen < limite and d.online:
+                        d.online = False
+
+                db.session.commit()
+
         except Exception as e:
             print("Error en watchdog:", e)
 
         time.sleep(20)
+
 
 threading.Thread(target=watchdog_offline, daemon=True).start()
 # =========================
