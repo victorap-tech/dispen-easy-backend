@@ -205,6 +205,7 @@ def serialize_dispenser(d: Dispenser) -> dict:
         "activo": bool(d.activo),
         "online": bool(d.online),
         "cliente_id": d.cliente_id,
+        "last_seen": d.last_seen.isoformat() if d.last_seen else None,
         "created_at": d.created_at.isoformat() if d.created_at else None,
     }
 
