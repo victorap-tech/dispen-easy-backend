@@ -692,7 +692,7 @@ def actualizar_cliente(cid):
         "cliente": {
             "id": c.id,
             "nombre": c.nombre,
-            "contacto": c.contacto
+            "descripcion": c.descripcion
         }
     })
 # =========================
