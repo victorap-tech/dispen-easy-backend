@@ -669,6 +669,32 @@ def delete_cliente(cid):
     db.session.commit()
 
     return jsonify({"msg": "Cliente eliminado correctamente"})
+
+@app.put("/api/clientes/<int:cid>")
+def actualizar_cliente(cid):
+    require_admin()
+    c = Cliente.query.get(cid)
+    if not c:
+        return json_error("Cliente no encontrado", 404)
+
+    data = request.get_json(silent=True) or {}
+
+    if "nombre" in data:
+        c.nombre = (data["nombre"] or "").strip()
+
+    if "contacto" in data:
+        c.contacto = (data["contacto"] or "").strip()
+
+    db.session.commit()
+
+    return ok_json({
+        "ok": True,
+        "cliente": {
+            "id": c.id,
+            "nombre": c.nombre,
+            "contacto": c.contacto
+        }
+    })
 # =========================
 # DISPENSERS
 # =========================
