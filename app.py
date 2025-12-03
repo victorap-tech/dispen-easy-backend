@@ -1399,14 +1399,14 @@ def pagina_gracias():
         msg = "<p>El pago fue cancelado o rechazado.</p>"
 
    html = f"""
-   <!doctype html>
-   <html lang="es">
-   <head>
-   <meta charset="UTF-8"/>
-   <title>{title}</title>
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<title>{title}</title>
 
-   <style>
-     html, body {{
+<style>
+    html, body {{
         margin: 0;
         padding: 0;
         height: 100%;
@@ -1415,9 +1415,9 @@ def pagina_gracias():
         color: #e5e7eb;
         font-family: Inter, system-ui;
         overflow: hidden;
-     }}
+    }}
 
-     .full {{
+    .full {{
         height: 100%;
         width: 100%;
         display: flex;
@@ -1427,29 +1427,29 @@ def pagina_gracias():
         text-align: center;
         padding: 20px;
         box-sizing: border-box;
-     }}
+    }}
 
-     h1 {{
+    h1 {{
         font-size: 42px;
         margin-bottom: 20px;
-     }}
+    }}
 
-     p {{
+    p {{
         font-size: 26px;
         line-height: 1.4;
         max-width: 900px;
-     }}
-   </style>
-   </head>
+    }}
+</style>
+</head>
 
-   <body>
-     <div class="full">
+<body>
+    <div class="full">
         <h1>{title}</h1>
         {msg}
-     </div>
-   </body>
-   </html>
-   """
+    </div>
+</body>
+</html>
+"""
 
     r = make_response(html, 200)
     r.headers["Content-Type"] = "text/html; charset=utf-8"
