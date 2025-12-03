@@ -366,6 +366,7 @@ def _handle_status_message(topic: str, payload_raw: bytes):
 
     if status in ("online", "reconnected", "wifi_reconnected"):
         disp.online = True
+        disp.last_seen = datetime.utcnow()
     elif status == "offline":
         disp.online = False
 
