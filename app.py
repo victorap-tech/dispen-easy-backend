@@ -654,11 +654,16 @@ def listar_clientes():
 
 @app.route("/api/clientes/<int:cid>", methods=["DELETE"])
 def delete_cliente(cid):
-    _check_admin()
+    require_admin()
 
     cli = Cliente.query.get(cid)
     if not cli:
         return jsonify({"error": "Cliente no encontrado"}), 404
+
+    # Verificar dispensers asignados
+    relacionados = Dispenser.query.filter_by(cliente_id=cid).count()
+    if relacionados > 0:
+        return jsonify({"error": "El cliente aún tiene dispensers asignados"}), 400
 
     db.session.delete(cli)
     db.session.commit()
