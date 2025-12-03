@@ -640,13 +640,13 @@ def crear_cliente():
     if not nombre:
         return json_error("nombre requerido", 400)
 
-    contacto = (data.get("contacto") or "").strip()
+    descripcion = (data.get("descripcion") or "").strip()
 
-    c = Cliente(nombre=nombre, contacto=contacto)
+    c = Cliente(nombre=nombre, descripcion=descripcion)
     db.session.add(c)
     db.session.commit()
 
-    return ok_json({"ok": True, "cliente": {"id": c.id, "nombre": c.nombre, "contacto": c.contacto}})
+    return ok_json({"ok": True, "cliente": c.serialize()})
 
 @app.get("/api/clientes")
 def listar_clientes():
