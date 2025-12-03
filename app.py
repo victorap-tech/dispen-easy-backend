@@ -93,13 +93,11 @@ class Cliente(db.Model):
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
     def serialize(self):
-      cantidad = Dispenser.query.filter_by(cliente_id=self.id).count()
       return {
         "id": self.id,
         "nombre": self.nombre,
         "descripcion": self.descripcion,
-        "dispensers": cantidad,
-        "created_at": ...
+        "created_at": self.created_at.isoformat() if self.created_at else None
     }
 
 # ---------- TOKENS MP por cliente ----------
