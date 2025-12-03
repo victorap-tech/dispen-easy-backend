@@ -1325,7 +1325,7 @@ def mp_oauth_callback():
 
     tok.access_token = access_token
     tok.refresh_token = refresh_token
-    tok.user_id = str(user_id or "")
+    tok.user_id_mp = str(user_id or "")
     tok.expires_at = expires_in
 
     db.session.add(tok)
@@ -1360,7 +1360,7 @@ def mp_oauth_status():
 
     return ok_json({
         "vinculado": bool(tok.access_token),
-        "user_id": tok.user_id,
+        "user_id": tok.user_id_mp,
     })
 
 # ---- UNLINK ----
