@@ -1398,18 +1398,58 @@ def pagina_gracias():
         title = "Pago no completado"
         msg = "<p>El pago fue cancelado o rechazado.</p>"
 
-    html = f"""
-    <!doctype html>
-    <html lang="es">
-    <head><meta charset="utf-8"/></head>
-    <body style="background:#0b1220;color:#e5e7eb;font-family:Inter,system-ui">
-    <div style="max-width:720px;margin:16vh auto;padding:20px;background:rgba(255,255,255,.05);border-radius:16px">
-    <h1>{title}</h1>
-    {msg}
-    </div>
-    </body>
-    </html>
-    """
+   html = f"""
+   <!doctype html>
+   <html lang="es">
+   <head>
+   <meta charset="UTF-8"/>
+   <title>{title}</title>
+
+   <style>
+     html, body {{
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        background: #0b1220;
+        color: #e5e7eb;
+        font-family: Inter, system-ui;
+        overflow: hidden;
+     }}
+
+     .full {{
+        height: 100%;
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        flex-direction: column;
+        text-align: center;
+        padding: 20px;
+        box-sizing: border-box;
+     }}
+
+     h1 {{
+        font-size: 42px;
+        margin-bottom: 20px;
+     }}
+
+     p {{
+        font-size: 26px;
+        line-height: 1.4;
+        max-width: 900px;
+     }}
+   </style>
+   </head>
+
+   <body>
+     <div class="full">
+        <h1>{title}</h1>
+        {msg}
+     </div>
+   </body>
+   </html>
+   """
 
     r = make_response(html, 200)
     r.headers["Content-Type"] = "text/html; charset=utf-8"
