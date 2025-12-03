@@ -738,16 +738,32 @@ def api_dispensers_create():
 def asignar_cliente(disp_id):
     require_admin()
     data = request.get_json(silent=True) or {}
+
+    # ⚡ PERMITIR liberar el dispenser
+    if "cliente_id" not in data:
+        return json_error("cliente_id faltante (puede ser null)", 400)
+
     cliente_id = data.get("cliente_id")
 
-    if not cliente_id:
-        return json_error("cliente_id requerido", 400)
+    # ⚡ Si viene null → liberar
+    if cliente_id in (None, "", "null"):
+        cliente_id = None
+
+    # Si viene un ID, validarlo
+    if cliente_id is not None:
+        cli = Cliente.query.get(cliente_id)
+        if not cli:
+            return json_error("cliente_id inválido", 400)
 
     disp = Dispenser.query.get_or_404(disp_id)
     disp.cliente_id = cliente_id
     db.session.commit()
 
-    return ok_json({"ok": True, "dispenser_id": disp.id, "cliente_id": disp.cliente_id})
+    return ok_json({
+        "ok": True,
+        "dispenser_id": disp.id,
+        "cliente_id": disp.cliente_id
+    })
 
 # =========================
 # PRODUCTOS
