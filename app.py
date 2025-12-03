@@ -1431,7 +1431,7 @@ def watchdog_offline():
     while True:
         try:
             with app.app_context():   # ← ESTA ES LA CLAVE
-                limite = datetime.utcnow() - timedelta(seconds=45)
+                limite = datetime.utcnow() - timedelta(seconds=12)
                 disps = Dispenser.query.all()
 
                 for d in disps:
