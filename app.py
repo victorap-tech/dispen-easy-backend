@@ -1297,7 +1297,7 @@ def mp_oauth_init():
     url = f"https://auth.mercadopago.com/authorization?{urlencode(params)}"
     return ok_json({"url": url})
 
-# ---- CALLBACK ----
+# --- CALLBACK ---
 @app.get("/api/mp/oauth/callback")
 def mp_oauth_callback():
     code = request.args.get("code")
@@ -1308,6 +1308,7 @@ def mp_oauth_callback():
     if not cliente_id:
         return json_error("Falta state=cliente_id", 400)
 
+    # Armamos redirect_uri EXACTO como figura en MercadoPago
     base = BACKEND_BASE_URL or request.url_root.rstrip("/")
     redirect_uri = f"{base}/api/mp/oauth/callback"
 
@@ -1330,41 +1331,44 @@ def mp_oauth_callback():
     data = r.json() or {}
     access_token = data.get("access_token")
     refresh_token = data.get("refresh_token", "")
-    user_id = data.get("user_id")
+    user_id = data.get("user_id", "")
     expires_in = data.get("expires_in")
 
     if not access_token:
         return json_error("No se recibió access_token", 500)
 
-    # Guardar en tabla multi-cliente
+    # Guardar token multi-cliente
     tok = MpTokenPorCliente.query.filter_by(cliente_id=cliente_id).first()
     if not tok:
         tok = MpTokenPorCliente(cliente_id=cliente_id)
 
     tok.access_token = access_token
     tok.refresh_token = refresh_token
-    tok.user_id_mp = str(user_id or "")
-    tok.expires_at = expires_in
+    tok.user_id = user_id
+    tok.expires_in = expires_in
 
     db.session.add(tok)
     db.session.commit()
 
+    # HTML de confirmación
     html = """
-    <!doctype html>
-    <html lang="es">
-    <head><meta charset="utf-8"/><title>Vinculación correcta</title></head>
-    <body style="background:#0b1220;color:#e5e7eb;font-family:sans-serif">
-    <div style="max-width:420px;margin:15vh auto;padding:18px;background:rgba(255,255,255,.05);border-radius:12px">
-    <h2>Cuenta vinculada</h2>
-    <p>La cuenta de MercadoPago se vinculó correctamente para este cliente. Ya podés cerrar esta ventana.</p>
-    </div>
-    </body>
-    </html>
-    """
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Vinculación correcta</title>
+</head>
+<body style="background:#0b1220;color:#e5e7eb;font-family:sans-serif">
+<div style="max-width:420px;margin:15vh auto;padding:18px;background:rgba(255,255,255,.05);border-radius:12px">
+<h2>Cuenta vinculada ✔</h2>
+<p>La cuenta de MercadoPago se vinculó correctamente para este cliente. Ya podés cerrar esta ventana.</p>
+</div>
+</body>
+</html>
+"""
     resp = make_response(html, 200)
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
-
 # ---- STATUS POR CLIENTE ----
 @app.get("/api/mp/oauth/status")
 def mp_oauth_status():
