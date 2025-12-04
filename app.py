@@ -1399,57 +1399,46 @@ def pagina_gracias():
         msg = "<p>El pago fue cancelado o rechazado.</p>"
 
         html = f"""
-            <!doctype html>
-            <html lang="es">
-            <head>
-            <meta charset="UTF-8"/>
-            <title>{title}</title>
-
-            <style>
-            html, body {{
-              margin: 0;
-              padding: 0;
-              height: 100%;
-              width: 100%;
-              background: #0b1220;
-              color: #e5e7eb;
-              font-family: Inter, system-ui;
-              overflow: hidden;
-            }}
-
-            .full {{
-              height: 100%;
-              width: 100%;
-              display: flex;
-              justify-content: center;
-              align-items: center;
-              flex-direction: column;
-              text-align: center;
-              padding: 20px;
-              box-sizing: border-box;
-            }}
-
-            h1 {{
-              font-size: 42px;
-              margin-bottom: 20px;
-            }}
-
-            p {{
-              font-size: 26px;
-              line-height: 1.4;
-              max-width: 900px;
-            }}
-            </style>
-            </head>
-
-            <body>
-            <div class="full">
-              <h1>{title}</h1>
-              {msg}
-            </div>
-            </body>
-            </html>
-            """
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>{title}</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #0b1220;
+            color: white;
+            font-family: Inter, system-ui;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        .card {
+            max-width: 95%;
+            width: 95%;
+            padding: 30px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 14px;
+            box-shadow: 0 0 12px rgba(0,0,0,0.4);
+        }
+        h1 { font-size: 2rem; margin-bottom: 12px; }
+        p  { font-size: 1.2rem; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>{title}</h1>
+        <p>{msg}</p>
+    </div>
+</body>
+</html>
+"""
 
     r = make_response(html, 200)
     r.headers["Content-Type"] = "text/html; charset=utf-8"
