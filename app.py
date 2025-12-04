@@ -951,24 +951,39 @@ def api_pagos_list():
 def api_pagos_reenviar(pid):
     p = Pago.query.get_or_404(pid)
 
+    # 🔥 Solo pagos aprobados
     if p.estado != "approved":
         return json_error("solo pagos approved", 400)
+
+    # 🔥 Si ya fue dispensado correctamente → NO reintentar
+    if p.dispensado:
+        return json_error("ya dispensado, no es necesario reintentar", 400)
+
+    # 🔥 Si falta slot o device → error real
     if not p.slot_id:
-        return json_error("pago sin slot", 400)
+        return json_error("pago sin slot asignado", 400)
 
     device = p.device_id
-    if not device and p.product_id:
+    if not device:
+        # recuperar desde producto
         prod = Producto.query.get(p.product_id)
         if prod and prod.dispenser_id:
             d = Dispenser.query.get(prod.dispenser_id)
             device = d.device_id if d else ""
 
     if not device:
-        return json_error("sin device_id", 400)
+        return json_error("no se puede determinar device_id", 400)
 
+    # 🔥 Enviar comando nuevamente
     ok = send_dispense_cmd(device, p.mp_payment_id, p.slot_id, p.dispenser_id, p.litros or 1)
+
     if not ok:
-        return json_error("no se pudo publicar MQTT", 500)
+        return json_error("no se pudo publicar MQTT (ESP desconectado?)", 500)
+
+    # 🔥 Marcamos como procesado pero NO como dispensado
+    # para permitir más reintentos si el ESP nunca responde el ACK
+    p.procesado = True
+    db.session.commit()
 
     return ok_json({"ok": True, "msg": "comando reenviado"})
 
