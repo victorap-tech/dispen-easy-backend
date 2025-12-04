@@ -1390,10 +1390,10 @@ def pagina_gracias():
 
     if status in ("success", "approved"):
         title = "¡Gracias por su compra!"
-        msg = "<p>El pago fue aprobado. El dispenser se activará en segundos.</p>"
+        msg = "<p>El pago fue aprobado. Seleccione su producto.</p>"
     elif status in ("pending", "in_process"):
         title = "Pago pendiente"
-        msg = "<p>Tu pago está en revisión. Si se aprueba, se activará automáticamente.</p>"
+        msg = "<p>Tu pago está en revisión. Si se aprueba, seleccione su producto.</p>"
     else:
         title = "Pago no completado"
         msg = "<p>El pago fue cancelado o rechazado.</p>"
