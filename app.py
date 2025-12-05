@@ -946,7 +946,93 @@ def api_pagos_list():
         }
         for p in pagos
     ])
+# =========================
+# CONTABLE COMPLETO POR CLIENTE
+# =========================
 
+@app.get("/api/contable/completo")
+def contable_completo():
+    try:
+        cliente_id = request.args.get("cliente_id", type=int)
+        if not cliente_id:
+            return json_error("cliente_id requerido", 400)
+
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        comision = float(request.args.get("comision", 0))
+
+        # Convertir fechas si vienen
+        filtro_desde = None
+        filtro_hasta = None
+
+        if desde:
+            filtro_desde = datetime.strptime(desde, "%Y-%m-%d")
+
+        if hasta:
+            filtro_hasta = datetime.strptime(hasta, "%Y-%m-%d") + timedelta(days=1)
+
+        # 1) Buscar todos los dispensers de ese cliente
+        dispensers = Dispenser.query.filter_by(cliente_id=cliente_id).all()
+        if not dispensers:
+            return ok_json({
+                "total_vendido_cliente": 0,
+                "monto_integrador": 0,
+                "monto_cliente": 0,
+                "dispensers": []
+            })
+
+        disp_ids = [d.id for d in dispensers]
+
+        # 2) Buscar pagos aprobados de esos dispensers
+        q = Pago.query.filter(
+            Pago.estado == "approved",
+            Pago.dispenser_id.in_(disp_ids)
+        )
+
+        if filtro_desde:
+            q = q.filter(Pago.created_at >= filtro_desde)
+        if filtro_hasta:
+            q = q.filter(Pago.created_at < filtro_hasta)
+
+        pagos = q.all()
+
+        # 3) Procesar totals
+        total_cliente = sum(p.monto for p in pagos)
+
+        resultados = {}
+
+        # Agrupamos por dispenser y slot
+        for d in dispensers:
+            resultados[d.id] = {
+                "dispenser_id": d.id,
+                "nombre": d.nombre,
+                "total": 0,
+                "slot_1": 0,
+                "slot_2": 0,
+            }
+
+        for p in pagos:
+            r = resultados.get(p.dispenser_id)
+            if r:
+                r["total"] += p.monto
+                if p.slot_id == 1:
+                    r["slot_1"] += p.monto
+                elif p.slot_id == 2:
+                    r["slot_2"] += p.monto
+
+        # 4) Comisión del integrador
+        monto_integrador = total_cliente * float(comision)
+        monto_cliente = total_cliente - monto_integrador
+
+        return ok_json({
+            "total_vendido_cliente": float(total_cliente),
+            "monto_integrador": float(monto_integrador),
+            "monto_cliente": float(monto_cliente),
+            "dispensers": list(resultados.values())
+        })
+
+    except Exception as e:
+        return json_error("error en contable", 500, str(e))
 @app.post("/api/pagos/<int:pid>/reenviar")
 def api_pagos_reenviar(pid):
     p = Pago.query.get_or_404(pid)
